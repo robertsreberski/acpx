@@ -168,6 +168,7 @@ export interface AdoptSessionInput {
   readonly providerSessionId: string;
   readonly cwd: string;
   readonly name?: string;
+  readonly mode?: string;
 }
 
 export interface MutationReceipt {

@@ -115,8 +115,9 @@ function permissionPolicy(value: unknown): CorePermissionPolicy {
 }
 
 function defaultMode(agentId: string, supplied: string | undefined): string | undefined {
-  if (supplied) {
-    return supplied;
+  const requested = supplied?.trim();
+  if (requested) {
+    return requested;
   }
   if (agentId === "codex") {
     return "read-only";
@@ -219,7 +220,7 @@ export function adaptAcpxSessionService(core: CoreSessionsService): AcpxConsoleS
       return (
         await core.adoptSession({
           ...input,
-          mode: defaultMode(input.agentId, undefined),
+          mode: defaultMode(input.agentId, input.mode),
           permissionPolicy: permissionPolicy(undefined),
         })
       ).result;

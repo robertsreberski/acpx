@@ -177,6 +177,46 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
   assert.deepEqual(JSON.parse(body), { response: { type: "cancel" } });
 });
 
+test("sends an explicit custom-agent mode for both session creation paths", async () => {
+  const client = new ConsoleApi();
+  const bodies: unknown[] = [];
+  await withFetch(
+    async (_input, init) => {
+      assert.equal(typeof init?.body, "string");
+      bodies.push(JSON.parse(init.body as string));
+      return response({ session: { ...SESSION, agentId: "mock", mode: "review" } });
+    },
+    async () => {
+      await client.createSession({
+        agentId: "mock",
+        cwd: "/work/checkout",
+        mode: "review",
+        permissionPolicy: "defer-risky",
+      });
+      await client.adoptSession({
+        agentId: "mock",
+        providerSessionId: "provider-mock",
+        cwd: "/work/checkout",
+        mode: "review",
+      });
+    },
+  );
+  assert.deepEqual(bodies, [
+    {
+      agentId: "mock",
+      cwd: "/work/checkout",
+      mode: "review",
+      policy: "defer-risky",
+    },
+    {
+      agentId: "mock",
+      providerSessionId: "provider-mock",
+      cwd: "/work/checkout",
+      mode: "review",
+    },
+  ]);
+});
+
 test("a network retry reuses the same idempotency key", async () => {
   const client = new ConsoleApi();
   const keys: string[] = [];

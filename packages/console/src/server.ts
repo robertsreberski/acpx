@@ -381,6 +381,7 @@ async function handleApi(
       providerSessionId: requiredString(body, "providerSessionId"),
       cwd,
       name: optionalString(body, "name"),
+      mode: optionalString(body, "mode"),
       idempotencyKey: idempotencyKey!,
     });
     sendJson(response, 201, { session });

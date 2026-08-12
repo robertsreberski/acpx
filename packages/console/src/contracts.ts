@@ -118,6 +118,7 @@ export interface AcpxConsoleSessionService {
     providerSessionId: string;
     cwd: string;
     name?: string;
+    mode?: string;
     idempotencyKey: string;
   }): Promise<ConsoleSession>;
   enqueuePrompt(input: {

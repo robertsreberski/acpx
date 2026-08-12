@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { useDismissibleLayer } from "../dismissible-layer";
+import { modeControlType, normalizeSessionMode, requiresExplicitMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
 import type { AgentSummary, ProviderSession } from "../types";
 import { Icon } from "./Icon";
@@ -30,6 +31,9 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   useDismissibleLayer(mode !== null, onClose, dialogRef);
 
   const agent = store.bootstrap.agents.find((item) => item.id === agentId);
+  const modeControl = modeControlType(agent);
+  const modeRequired = requiresExplicitMode(agent);
+  const normalizedMode = normalizeSessionMode(sessionMode);
 
   useEffect(() => {
     if (!mode) {
@@ -106,13 +110,17 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
+    if (modeRequired && !normalizedMode) {
+      setError(`Enter a mode for ${agent?.label ?? agentId}.`);
+      return;
+    }
     const action =
       mode === "create"
         ? store.createSession({
             agentId,
             cwd,
             name: name.trim() || undefined,
-            mode: sessionMode || undefined,
+            mode: normalizedMode,
             model: model || undefined,
             permissionPolicy: "defer-risky",
           })
@@ -121,6 +129,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             cwd,
             providerSessionId: providerSessionId.trim(),
             name: name.trim() || undefined,
+            mode: normalizedMode,
           });
     void action.then(onClose, (reason: unknown) => {
       setError(reason instanceof Error ? reason.message : "The session could not be saved.");
@@ -156,7 +165,16 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
         <form onSubmit={submit}>
           <label className="form-field">
             <span>Agent</span>
-            <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
+            <select
+              value={agentId}
+              onChange={(event) => {
+                setAgentId(event.target.value);
+                setSessionMode("");
+                setModel("");
+                setProviderSessionId("");
+              }}
+              required
+            >
               {store.bootstrap.agents.map((item) => (
                 <option value={item.id} key={item.id}>
                   {item.label}
@@ -185,18 +203,34 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
               placeholder="e.g. Fix checkout regression"
             />
           </label>
+          {modeControl === "input" && (
+            <label className="form-field">
+              <span>Mode</span>
+              <input
+                value={sessionMode}
+                onChange={(event) => setSessionMode(event.target.value)}
+                placeholder="Exact agent mode ID"
+                autoComplete="off"
+                required
+              />
+              <small>This agent has no advertised modes. ACPX will not guess one.</small>
+            </label>
+          )}
           {mode === "create" && (
             <>
-              {(agent?.modes?.length || agent?.models?.length) && (
+              {(modeControl === "select" || agent?.models?.length) && (
                 <div className="form-columns">
-                  {agent.modes?.length && (
+                  {modeControl === "select" && agent?.modes?.length && (
                     <label className="form-field">
                       <span>Mode</span>
                       <select
                         value={sessionMode}
                         onChange={(event) => setSessionMode(event.target.value)}
+                        required={modeRequired}
                       >
-                        <option value="">Safe agent default</option>
+                        <option value="">
+                          {modeRequired ? "Choose a mode" : "Safe agent default"}
+                        </option>
                         {agent.modes.map((item) => (
                           <option value={item.id} key={item.id}>
                             {item.label}
@@ -205,7 +239,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
                       </select>
                     </label>
                   )}
-                  {agent.models?.length && (
+                  {agent?.models?.length && (
                     <label className="form-field">
                       <span>Model</span>
                       <select value={model} onChange={(event) => setModel(event.target.value)}>
@@ -228,6 +262,23 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
                 </p>
               </div>
             </>
+          )}
+          {mode === "adopt" && modeControl === "select" && agent?.modes?.length && (
+            <label className="form-field">
+              <span>Mode</span>
+              <select
+                value={sessionMode}
+                onChange={(event) => setSessionMode(event.target.value)}
+                required={modeRequired}
+              >
+                <option value="">{modeRequired ? "Choose a mode" : "Safe agent default"}</option>
+                {agent.modes.map((item) => (
+                  <option value={item.id} key={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           )}
           {mode === "adopt" && (
             <label className="form-field">
@@ -286,7 +337,11 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
               type="submit"
               className="primary-button"
               disabled={
-                store.actionBusy || !agentId || !cwd || (mode === "adopt" && !providerSessionId)
+                store.actionBusy ||
+                !agentId ||
+                !cwd ||
+                (modeRequired && !normalizedMode) ||
+                (mode === "adopt" && !providerSessionId.trim())
               }
             >
               {mode === "create" ? "Create session" : "Adopt session"}

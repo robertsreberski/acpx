@@ -231,6 +231,35 @@ test("session creation enforces the configured real workspace boundary", async (
   }
 });
 
+test("custom-agent create and adopt routes forward the explicit mode", async () => {
+  const { running, service, workspace } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    const created = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "custom-create-mode"),
+      body: JSON.stringify({ agentId: "custom-agent", cwd: workspace, mode: "safe" }),
+    });
+    assert.equal(created.status, 201);
+    assert.equal((service.calls.at(-1)?.input as { mode?: string } | undefined)?.mode, "safe");
+
+    const adopted = await fetch(`${running.origin}/api/v1/sessions/adopt`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "custom-adopt-mode"),
+      body: JSON.stringify({
+        agentId: "custom-agent",
+        providerSessionId: "provider-custom",
+        cwd: workspace,
+        mode: "review",
+      }),
+    });
+    assert.equal(adopted.status, 201);
+    assert.equal((service.calls.at(-1)?.input as { mode?: string } | undefined)?.mode, "review");
+  } finally {
+    await running.close();
+  }
+});
+
 test("an unapproved Host header is rejected", async () => {
   const { running } = await fixture();
   try {

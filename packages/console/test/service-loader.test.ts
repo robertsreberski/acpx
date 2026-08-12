@@ -216,3 +216,58 @@ test("unknown agents require an explicit mode instead of inheriting an unsafe de
   });
   assert.equal((fixture.calls.at(-1)!.input as { mode?: string }).mode, "safe");
 });
+
+test("unknown agents require and preserve an explicit mode when adopting", async () => {
+  const fixture = coreFixture();
+  const service = adaptAcpxSessionService(fixture.core);
+  await assert.rejects(
+    service.adoptSession({
+      agentId: "custom-agent",
+      providerSessionId: "provider-custom",
+      cwd: "/workspace",
+      idempotencyKey: "custom-adopt-key",
+    }),
+    /mode is required for agent custom-agent/,
+  );
+  await assert.rejects(
+    service.adoptSession({
+      agentId: "custom-agent",
+      providerSessionId: "provider-custom",
+      cwd: "/workspace",
+      mode: "   ",
+      idempotencyKey: "custom-adopt-blank-mode-key",
+    }),
+    /mode is required for agent custom-agent/,
+  );
+  assert.equal(fixture.calls.length, 0);
+
+  await service.adoptSession({
+    agentId: "custom-agent",
+    providerSessionId: "provider-custom",
+    cwd: "/workspace",
+    mode: "safe",
+    idempotencyKey: "custom-adopt-safe-key",
+  });
+  assert.equal((fixture.calls.at(-1)!.input as { mode?: string }).mode, "safe");
+});
+
+test("built-in adoption retains the Codex and Claude safe defaults", async () => {
+  const fixture = coreFixture();
+  const service = adaptAcpxSessionService(fixture.core);
+
+  await service.adoptSession({
+    agentId: "codex",
+    providerSessionId: "provider-codex",
+    cwd: "/workspace",
+    idempotencyKey: "codex-adopt-key",
+  });
+  assert.equal((fixture.calls.at(-1)!.input as { mode?: string }).mode, "read-only");
+
+  await service.adoptSession({
+    agentId: "claude",
+    providerSessionId: "provider-claude",
+    cwd: "/workspace",
+    idempotencyKey: "claude-adopt-key",
+  });
+  assert.equal((fixture.calls.at(-1)!.input as { mode?: string }).mode, "default");
+});
