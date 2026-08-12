@@ -194,6 +194,7 @@ Behavior:
 ### Deferred permission requests
 
 ```bash
+acpx codex set mode read-only   # codex self-approves in its sandbox without this
 acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
 acpx codex requests --json
 acpx codex respond <request-id> --option allow
@@ -205,6 +206,7 @@ acpx codex respond <request-id> --cancel
 
 Behavior:
 
+- **Codex parks nothing until its session is set to `read-only`** (`acpx codex set mode read-only`): its default `agent` preset approves its own tool calls inside its sandbox and never sends a permission request. Agents that do not self-sandbox, such as `claude`, need nothing extra. Codex also offers no `reject_always` option and sends no tool title, so `--decline` uses `reject_once` and the listing shows the `tool` fallback — read `raw_input` for the command.
 - `--defer` parks `defer`-matched permission requests instead of denying them for the turn: the turn stays blocked and a durable record is written under `~/.acpx/requests/`.
 - `--defer` and `--defer-max-age <seconds>` are owner-level, fixed when the session's queue owner starts; a submit a warm owner cannot honour is refused, not silently denied.
 - `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session, needs no session in the current directory, and cannot be combined with `-s`.

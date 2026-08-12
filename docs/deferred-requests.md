@@ -71,7 +71,23 @@ and the whole directory is deleted when its session is closed or pruned.
 
 ## The flow
 
+> **Codex approves its own tool calls unless you tell it not to.** Its default
+> `agent` preset runs commands inside its own sandbox and never sends a
+> permission request at all, so `--defer` has nothing to park and `requests`
+> comes back empty. Set the session to the preset that asks first:
+>
+> ```bash
+> acpx codex set mode read-only     # "Requires approval to edit files and run commands"
+> ```
+>
+> This is per session and survives for its lifetime. Every codex example below
+> assumes it. Agents that do not sandbox their own tool calls — `claude`, for
+> one — need nothing extra.
+
 ```bash
+# 0. Make codex ask before it acts (see the note above).
+acpx codex set mode read-only
+
 # 1. Ask, and do not wait for the answer.
 acpx --defer --policy '{"defaultAction":"defer"}' codex prompt --no-wait 'run the repo checks'
 
@@ -85,6 +101,21 @@ acpx codex respond <request-id> --option allow
 `--no-wait` is what makes this useful: it returns as soon as the queue owner has
 accepted the prompt, leaving the owner holding the turn. The answer can come
 minutes or hours later, from a different shell or a different process.
+
+### What an agent's options actually look like
+
+The option list is stored and listed **verbatim**, because only the agent knows
+what its ids mean. Two things that surprises people:
+
+- **There may be no rejection option.** Codex offers `allow_once`,
+  `allow_always`, `accept_execpolicy_amendment` (a second allow, naming the
+  command prefix it would whitelist) and `reject_once` — but no
+  `reject_always`. `--decline` answers with whichever rejection the agent
+  offered, and is **refused** when it offered none rather than being downgraded
+  to a cancel, which is a different outcome for the agent.
+- **The title may be empty.** Codex sends none, so the listing shows acpx's
+  `tool` fallback and the tool call's `raw_input` is where the actual command
+  is. Read `raw_input` when the title tells you nothing.
 
 ## `--defer` and `--defer-max-age`
 
@@ -140,6 +171,7 @@ answer — the alternative is auto-declining a question a human was meant to see
 ### Answering a form
 
 ```bash
+# Assumes `acpx codex set mode read-only` (see the note under "The flow").
 acpx codex requests --json                                   # read requested_schema
 acpx codex respond <id> --field question_0='Greeting A'      # fill one field
 acpx codex respond <id> --field picks=a --field picks=b      # multi-select

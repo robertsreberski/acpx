@@ -466,3 +466,46 @@ test("--field still reaches both halves of a marked pair directly", () => {
     q_main: "Greeting A",
   });
 });
+
+test("--text prefers an exact value over another option's title", () => {
+  // The collision the shared match space hid: "beta" is option 2's VALUE and
+  // also option 1's TITLE. Order-of-declaration would answer "alpha" — the
+  // wrong option, at exit 0, silently.
+  const crossed = makeEntry({
+    q_main: {
+      type: "string",
+      oneOf: [
+        { const: "alpha", title: "beta" },
+        { const: "beta", title: "gamma" },
+      ],
+    },
+    q_free: { type: "string", _meta: customAnswerMeta("q_main") },
+  });
+  assert.deepEqual(elicitationContentFromFlags(crossed, { text: "beta" }), { q_main: "beta" });
+  // The titles that collide with nothing still resolve to their own value.
+  assert.deepEqual(elicitationContentFromFlags(crossed, { text: "gamma" }), { q_main: "beta" });
+  assert.deepEqual(elicitationContentFromFlags(crossed, { text: "alpha" }), { q_main: "alpha" });
+  // And an answer that names no option at all is still the operator's own.
+  assert.deepEqual(elicitationContentFromFlags(crossed, { text: "delta" }), { q_free: "delta" });
+});
+
+test("--text refuses a title two options share", () => {
+  // Nothing distinguishes them, so picking one would be a guess. The values
+  // are named so the operator can say which they meant.
+  const duplicated = makeEntry({
+    q_main: {
+      type: "string",
+      oneOf: [
+        { const: "a", title: "Same label" },
+        { const: "b", title: "Same label" },
+      ],
+    },
+    q_free: { type: "string", _meta: customAnswerMeta("q_main") },
+  });
+  assert.throws(
+    () => elicitationContentFromFlags(duplicated, { text: "Same label" }),
+    /offers more than one option titled "Same label" \(values: "a", "b"\)/,
+  );
+  // Naming either value directly is unambiguous and still works.
+  assert.deepEqual(elicitationContentFromFlags(duplicated, { text: "b" }), { q_main: "b" });
+});

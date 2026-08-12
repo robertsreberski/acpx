@@ -330,15 +330,36 @@ function offeredOptions(
  * The value behind an option the answer names, by value or by the title shown
  * for it. The two differ whenever a bridge titles an option differently from
  * the value it records, and the value is what the agent reads back.
+ *
+ * Values and titles are NOT one match space. An answer that is exactly some
+ * option's value is that option, even when it also happens to be a different
+ * option's title — matching them together and taking the first hit would answer
+ * with a neighbouring option, at exit 0, silently. Titles are only consulted
+ * once no value matches, and a title two options share is refused rather than
+ * resolved by declaration order.
  */
 function offeredOptionValue(
   entry: PendingElicitationRequest,
   field: string,
   answer: string,
 ): string | undefined {
-  return offeredOptions(entry, field).find(
-    (option) => option.value === answer || option.title === answer,
-  )?.value;
+  const options = offeredOptions(entry, field);
+  // Every value match yields the same string, so there is nothing to be
+  // ambiguous about even if a schema lists one twice.
+  const byValue = options.find((option) => option.value === answer);
+  if (byValue) {
+    return byValue.value;
+  }
+  const byTitle = options.filter((option) => option.title === answer);
+  const [titled, ...rest] = byTitle;
+  if (rest.length > 0) {
+    throw new InvalidArgumentError(
+      `Field ${field} offers more than one option titled ${JSON.stringify(answer)} ` +
+        `(values: ${byTitle.map((option) => JSON.stringify(option.value)).join(", ")}); ` +
+        `answer with the value itself, using --field ${field}=<value>`,
+    );
+  }
+  return titled?.value;
 }
 
 /**
