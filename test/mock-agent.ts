@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -70,6 +70,12 @@ type MockAgentOptions = {
   cancelDelayMs: number;
   /** If set, the agent writes its PID to this path at startup (before ACP handshake). */
   pidFile?: string;
+  /**
+   * If set, every session-shaping request is appended there as one JSON line,
+   * tagged with the agent pid. Ordering across agent processes is what proves
+   * a mode was re-applied *before* the prompt that relied on it.
+   */
+  callLog?: string;
 };
 
 type SessionState = {
@@ -421,6 +427,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let cancelDelayMs = 0;
   let hangOnNewSession = false;
   let pidFile: string | undefined;
+  let callLog: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -571,6 +578,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--call-log") {
+      callLog = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
     if (token === "--claude-agent-acp") {
       continue;
     }
@@ -638,6 +651,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     ignoreSigterm,
     cancelDelayMs,
     pidFile,
+    callLog,
   };
 }
 
@@ -825,6 +839,7 @@ class MockAgent implements Agent {
 
     const sessionId = randomUUID();
     this.sessions.set(sessionId, createSessionState(false));
+    this.logCall({ method: "session/new", sessionId });
 
     const response: NewSessionResponse = { sessionId };
 
@@ -848,6 +863,7 @@ class MockAgent implements Agent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    this.logCall({ method: "session/load", sessionId: params.sessionId });
     if (!this.options.supportsLoadSession) {
       throw new Error("loadSession is not supported");
     }
@@ -881,6 +897,7 @@ class MockAgent implements Agent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    this.logCall({ method: "session/resume", sessionId: params.sessionId });
     if (!this.options.supportsResumeSession) {
       throw new Error("resumeSession is not supported");
     }
@@ -963,6 +980,12 @@ class MockAgent implements Agent {
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
+    this.logCall({
+      method: "session/prompt",
+      sessionId: params.sessionId,
+      text,
+      modeId: session.modeId,
+    });
 
     if (text === "partial-retryable-error") {
       try {
@@ -1040,6 +1063,11 @@ class MockAgent implements Agent {
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     const session = this.ensureSession(params.sessionId);
+    this.logCall({
+      method: "session/set_mode",
+      sessionId: params.sessionId,
+      modeId: params.modeId,
+    });
     if (this.options.setSessionModeInvalidParams) {
       const error = new Error("Invalid params") as Error & {
         code: number;
@@ -1066,6 +1094,12 @@ class MockAgent implements Agent {
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.ensureSession(params.sessionId);
+    this.logCall({
+      method: "session/set_config_option",
+      sessionId: params.sessionId,
+      configId: params.configId,
+      value: params.value,
+    });
     if (
       this.options.setSessionConfigInvalidParams ||
       (params.configId === this.options.modelConfigId && this.options.setSessionModelInvalidParams)
@@ -1193,6 +1227,22 @@ class MockAgent implements Agent {
         process.stderr.write(`late-tool failed: ${toErrorMessage(error)}\n`);
       });
     }, scheduledDelay);
+  }
+
+  /**
+   * Record one handled request in submission order, when a test asked for a
+   * call log. Failures are swallowed: the log is test scaffolding, and taking
+   * the agent down over it would only obscure what the test is measuring.
+   */
+  private logCall(entry: Record<string, unknown>): void {
+    if (!this.options.callLog) {
+      return;
+    }
+    try {
+      appendFileSync(this.options.callLog, `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
+    } catch {
+      // ignore call-log write failures
+    }
   }
 
   private ensureSession(sessionId: SessionId): SessionState {

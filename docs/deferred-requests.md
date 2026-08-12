@@ -84,6 +84,19 @@ and the whole directory is deleted when its session is closed or pruned.
 > assumes it. Agents that do not sandbox their own tool calls — `claude`, for
 > one — need nothing extra.
 
+The mode also survives owner restarts as of `0.13.0-fork.2`. A session's mode is
+saved on its record and re-applied whenever `acpx` binds that record to a fresh
+adapter session: a queue owner that died and was respawned, an agent process
+that exited, a `session/resume` that fell back to `session/load` or
+`session/new`. Before that the mode was applied only to the connection that set
+it, so the next owner started the session at the adapter's own default —
+`agent` for codex, `auto` for claude, both of which approve their own tool
+calls — and a session that had been parking every write silently regained
+self-approval. If an adapter refuses the saved mode (an upgrade retired the id),
+the turn still runs and the refusal is reported as an `_acpx/warning` carrying
+`code: SESSION_MODE_NOT_REAPPLIED`, so a poller can see the mode is not in
+force rather than assuming it is.
+
 ```bash
 # 0. Make codex ask before it acts (see the note above).
 acpx codex set mode read-only
@@ -224,11 +237,11 @@ Every transition is written into the session's event log as a synthetic
 JSON-RPC notification. The underscore prefix marks it as a client extension so
 an ACP reader can skip it.
 
-| Method                        | When                                                             |
-| ----------------------------- | ---------------------------------------------------------------- |
-| `_acpx/pending_request`       | a request parked, or changed state                               |
-| `_acpx/permission_escalation` | a policy `escalate`/`defer` match was reported                   |
-| `_acpx/warning`               | a listing could not reach a live owner (stderr, `--format json`) |
+| Method                        | When                                                                                                                          |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `_acpx/pending_request`       | a request parked, or changed state                                                                                            |
+| `_acpx/permission_escalation` | a policy `escalate`/`defer` match was reported                                                                                |
+| `_acpx/warning`               | a saved mode could not be re-applied, or a listing could not reach a live owner (the listing case is stderr, `--format json`) |
 
 The log is `~/.acpx/sessions/<record-id>.stream.ndjson`, one JSON object per
 line, appended as the turn runs. It is the only place these events surface for a

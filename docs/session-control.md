@@ -41,6 +41,10 @@ Unsupported mode ids are rejected by the adapter, often as `Invalid params`. `ac
 
 `set-mode` routes through the queue owner when active and falls back to a fresh client connection otherwise.
 
+The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter session — a respawned queue owner, an agent process that died, a `session/resume` that fell back to `session/load` or `session/new`. Adapters start every new session at their own default, so without this a restart would quietly return the session to `agent`/`auto` and with it the adapter's self-approval. If the adapter refuses the saved mode on that fresh session, the turn is not failed: the refusal is recorded in the session event log as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`, naming the mode that is not in force.
+
+A session the current queue owner still holds open keeps the mode its live adapter session is already running under; the re-apply is for new bindings, not for every turn.
+
 ## `set <key> <value>`
 
 ```bash
@@ -48,7 +52,7 @@ acpx claude set verbosity terse
 acpx set model gpt-5.4         # defaults to codex
 ```
 
-Calls ACP `session/set_config_option` with the literal `<key>` and `<value>`. Non-mode `set_config_option` values are persisted by `acpx` and replayed onto fresh adapter sessions when the adapter supports those config keys.
+Calls ACP `session/set_config_option` with the literal `<key>` and `<value>`. `set_config_option` values are persisted by `acpx` and replayed onto fresh adapter sessions when the adapter supports those config keys. A `mode` config option is stored as the session mode and follows the [`set-mode`](#set-mode) rules above.
 
 ### `set model <id>`
 

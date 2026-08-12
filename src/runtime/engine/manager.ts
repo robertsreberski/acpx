@@ -1194,6 +1194,12 @@ export class AcpRuntimeManager {
       onSessionIdResolved: (sessionIdValue) => {
         turn.activeSessionId = sessionIdValue;
       },
+      onWarning: (warning) => {
+        this.emitRuntimeTurnEvent(task, {
+          type: "status",
+          text: warning.message,
+        });
+      },
     });
   }
 

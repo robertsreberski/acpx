@@ -883,6 +883,171 @@ test("connectAndLoadSession fails when desired mode replay cannot be restored on
   });
 });
 
+type SetModeCall = {
+  sessionId: string;
+  modeId: string;
+};
+
+/**
+ * A client whose reconnect hands the record a *new* adapter session behind the
+ * same acpx session id, which is what `session/resume` and `session/load` both
+ * do after a queue-owner restart or an agent process death.
+ */
+function makeReboundSessionClient(params: {
+  setModeCalls: SetModeCall[];
+  reusableSessionId?: string;
+  resumeCapable?: boolean;
+  refuseSetSessionMode?: boolean;
+  onStart?: () => void;
+}): FakeClient {
+  return {
+    hasReusableSession: (sessionId) => sessionId === params.reusableSessionId,
+    start: async () => {
+      params.onStart?.();
+    },
+    getAgentLifecycleSnapshot: () => ({
+      running: true,
+    }),
+    supportsLoadSession: () => params.resumeCapable !== true,
+    supportsResumeSession: () => params.resumeCapable === true,
+    resumeSession: async () => ({ agentSessionId: "runtime-session" }),
+    loadSessionWithOptions: async () => ({ agentSessionId: "runtime-session" }),
+    createSession: async () => {
+      throw new Error("createSession should not be called");
+    },
+    setSessionMode: async (sessionId, modeId) => {
+      params.setModeCalls.push({ sessionId, modeId });
+      if (params.refuseSetSessionMode) {
+        throw new Error("unsupported mode");
+      }
+    },
+    setSessionModel: async () => {},
+  };
+}
+
+async function connectReboundSession(params: {
+  homeDir: string;
+  client: FakeClient;
+  desiredModeId?: string;
+  onWarning?: Parameters<typeof connectAndLoadSession>[0]["onWarning"];
+}): Promise<{
+  record: ReturnType<typeof makeSessionRecord>;
+  result: Awaited<ReturnType<typeof connectAndLoadSession>>;
+}> {
+  const cwd = path.join(params.homeDir, "workspace");
+  await fs.mkdir(cwd, { recursive: true });
+  const record = makeSessionRecord({
+    acpxRecordId: "rebound-record",
+    acpSessionId: "bound-session",
+    agentCommand: "agent",
+    cwd,
+    ...(params.desiredModeId ? { acpx: { desired_mode_id: params.desiredModeId } } : {}),
+  });
+
+  const result = await connectAndLoadSession({
+    client: params.client as never,
+    record,
+    timeoutMs: 1_000,
+    activeController: ACTIVE_CONTROLLER,
+    onWarning: params.onWarning,
+  });
+
+  return { record, result };
+}
+
+test("connectAndLoadSession re-applies the stored mode on a resumed adapter session", async () => {
+  await withTempHome(async (homeDir) => {
+    const setModeCalls: SetModeCall[] = [];
+    const { result } = await connectReboundSession({
+      homeDir,
+      client: makeReboundSessionClient({ setModeCalls, resumeCapable: true }),
+      desiredModeId: "plan",
+    });
+
+    assert.equal(result.resumed, true);
+    assert.deepEqual(setModeCalls, [{ sessionId: "bound-session", modeId: "plan" }]);
+  });
+});
+
+test("connectAndLoadSession re-applies the stored mode after session/load", async () => {
+  await withTempHome(async (homeDir) => {
+    const setModeCalls: SetModeCall[] = [];
+    const { result } = await connectReboundSession({
+      homeDir,
+      client: makeReboundSessionClient({ setModeCalls }),
+      desiredModeId: "read-only",
+    });
+
+    assert.equal(result.resumed, true);
+    assert.deepEqual(setModeCalls, [{ sessionId: "bound-session", modeId: "read-only" }]);
+  });
+});
+
+test("connectAndLoadSession leaves a rebound session alone when no mode was ever set", async () => {
+  await withTempHome(async (homeDir) => {
+    const setModeCalls: SetModeCall[] = [];
+    await connectReboundSession({
+      homeDir,
+      client: makeReboundSessionClient({ setModeCalls, resumeCapable: true }),
+    });
+
+    assert.deepEqual(setModeCalls, []);
+  });
+});
+
+test("connectAndLoadSession does not re-apply the stored mode onto a reused live session", async () => {
+  await withTempHome(async (homeDir) => {
+    const setModeCalls: SetModeCall[] = [];
+    let started = false;
+    await connectReboundSession({
+      homeDir,
+      client: makeReboundSessionClient({
+        setModeCalls,
+        reusableSessionId: "bound-session",
+        onStart: () => {
+          started = true;
+        },
+      }),
+      desiredModeId: "plan",
+    });
+
+    // Reusing a session this client already holds is not a new binding, so it
+    // keeps whatever mode the live session is already running under.
+    assert.equal(started, false);
+    assert.deepEqual(setModeCalls, []);
+  });
+});
+
+test("connectAndLoadSession warns and keeps the turn when a rebound adapter refuses the stored mode", async () => {
+  await withTempHome(async (homeDir) => {
+    const setModeCalls: SetModeCall[] = [];
+    const warnings: Array<{ code: string; modeId: string; sessionId: string; message: string }> =
+      [];
+    const { record, result } = await connectReboundSession({
+      homeDir,
+      client: makeReboundSessionClient({
+        setModeCalls,
+        resumeCapable: true,
+        refuseSetSessionMode: true,
+      }),
+      desiredModeId: "plan",
+      onWarning: (warning) => {
+        warnings.push(warning);
+      },
+    });
+
+    assert.equal(result.resumed, true);
+    assert.deepEqual(setModeCalls, [{ sessionId: "bound-session", modeId: "plan" }]);
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0]?.code, "SESSION_MODE_NOT_REAPPLIED");
+    assert.equal(warnings[0]?.modeId, "plan");
+    assert.equal(warnings[0]?.sessionId, "bound-session");
+    assert.match(warnings[0]?.message ?? "", /is not in force/);
+    // The preference stays saved so the next binding tries again.
+    assert.equal(record.acpx?.desired_mode_id, "plan");
+  });
+});
+
 test("connectAndLoadSession replays desired model on a fresh session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

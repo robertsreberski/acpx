@@ -58,6 +58,20 @@ function isProcessAlive(pid: number | undefined): boolean {
   }
 }
 
+/**
+ * A connect step that could not be honoured but must not take the turn down.
+ *
+ * It is a value rather than a log line because the caller owns the reporting
+ * surface: the CLI records it in the durable session event log where a poller
+ * can find it, the runtime turns it into a turn event.
+ */
+export type SessionConnectWarning = {
+  code: "SESSION_MODE_NOT_REAPPLIED";
+  message: string;
+  sessionId: string;
+  modeId: string;
+};
+
 export type ConnectAndLoadSessionOptions = {
   client: AcpClient;
   record: SessionRecord;
@@ -69,6 +83,7 @@ export type ConnectAndLoadSessionOptions = {
   onClientAvailable?: (controller: ConnectedSessionController) => void;
   onConnectedRecord?: (record: SessionRecord) => void;
   onSessionIdResolved?: (sessionId: string) => void;
+  onWarning?: (warning: SessionConnectWarning) => void;
 };
 
 export type ConnectAndLoadSessionResult = {
@@ -154,6 +169,80 @@ async function replayDesiredMode(params: {
         retryable: true,
       },
     );
+  }
+}
+
+/**
+ * True when this connect bound the record to an adapter session it neither
+ * created nor was already holding open.
+ *
+ * A session acpx just created has had its preferences replayed already, and a
+ * session this client still holds open is not a new binding at all — asserting
+ * the mode there would add a `session/set_mode` to every turn and would
+ * override a mode the agent itself moved to mid-conversation.
+ */
+function boundToUncreatedAdapterSession(
+  createdFreshSession: boolean,
+  reusingLoadedSession: boolean,
+): boolean {
+  return !createdFreshSession && !reusingLoadedSession;
+}
+
+/**
+ * Re-assert the saved mode on an adapter session acpx bound but did not create.
+ *
+ * `session/resume` and `session/load` return the record's own session id, but
+ * behind it the adapter has built a *new* session — after a queue-owner
+ * restart, an agent process death, or a resume that fell back to load. That
+ * session starts at the adapter's default mode, and both defaults in wide use
+ * (claude `auto`, codex `agent`) let the agent answer its own permission
+ * prompts. A session an operator deliberately put in `plan` or `read-only`
+ * would silently regain self-approval. The mode is a security posture, so it
+ * is re-applied on every binding rather than only on the ones acpx created.
+ *
+ * Best effort by design: an adapter that has retired the saved mode id must
+ * not take the turn down with it. It must not pass for applied either, so the
+ * refusal is reported to the caller and the saved preference is kept for the
+ * next binding.
+ */
+async function reapplyModeOnBoundSession(params: {
+  client: AcpClient;
+  sessionId: string;
+  desiredModeId: string | undefined;
+  timeoutMs?: number;
+  verbose?: boolean;
+  onWarning?: (warning: SessionConnectWarning) => void;
+}): Promise<void> {
+  if (!params.desiredModeId) {
+    return;
+  }
+
+  try {
+    await withTimeout(
+      params.client.setSessionMode(params.sessionId, params.desiredModeId),
+      params.timeoutMs,
+    );
+    if (params.verbose) {
+      process.stderr.write(
+        `[acpx] re-applied saved mode ${params.desiredModeId} on rebound ACP session ${params.sessionId}\n`,
+      );
+    }
+  } catch (error) {
+    // An interrupt is the operator stopping the turn, not the adapter refusing
+    // a mode, and swallowing it would run the prompt they just cancelled.
+    if (error instanceof InterruptedError) {
+      throw error;
+    }
+    const message = `Saved session mode ${params.desiredModeId} was not re-applied to ACP session ${params.sessionId} and is not in force: ${formatErrorMessage(error)}`;
+    params.onWarning?.({
+      code: "SESSION_MODE_NOT_REAPPLIED",
+      message,
+      sessionId: params.sessionId,
+      modeId: params.desiredModeId,
+    });
+    if (params.verbose) {
+      process.stderr.write(`[acpx] warning: ${message}\n`);
+    }
   }
 }
 
@@ -353,6 +442,17 @@ export async function connectAndLoadSession(
     verbose: options.verbose,
     suppressWarnings: options.suppressWarnings,
   });
+
+  if (boundToUncreatedAdapterSession(createdFreshSession, reusingLoadedSession)) {
+    await reapplyModeOnBoundSession({
+      client,
+      sessionId,
+      desiredModeId,
+      timeoutMs: options.timeoutMs,
+      verbose: options.verbose,
+      onWarning: options.onWarning,
+    });
+  }
 
   applyReconnectedModelState(
     record,

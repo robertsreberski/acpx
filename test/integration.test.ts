@@ -4533,6 +4533,217 @@ test("integration: session remains resumable after queue owner exits and agent h
   });
 });
 
+type MockAgentCall = {
+  pid: number;
+  method: string;
+  sessionId?: string;
+  modeId?: string;
+  text?: string;
+};
+
+async function readMockAgentCalls(callLogPath: string): Promise<MockAgentCall[]> {
+  const contents = await fs.readFile(callLogPath, "utf8").catch(() => "");
+  return contents
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as MockAgentCall);
+}
+
+function sessionRecordPath(homeDir: string, sessionId: string): string {
+  return path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(sessionId)}.json`);
+}
+
+async function readStoredSessionAcpxState(
+  homeDir: string,
+  sessionId: string,
+): Promise<Record<string, unknown>> {
+  const raw = await fs.readFile(sessionRecordPath(homeDir, sessionId), "utf8");
+  return (JSON.parse(raw) as { acpx?: Record<string, unknown> }).acpx ?? {};
+}
+
+async function storeSessionDesiredMode(
+  homeDir: string,
+  sessionId: string,
+  modeId: string,
+): Promise<void> {
+  const recordPath = sessionRecordPath(homeDir, sessionId);
+  const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+    acpx?: Record<string, unknown>;
+  };
+  record.acpx = { ...record.acpx, desired_mode_id: modeId };
+  await fs.writeFile(recordPath, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+async function readSessionStreamNotifications(
+  homeDir: string,
+  method: string,
+): Promise<Array<Record<string, unknown>>> {
+  const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+  const found: Array<Record<string, unknown>> = [];
+  for (const name of await fs.readdir(sessionsDir)) {
+    if (!name.endsWith(".stream.ndjson")) {
+      continue;
+    }
+    const contents = await fs.readFile(path.join(sessionsDir, name), "utf8");
+    for (const line of contents.split("\n")) {
+      if (!line.includes(`"${method}"`)) {
+        continue;
+      }
+      const parsed = JSON.parse(line) as { method?: string; params?: Record<string, unknown> };
+      if (parsed.method === method && parsed.params) {
+        found.push(parsed.params);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * A queue-owner restart is the common case, and the dangerous one: the record
+ * survives, the adapter session behind it does not, and an adapter that starts
+ * every session at a self-approving default hands a parked-everything session
+ * its approvals back. The mode has to be re-asserted before the prompt that
+ * relies on it, not merely stored.
+ */
+test("integration: a saved session mode is re-applied when a fresh queue owner rebinds the session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(cwd, "agent-calls.ndjson");
+    const agentArgs = [
+      "--agent",
+      `${MOCK_AGENT_COMMAND} --supports-resume-session --call-log ${JSON.stringify(callLog)}`,
+      "--approve-all",
+      "--cwd",
+      cwd,
+    ];
+
+    try {
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const warmed = await runCli(
+        [...agentArgs, "--format", "quiet", "--ttl", "60", "prompt", "echo one"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(warmed.code, 0, warmed.stderr);
+
+      const setMode = await runCli(
+        [...agentArgs, "--format", "quiet", "set-mode", "plan"],
+        homeDir,
+        {
+          timeoutMs: 30_000,
+        },
+      );
+      assert.equal(setMode.code, 0, setMode.stderr);
+      assert.equal(
+        (await readStoredSessionAcpxState(homeDir, sessionId)).desired_mode_id,
+        "plan",
+        "set-mode must persist the mode on the record",
+      );
+
+      const { pid } = await readQueueOwnerLock(homeDir, sessionId);
+      process.kill(pid, "SIGKILL");
+      assert.equal(await waitForPidExit(pid, 10_000), true, "queue owner did not exit");
+
+      const afterRestart = await runCli(
+        [...agentArgs, "--format", "quiet", "--ttl", "60", "prompt", "echo two"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(afterRestart.code, 0, afterRestart.stderr);
+      assert.match(afterRestart.stdout, /two/);
+
+      const calls = await readMockAgentCalls(callLog);
+      const promptIndex = calls.findIndex(
+        (call) => call.method === "session/prompt" && call.text === "echo two",
+      );
+      assert.notEqual(promptIndex, -1, JSON.stringify(calls));
+      const reboundAgentPid = calls[promptIndex]?.pid;
+      const reapplyIndex = calls.findIndex(
+        (call) =>
+          call.method === "session/set_mode" &&
+          call.modeId === "plan" &&
+          call.pid === reboundAgentPid,
+      );
+      assert.notEqual(
+        reapplyIndex,
+        -1,
+        `the fresh agent process never received session/set_mode: ${JSON.stringify(calls)}`,
+      );
+      assert.equal(
+        reapplyIndex < promptIndex,
+        true,
+        `session/set_mode must precede the prompt: ${JSON.stringify(calls)}`,
+      );
+      // The mode the agent actually held while answering, which is the whole
+      // point: a stored preference that arrives after the prompt is no mode.
+      assert.equal(calls[promptIndex]?.modeId, "plan", JSON.stringify(calls));
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: a mode the rebound adapter refuses is reported instead of passing for applied", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(cwd, "agent-calls.ndjson");
+    const agentArgs = [
+      "--agent",
+      `${MOCK_AGENT_COMMAND} --supports-resume-session --set-session-mode-fails --call-log ${JSON.stringify(callLog)}`,
+      "--approve-all",
+      "--cwd",
+      cwd,
+    ];
+
+    try {
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      // The mode was accepted when it was set; the adapter has since stopped
+      // accepting it, which is what an adapter upgrade looks like from here.
+      await storeSessionDesiredMode(homeDir, sessionId, "plan");
+
+      const prompted = await runCli(
+        [...agentArgs, "--format", "quiet", "--ttl", "1", "prompt", "echo still-running"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+      assert.match(prompted.stdout, /still-running/);
+
+      const warnings = await readSessionStreamNotifications(homeDir, "_acpx/warning");
+      assert.equal(warnings.length, 1, JSON.stringify(warnings));
+      assert.equal(warnings[0]?.code, "SESSION_MODE_NOT_REAPPLIED");
+      assert.equal(warnings[0]?.modeId, "plan");
+      assert.match(String(warnings[0]?.message), /is not in force/);
+
+      const calls = await readMockAgentCalls(callLog);
+      const prompt = calls.find(
+        (call) => call.method === "session/prompt" && call.text === "echo still-running",
+      );
+      assert.equal(
+        prompt?.modeId,
+        "auto",
+        `the refused mode must not be reported as applied: ${JSON.stringify(calls)}`,
+      );
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 function baseAgentArgs(cwd: string): string[] {
   return ["--agent", MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
 }

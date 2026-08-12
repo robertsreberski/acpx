@@ -973,6 +973,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           onSessionIdResolved: (sessionId) => {
             activeSessionIdForControl = sessionId;
           },
+          onWarning: (warning) => {
+            // The turn still runs, so the only way an operator learns the mode
+            // is not in force is the durable log plus the live JSON stream.
+            const notification = acpxExtensionNotification("_acpx/warning", warning);
+            pendingMessages.push(notification);
+            output.onAcpMessage(notification);
+          },
         });
       });
       acpxState = mergeConnectedModelState(acpxState, record.acpx);
