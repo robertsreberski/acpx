@@ -20,7 +20,7 @@ import {
   resolveSessionNameFromFlags,
 } from "./flags.js";
 import { tryListRequestsOnRunningOwner, tryRespondOnRunningOwner } from "./queue/ipc.js";
-import { readQueueOwnerStatus } from "./queue/lease-store.js";
+import { readLiveQueueOwner } from "./queue/lease-store.js";
 
 export type RequestsListFlags = {
   all?: boolean;
@@ -42,6 +42,14 @@ export type RespondFlags = {
  * a dead owner left pending into an orphan.
  */
 const NO_LIVE_OWNER_GENERATION = 0;
+
+/**
+ * How long the live-owner cross-check may take before the listing gives up and
+ * reports what the store holds. A suspended or wedged owner accepts the socket
+ * connection and then never answers, so an unbounded wait would hang the one
+ * command an operator reaches for when a session is stuck.
+ */
+const LIVE_LIST_TIMEOUT_MS = 2_000;
 
 function resolveRequestsFormat(
   json: boolean | undefined,
@@ -67,14 +75,16 @@ function resolveAnswerFromFlags(flags: RespondFlags): PendingRequestAnswer {
 }
 
 /**
- * The generation of the owner that is alive right now, or the sentinel when
- * there is none. Reading the lease (rather than asking the owner) is what keeps
- * this working when the owner is wedged, which is exactly when an operator
- * reaches for these verbs.
+ * The generation of the owner whose process is alive right now, or the sentinel
+ * when there is none.
+ *
+ * `readLiveQueueOwner` is deliberately the non-mutating read: the status helper
+ * retires an owner whose heartbeat has gone stale, which for a live-but-busy
+ * owner means killing the process that is holding the very promise these verbs
+ * exist to answer.
  */
 async function liveOwnerGeneration(sessionId: string): Promise<number> {
-  const owner = await readQueueOwnerStatus(sessionId);
-  return owner?.ownerGeneration ?? NO_LIVE_OWNER_GENERATION;
+  return (await readLiveQueueOwner(sessionId))?.ownerGeneration ?? NO_LIVE_OWNER_GENERATION;
 }
 
 function sortedRequests(entries: PendingRequest[]): PendingRequest[] {
@@ -105,8 +115,18 @@ async function readLiveParkedRequests(
   sessionId: string,
   warn: (message: string) => void,
 ): Promise<PendingRequest[]> {
+  if (!(await readLiveQueueOwner(sessionId))) {
+    // No live process to ask; the store is the whole answer, and this is what
+    // bounds the cross-session listing to sessions that still have an owner.
+    return [];
+  }
   try {
-    return (await tryListRequestsOnRunningOwner({ sessionId })) ?? [];
+    return (
+      (await tryListRequestsOnRunningOwner({
+        sessionId,
+        responseTimeoutMs: LIVE_LIST_TIMEOUT_MS,
+      })) ?? []
+    );
   } catch (error) {
     // The durable store is the answer to this question; the owner only adds to
     // it. Failing the whole listing because the owner is busy would break the
@@ -120,32 +140,39 @@ async function readLiveParkedRequests(
   }
 }
 
-async function reconcileSessionRequests(sessionId: string): Promise<PendingRequest[]> {
-  // Never reimplement the orphan rule: the sweep owns it, including the proof
-  // that the recorded owner is gone.
-  await sweepPendingRequests({ sessionId, ownerGeneration: await liveOwnerGeneration(sessionId) });
-  return await listPendingRequests(sessionId);
-}
-
+/**
+ * Listing observes; it never reconciles.
+ *
+ * Marking an entry `orphaned` is a claim that its owner is gone, and only a
+ * caller holding proof of that may make it — the next owner of the session (its
+ * generation is the proof) or `respond`, which has just looked for a live
+ * process and found none. An inspection command has no such proof: an owner
+ * that is merely slow or suspended looks identical from here, and rewriting its
+ * parked requests would destroy answers that are still coming.
+ */
 async function listSessionRequests(
   sessionId: string,
   warn: (message: string) => void,
 ): Promise<PendingRequest[]> {
-  const stored = await reconcileSessionRequests(sessionId);
+  const stored = await listPendingRequests(sessionId);
   return sortedRequests(
     mergeLiveParkedRequests(stored, await readLiveParkedRequests(sessionId, warn)),
   );
 }
 
 /**
- * Every session in the store. This one stays store-only: a cross-session scan
- * has no single session context, and a request no session directory knows about
- * would not be discoverable here anyway.
+ * Every session the store knows about, with the same live-owner cross-check.
+ *
+ * The cross-check is bounded to sessions that still have a live lease, so the
+ * cost is one lock-file read per session and an IPC round trip only where there
+ * is something to ask. A park whose durable write failed in a session with no
+ * other entries has no directory to be discovered through, so it stays
+ * invisible here.
  */
-async function listAllRequests(): Promise<PendingRequest[]> {
+async function listAllRequests(warn: (message: string) => void): Promise<PendingRequest[]> {
   const entries: PendingRequest[] = [];
   for (const sessionId of await listPendingRequestSessionIds()) {
-    entries.push(...(await reconcileSessionRequests(sessionId)));
+    entries.push(...(await listSessionRequests(sessionId, warn)));
   }
   return sortedRequests(entries);
 }
@@ -162,21 +189,25 @@ function printRequestsByFormat(entries: PendingRequest[], format: OutputFormat):
     return;
   }
 
+  // Both non-JSON formats carry the session, so a cross-session listing says
+  // which session is stuck without a second lookup, and the scoped listing has
+  // the same shape.
   if (format === "quiet") {
     for (const entry of entries) {
-      process.stdout.write(`${entry.requestId}\n`);
+      process.stdout.write(`${entry.requestId}\t${entry.sessionId}\n`);
     }
     return;
   }
 
   if (entries.length === 0) {
-    process.stdout.write("No parked requests\n");
+    // Not "no parked requests": the listing covers settled states too.
+    process.stdout.write("No requests\n");
     return;
   }
 
   for (const entry of entries) {
     process.stdout.write(
-      `${entry.requestId}\t${entry.state}\t${entry.toolCall.title}\t${requestOptionSummary(entry)}\t${entry.createdAt}\n`,
+      `${entry.requestId}\t${entry.state}\t${entry.sessionId}\t${entry.toolCall.title}\t${requestOptionSummary(entry)}\t${entry.createdAt}\n`,
     );
   }
 }
@@ -196,11 +227,31 @@ function printRespondResultByFormat(entry: PendingRequest, format: OutputFormat)
   process.stdout.write(`${entry.state}${selected}: ${entry.requestId}\n`);
 }
 
-function createWarn(jsonStrict: boolean | undefined): (message: string) => void {
+/**
+ * A listing that could not reach a live owner is a listing that may be short,
+ * and a machine consumer is exactly the caller who cannot notice that. The
+ * diagnostic is therefore never suppressed, not even under --json-strict, whose
+ * contract is that stderr carries no NON-JSON output: in JSON mode it is
+ * emitted as an `_acpx/warning` notification, matching the other `_acpx/*`
+ * extension notifications acpx already writes.
+ *
+ * It stays on stderr rather than in the payload because `requests --json` is a
+ * bare array of persisted entries, and wrapping it would break the one shape
+ * the file on disk, the queue wire, and this listing share.
+ */
+function createWarn(format: OutputFormat): (message: string) => void {
   return (message: string) => {
-    if (jsonStrict !== true) {
-      process.stderr.write(`[acpx] warning: ${message}\n`);
+    if (format === "json") {
+      process.stderr.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "_acpx/warning",
+          params: { code: "QUEUE_OWNER_UNREACHABLE", message },
+        })}\n`,
+      );
+      return;
     }
+    process.stderr.write(`[acpx] warning: ${message}\n`);
   };
 }
 
@@ -219,7 +270,7 @@ export async function handleRequestsList(
       // one of them silently would hide which.
       throw new InvalidArgumentError("--all cannot be combined with -s/--session");
     }
-    printRequestsByFormat(await listAllRequests(), format);
+    printRequestsByFormat(await listAllRequests(createWarn(format)), format);
     return;
   }
 
@@ -230,10 +281,7 @@ export async function handleRequestsList(
     agent.cwd,
     sessionName,
   );
-  printRequestsByFormat(
-    await listSessionRequests(record.acpxRecordId, createWarn(globalFlags.jsonStrict)),
-    format,
-  );
+  printRequestsByFormat(await listSessionRequests(record.acpxRecordId, createWarn(format)), format);
 }
 
 /**

@@ -206,10 +206,12 @@ Behavior:
 - `--defer` parks `defer`-matched permission requests instead of denying them for the turn: the turn stays blocked and a durable record is written under `~/.acpx/requests/`.
 - `--defer` and `--defer-max-age <seconds>` are owner-level, fixed when the session's queue owner starts; a submit a warm owner cannot honour is refused, not silently denied.
 - `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session, needs no session in the current directory, and cannot be combined with `-s`.
+- `requests` observes only: it never rewrites request state and never touches the owner process. A request left `pending` by a dead owner is reconciled to `orphaned` by `respond` or by the session's next queue owner.
+- `-s` takes a session **name**; the JSON carries `session_id` and `cwd`. Answer a request listed by `--all` from its `cwd`.
 - `requests --json` prints the persisted store entries verbatim (snake_case, `acpx.pending_request.v1`). Bind scripts to that shape.
 - `respond` takes exactly one of `--option <optionId>`, `--decline`, or `--cancel`. Option ids come from the `options` array of the listed request.
 - `respond` exits `2` when the answer cannot apply (unknown option, unknown or settled request) and `4` when the owner that parked the request is gone.
-- `status` reports the parked count (`parkedRequests` in JSON).
+- `status` reports the parked count (`parkedRequests` in JSON), counting `pending` requests only.
 
 ### Sessions
 

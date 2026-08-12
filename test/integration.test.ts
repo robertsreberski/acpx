@@ -5381,6 +5381,13 @@ function queueOwnerLockPath(homeDir: string, sessionId: string): string {
   return path.join(homeDir, ".acpx", "queues", `${queueKey}.lock`);
 }
 
+async function staleQueueOwnerHeartbeat(homeDir: string, sessionId: string): Promise<void> {
+  const lockPath = queueOwnerLockPath(homeDir, sessionId);
+  const parsed = JSON.parse(await fs.readFile(lockPath, "utf8")) as Record<string, unknown>;
+  parsed.heartbeatAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  await fs.writeFile(lockPath, `${JSON.stringify(parsed)}\n`, "utf8");
+}
+
 async function readQueueOwnerLock(homeDir: string, sessionId: string): Promise<{ pid: number }> {
   const lockPath = queueOwnerLockPath(homeDir, sessionId);
   const payload = await fs.readFile(lockPath, "utf8");
@@ -6156,6 +6163,69 @@ test("integration: requests list surfaces a park whose durable record is missing
     const requestId = String(listed[0]?.request_id);
 
     // And it is still answerable: the owner, not the store, is what holds it.
+    const answered = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--option", "allow"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+  });
+});
+
+test("integration: inspecting a session never retires a live queue owner", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
+    const { pid } = await readQueueOwnerLock(homeDir, sessionId);
+    // Suspend the owner and backdate its heartbeat: alive, holding the parked
+    // promise, and indistinguishable from dead to a staleness check.
+    process.kill(pid, "SIGSTOP");
+    try {
+      await staleQueueOwnerHeartbeat(homeDir, sessionId);
+
+      const listed = await runCli([...deferArgs, "requests", "--json"], homeDir, {
+        timeoutMs: 30_000,
+      });
+      assert.equal(listed.code, 0, `${listed.stdout}${listed.stderr}`);
+      // The store still answers, and the unreachable owner is reported rather
+      // than passed off as an empty live view.
+      assert.equal(
+        (JSON.parse(listed.stdout.trim()) as Array<{ state: string }>)[0]?.state,
+        "pending",
+        listed.stdout,
+      );
+      assert.match(listed.stderr, /"method":"_acpx\/warning"/);
+
+      const listedAll = await runCli([...deferArgs, "requests", "--json", "--all"], homeDir, {
+        timeoutMs: 30_000,
+      });
+      assert.equal(listedAll.code, 0, `${listedAll.stdout}${listedAll.stderr}`);
+
+      // --json-strict suppresses non-JSON stderr; it must not suppress the one
+      // diagnostic that says this listing may be short, since a machine
+      // consumer cannot notice that on its own.
+      const strict = await runCli(
+        [...deferArgs, "--format", "json", "--json-strict", "requests"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(strict.code, 0, `${strict.stdout}${strict.stderr}`);
+      assert.deepEqual(
+        (JSON.parse(strict.stderr.trim()) as { method: string; params: { code: string } }).params
+          .code,
+        "QUEUE_OWNER_UNREACHABLE",
+        strict.stderr,
+      );
+
+      // The owner is still running and the park is still answerable: an
+      // inspection command must not kill what it is inspecting, and must not
+      // orphan requests whose answers are still coming.
+      assert.equal(isPidAlive(pid), true, "listing retired a live queue owner");
+      assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+    } finally {
+      process.kill(pid, "SIGCONT");
+    }
+
+    // And the resumed owner can still answer it.
+    const requestId = (await readStoredPendingRequests(homeDir))[0]?.request_id ?? "";
     const answered = await runCli(
       [...deferArgs, "--format", "json", "respond", requestId, "--option", "allow"],
       homeDir,

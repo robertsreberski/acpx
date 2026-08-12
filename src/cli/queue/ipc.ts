@@ -20,6 +20,7 @@ import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
   QUEUE_PROTOCOL_DEFER_VERSION,
+  readLiveQueueOwner,
   type QueueOwnerRecord,
   queueOwnerProtocolVersion,
   readQueueOwnerRecord,
@@ -209,6 +210,12 @@ function parseQueueOwnerResponseLine(
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
+  /**
+   * Give up waiting for the owner's reply after this long. Only for requests
+   * whose caller must stay responsive: a connected but suspended owner never
+   * answers, and the socket stays open, so nothing else ends the wait.
+   */
+  responseTimeoutMs?: number;
   onAccepted?: (controls: QueueOwnerRequestControls<TResult>) => void;
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
@@ -227,11 +234,20 @@ async function runQueueOwnerRequest<TResult>(options: {
       acknowledged: false,
     };
 
+    let responseTimer: NodeJS.Timeout | undefined;
+    const clearResponseTimer = () => {
+      if (responseTimer) {
+        clearTimeout(responseTimer);
+        responseTimer = undefined;
+      }
+    };
+
     const finishResolve = (result: TResult) => {
       if (settled) {
         return;
       }
       settled = true;
+      clearResponseTimer();
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.end();
@@ -244,12 +260,29 @@ async function runQueueOwnerRequest<TResult>(options: {
         return;
       }
       settled = true;
+      clearResponseTimer();
       socket.removeAllListeners();
       if (!socket.destroyed) {
         socket.destroy();
       }
       reject(error);
     };
+
+    if (options.responseTimeoutMs !== undefined) {
+      responseTimer = setTimeout(() => {
+        finishReject(
+          new QueueConnectionError(
+            `Queue owner did not respond within ${options.responseTimeoutMs}ms`,
+            {
+              detailCode: "QUEUE_RESPONSE_TIMEOUT",
+              origin: "queue",
+              retryable: true,
+            },
+          ),
+        );
+      }, options.responseTimeoutMs);
+      responseTimer.unref?.();
+    }
 
     const controls: QueueOwnerRequestControls<TResult> = {
       state,
@@ -481,10 +514,12 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   owner: QueueOwnerRecord,
   request: QueueRequest,
   isExpectedResponse: (message: QueueOwnerMessage) => message is TResponse,
+  responseTimeoutMs?: number,
 ): Promise<TResponse | undefined> {
   return await runQueueOwnerRequest<TResponse>({
     owner,
     request,
+    ...(responseTimeoutMs === undefined ? {} : { responseTimeoutMs }),
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
@@ -1008,6 +1043,14 @@ export async function trySetModelOnRunningOwner(
   );
 }
 
+/**
+ * Decide what an unreachable owner means, without touching it.
+ *
+ * The other verbs probe owner health here, which retires — and kills — an owner
+ * whose heartbeat has gone stale. These two verbs must not: the process they
+ * cannot reach right now is the process holding the parked promise they exist
+ * to answer, and a stale heartbeat is a symptom, not proof of death.
+ */
 async function requireAcceptingOwner<T>(
   sessionId: string,
   response: T | undefined,
@@ -1017,8 +1060,7 @@ async function requireAcceptingOwner<T>(
     return response;
   }
 
-  const health = await probeQueueOwnerHealth(sessionId);
-  if (!health.hasLease) {
+  if (!(await readLiveQueueOwner(sessionId))) {
     return undefined;
   }
 
@@ -1041,6 +1083,8 @@ async function requireAcceptingOwner<T>(
  */
 export async function tryListRequestsOnRunningOwner(options: {
   sessionId: string;
+  /** Bound the wait; an owner that never answers must not hang the caller. */
+  responseTimeoutMs?: number;
   verbose?: boolean;
 }): Promise<PendingRequest[] | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
@@ -1058,6 +1102,7 @@ export async function tryListRequestsOnRunningOwner(options: {
     request,
     (message): message is QueueOwnerListRequestsResultMessage =>
       message.type === "list_requests_result",
+    options.responseTimeoutMs,
   );
   if (options.verbose && response) {
     process.stderr.write(
@@ -1067,7 +1112,13 @@ export async function tryListRequestsOnRunningOwner(options: {
   return (await requireAcceptingOwner(options.sessionId, response, "list_requests"))?.requests;
 }
 
-/** Answer a parked request on the owner that parked it. */
+/**
+ * Answer a parked request on the owner that parked it.
+ *
+ * Deliberately without a response timeout, unlike the listing: once the answer
+ * is on the wire the owner may apply it at any moment, so giving up early would
+ * report a failure for a request that is about to be settled.
+ */
 export async function tryRespondOnRunningOwner(options: {
   sessionId: string;
   pendingRequestId: string;

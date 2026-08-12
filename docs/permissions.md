@@ -55,7 +55,7 @@ acpx codex respond <request-id> --option allow
 ```
 
 - `--defer` and `--defer-max-age <seconds>` are owner-level: they are fixed when the session's queue owner starts. A submit that a warm owner cannot honour is refused rather than silently denied.
-- A parked request expires after `--defer-max-age` (default `86400`, `0` never expires). Expiry resolves like a rejection, never like an approval.
+- A parked request expires after `--defer-max-age` (default `86400`, `0` never expires; a request parked indefinitely carries no `expires_at`). Expiry resolves like a rejection, never like an approval.
 - Cancelling the session or stopping the owner unwinds parked requests; requests a stopped owner left behind become `orphaned` and can no longer be answered.
 - [`acpx <agent> requests`](CLI.md#requests-command) lists them and [`acpx <agent> respond`](CLI.md#respond-command) answers them. `acpx <agent> status` reports how many are parked.
 - Every transition is also emitted into the session event stream as an `_acpx/pending_request` notification, so a `--no-wait` caller still sees park and answer events.

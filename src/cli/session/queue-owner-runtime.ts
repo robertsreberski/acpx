@@ -197,6 +197,11 @@ function createParkingBridge(params: {
     // ctx.signal is per ACP session, not per turn), so there is no key to look
     // the right context up by.
     //
+    // The attribution mechanism of record is therefore the notification payload
+    // itself: every _acpx/pending_request event carries the owning task id in
+    // request.taskRequestId, so a reader attributes by that field rather than
+    // by which turn's log segment the event happened to land in.
+    //
     // Routing each request's later transitions by its own taskRequestId — the
     // one thing such a map would buy — would make delivery worse, not better.
     // Turns are serialized, so a retired task's sink writes into a batch nobody

@@ -344,16 +344,19 @@ Lists the permission requests this session has parked with [`--defer`](permissio
 Behavior:
 
 - Reads the durable request store, so it keeps working when the queue owner is unreachable.
-- Reconciles first: requests left pending by an owner that is gone are marked `orphaned`, and terminal entries past the retention window are deleted.
-- Adds anything a live owner is holding that the store does not know about. When the owner cannot be reached, the listing still prints and a warning goes to stderr.
-- `--all` lists every session's parked requests and needs no session in the current directory. It cannot be combined with `-s`. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
-- States are `pending`, `answered`, `cancelled`, `expired`, and `orphaned`. Only `pending` requests can be answered.
+- Observes only. It never rewrites request state: marking an entry `orphaned` claims its owner is gone, and only a caller holding proof of that may make the claim — the session's next queue owner, or [`respond`](#respond-command). A `pending` entry whose owner has died therefore keeps reading `pending` until one of those looks at it.
+- Never touches the owner process. A live owner whose heartbeat has gone stale (a suspended process, a machine that slept, a loaded event loop) is left running.
+- Adds anything a live owner is holding that the store does not know about, waiting at most two seconds for it. When the owner cannot be reached the listing still prints, and the gap is reported on stderr — as an `_acpx/warning` JSON-RPC notification under `--format json` (including `--json-strict`, whose contract is that stderr carries no _non-JSON_ output) and as `[acpx] warning: …` otherwise.
+- `--all` lists every session's requests with the same live cross-check, bounded to sessions that still have a live owner. It needs no session in the current directory and cannot be combined with `-s`. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
+- States are `pending`, `answered`, `cancelled`, `expired`, and `orphaned`. The listing shows all of them; only `pending` requests can be answered.
 
 Output:
 
-- `--json` (or `--format json`) prints the persisted store entries verbatim: a JSON array of `acpx.pending_request.v1` objects with snake_case keys. This is the same shape as the files under `~/.acpx/requests/` and is the contract scripts should bind to.
-- Text prints one tab-separated line per request: id, state, tool title, offered option ids, creation time.
-- Quiet prints one request id per line.
+- `--json` (or `--format json`) prints the persisted store entries verbatim: a JSON array of `acpx.pending_request.v1` objects with snake_case keys. This is the same shape as the files under `~/.acpx/requests/` and is the contract scripts should bind to. `expires_at` is absent when the owner runs with `--defer-max-age 0`, which parks indefinitely.
+- Text prints one tab-separated line per request: id, state, session id, tool title, offered option ids, creation time.
+- Quiet prints one tab-separated `id session-id` line per request.
+- `-s` selects a session by **name**, while the JSON carries the session's record id as `session_id` and its directory as `cwd`. To answer a request listed by `--all`, run `respond` from that `cwd` (or pass the session's name with `-s`).
+- `--json` selects this command's result shape. Error envelopes follow the global `--format json`, as they do for `compare --json`.
 
 ## `respond` command
 
@@ -466,9 +469,11 @@ Status checks are local and PID-based (`kill(pid, 0)` semantics). Cached session
 PIDs are not reported unless a live queue-owner lease ties them to the session.
 
 The parked count comes from the durable request store, not from the queue owner,
-so it still reports after the owner is gone. `status` only reports it; use
-[`requests`](#requests-command) to reconcile and answer. JSON output carries it
-as `parkedRequests`; quiet output adds a `parked:<n>` line only when at least one
+so it still reports after the owner is gone, and it counts only requests still
+`pending`. `status` never opens the queue socket, so unlike
+[`requests`](#requests-command) it cannot see a park whose durable record failed
+to write; `requests` is the authoritative view. JSON output carries the count as
+`parkedRequests`; quiet output adds a `parked:<n>` line only when at least one
 request is parked. See [permissions](permissions.md) for `--defer`.
 
 ## `config` command

@@ -120,6 +120,14 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
  * owner, because the count matters most when the owner is unreachable — that is
  * exactly when an operator needs to know something is still waiting. Nothing is
  * reconciled here: `status` reports, `requests` decides.
+ *
+ * Consequence, deliberate: `status` never opens the queue socket, so it cannot
+ * see a park whose durable write failed, while `acpx <agent> requests` asks the
+ * live owner and can. `status` stays a cheap local summary; `requests` is the
+ * authoritative view. Documented in docs/CLI.md.
+ *
+ * Counts `pending` only — the states a listing also shows (`answered`,
+ * `cancelled`, `expired`, `orphaned`) are history, not something waiting.
  */
 async function countParkedRequests(sessionId: string): Promise<number> {
   const entries = await listPendingRequests(sessionId).catch(() => []);
