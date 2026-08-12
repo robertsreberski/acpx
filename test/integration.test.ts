@@ -6139,6 +6139,32 @@ test("integration: respond refuses exactly-one-answer violations before touching
   });
 });
 
+test("integration: requests list surfaces a park whose durable record is missing", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const requestsDir = path.join(homeDir, ".acpx", "requests");
+    const sessionDir = path.join(requestsDir, (await fs.readdir(requestsDir))[0] ?? "");
+    const files = await fs.readdir(sessionDir);
+    assert.equal(files.length, 1, files.join(", "));
+    // Stand in for the documented failure mode the manager tolerates: the owner
+    // is blocked on this request but its durable write did not land.
+    await fs.rm(path.join(sessionDir, files[0] ?? ""));
+    assert.deepEqual(await readStoredPendingRequests(homeDir), []);
+
+    const listed = await listRequestsJson(homeDir, deferArgs);
+    assert.equal(listed.length, 1, listed.length === 0 ? "live park was not listed" : "");
+    assert.equal(listed[0]?.state, "pending");
+    const requestId = String(listed[0]?.request_id);
+
+    // And it is still answerable: the owner, not the store, is what holds it.
+    const answered = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--option", "allow"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+  });
+});
+
 test("integration: status reports parked requests, and a dead owner orphans them", async () => {
   await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
     const parkedStatus = await runCli([...deferArgs, "--format", "json", "status"], homeDir);
@@ -6170,9 +6196,13 @@ test("integration: status reports parked requests, and a dead owner orphans them
       homeDir,
       { timeoutMs: 30_000 },
     );
-    // Nothing can answer a request whose waiter died with its owner.
+    // Nothing can answer a request whose waiter died with its owner, and the
+    // refusal names that as the reason rather than reporting a failed delivery.
     assert.equal(answered.code, 4, `${answered.stdout}${answered.stderr}`);
-    assert.match(`${answered.stdout}${answered.stderr}`, /can no longer be answered/);
+    assert.match(
+      `${answered.stdout}${answered.stderr}`,
+      /can no longer be answered: its queue owner is no longer running/,
+    );
 
     const listed = await listRequestsJson(homeDir, deferArgs);
     assert.equal(listed[0]?.state, "orphaned", JSON.stringify(listed));
