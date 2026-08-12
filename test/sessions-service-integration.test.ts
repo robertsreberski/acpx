@@ -248,7 +248,7 @@ test("duplicate provider adoption survives configured command drift without reco
   });
 });
 
-test("provider session ids cannot collide across registered agent identities", async () => {
+test("adapter-scoped provider ids can map to distinct registered agent identities", async () => {
   await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -267,27 +267,24 @@ test("provider session ids cannot collide across registered agent identities", a
       idempotencyKey: "adopt-alpha-provider",
     });
 
-    await assert.rejects(
-      async () =>
-        await service.adoptSession({
-          agentId: "beta",
-          cwd,
-          providerSessionId: provider.providerSessionId,
-          idempotencyKey: "adopt-beta-collision",
-        }),
-      (error: unknown) => {
-        assert.ok(error instanceof AcpxSessionAdoptionError);
-        assert.match(error.message, /already adopted by agent "alpha"/u);
-        return true;
-      },
-    );
+    const beta = await service.adoptSession({
+      agentId: "beta",
+      cwd,
+      providerSessionId: provider.providerSessionId,
+      idempotencyKey: "adopt-beta-provider",
+    });
     const records = await listSessions();
-    assert.equal(records.length, 1);
-    assert.equal(records[0]?.acpxRecordId, adopted.result.acpxRecordId);
-    assert.equal(records[0]?.acpx?.agent_id, "alpha");
+    assert.equal(records.length, 2);
+    assert.notEqual(beta.result.acpxRecordId, adopted.result.acpxRecordId);
+    assert.equal(beta.result.acpSessionId, adopted.result.acpSessionId);
+    assert.deepEqual(records.map((record) => record.acpx?.agent_id).toSorted(), ["alpha", "beta"]);
     assert.equal(
       (await service.getSession({ acpxRecordId: adopted.result.acpxRecordId }))?.agentId,
       "alpha",
+    );
+    assert.equal(
+      (await service.getSession({ acpxRecordId: beta.result.acpxRecordId }))?.agentId,
+      "beta",
     );
     service.dispose();
   });

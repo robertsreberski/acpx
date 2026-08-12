@@ -409,6 +409,62 @@ test("pending permissions and elicitations project without raw tool input", asyn
   });
 });
 
+test("a first pending request on a newly observed session emits an invalidation", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-first-pending-invalidation",
+      acpSessionId: "provider-first-pending-invalidation",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const now = new Date().toISOString();
+    const pending: PendingRequest = {
+      schema: PENDING_REQUEST_SCHEMA,
+      sessionId: initial.acpxRecordId,
+      acpSessionId: initial.acpSessionId,
+      agentCommand: initial.agentCommand,
+      cwd,
+      kind: "permission",
+      state: "pending",
+      requestId: "first-pending",
+      createdAt: now,
+      updatedAt: now,
+      ownerPid: 999_999,
+      ownerGeneration: 81,
+      taskRequestId: "turn-first-pending",
+      toolCall: { toolCallId: "tool-first", title: "Run checks", kind: "execute" },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    };
+    const service = createAcpxSessionService({ cwd, timelinePollMs: 100 });
+    let unsubscribe = () => {};
+    try {
+      const invalidated = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("timed out waiting for first pending invalidation")),
+          2_000,
+        );
+        unsubscribe = service.subscribe((event) => {
+          if (event.type === "pending" && event.acpxRecordId === initial.acpxRecordId) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+      });
+      // Let the initial empty poll establish its baseline. The session and its
+      // first park then appear in one interval, matching create+prompt races.
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      await writeSessionRecordFile(homeDir, initial);
+      await writePendingRequest(pending);
+      await invalidated;
+    } finally {
+      unsubscribe();
+      service.dispose();
+    }
+  });
+});
+
 test("pending responses inherit a bounded service timeout when the request omits one", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

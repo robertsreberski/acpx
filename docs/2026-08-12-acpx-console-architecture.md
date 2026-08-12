@@ -84,8 +84,8 @@ Suffix or fuzzy session matching is not exposed over HTTP.
 Service-created records use a collision-safe local `acpxRecordId` independent
 of the adapter-scoped provider session ID. Adoption persists the registered
 agent identity with that mapping: command upgrades for the same agent keep the
-record, while a provider-ID collision from a different agent is rejected rather
-than returning or overwriting the wrong transcript.
+record, while the same adapter-scoped provider ID from a different agent gets a
+separate local record rather than returning or overwriting the wrong transcript.
 
 State is a product of independent axes:
 

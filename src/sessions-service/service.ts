@@ -396,16 +396,12 @@ class SessionService implements AcpxSessionService {
         }
         return await this.projectDetail(existing);
       }
-      if (candidates.length > 0) {
-        const owner = candidates[0]?.acpx?.agent_id;
+      const unverified = candidates.find((record) => record.acpx?.agent_id === undefined);
+      if (unverified) {
         throw new AcpxSessionAdoptionError(
           agent.agentId,
           providerSessionId,
-          new Error(
-            owner
-              ? `provider session is already adopted by agent ${JSON.stringify(owner)}`
-              : "provider session is already adopted by an unverified agent command",
-          ),
+          new Error("provider session is already adopted by an unverified agent command"),
         );
       }
     }
@@ -796,7 +792,10 @@ class SessionService implements AcpxSessionService {
         const pending = await listStoredPendingRequests(record.acpxRecordId);
         const nextPending = pendingFingerprint(pending);
         const previousPending = this.observedPending.get(record.acpxRecordId);
-        if (previousPending !== undefined && previousPending !== nextPending) {
+        if (
+          (previousPending !== undefined && previousPending !== nextPending) ||
+          (previousPending === undefined && pending.length > 0)
+        ) {
           this.emit({ type: "pending", acpxRecordId: record.acpxRecordId });
         }
         this.observedPending.set(record.acpxRecordId, nextPending);
