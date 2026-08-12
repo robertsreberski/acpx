@@ -5,12 +5,16 @@ import { isPromptInput, textPrompt } from "../../prompt-content.js";
 import {
   OUTPUT_ERROR_CODES,
   OUTPUT_ERROR_ORIGINS,
+  PERMISSION_ESCALATION_ACTIONS,
+  PERMISSION_POLICY_ACTIONS,
   type AcpClientOptions,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
   type OutputErrorOrigin,
+  type PermissionEscalationAction,
   type PermissionEscalationEvent,
   type PermissionPolicy,
+  type PermissionPolicyAction,
 } from "../../types.js";
 import type {
   AcpJsonRpcMessage,
@@ -202,7 +206,7 @@ function isPermissionPolicy(value: unknown): value is PermissionPolicy {
 }
 
 function hasValidPermissionRuleLists(record: Record<string, unknown>): boolean {
-  const stringListKeys = ["autoApprove", "autoDeny", "escalate"] as const;
+  const stringListKeys = ["autoApprove", "autoDeny", "escalate", "defer"] as const;
   for (const key of stringListKeys) {
     if (!isOptionalStringList(record[key])) {
       return false;
@@ -218,9 +222,15 @@ function isOptionalStringList(value: unknown): boolean {
 function hasValidPermissionDefaultAction(record: Record<string, unknown>): boolean {
   return (
     record.defaultAction == null ||
-    record.defaultAction === "approve" ||
-    record.defaultAction === "deny" ||
-    record.defaultAction === "escalate"
+    (typeof record.defaultAction === "string" &&
+      PERMISSION_POLICY_ACTIONS.includes(record.defaultAction as PermissionPolicyAction))
+  );
+}
+
+function isPermissionEscalationAction(value: unknown): value is PermissionEscalationAction {
+  return (
+    typeof value === "string" &&
+    PERMISSION_ESCALATION_ACTIONS.includes(value as PermissionEscalationAction)
   );
 }
 
@@ -247,7 +257,7 @@ function hasRequiredPermissionEscalationFields(event: Record<string, unknown>): 
     typeof event.sessionId === "string" &&
     typeof event.toolCallId === "string" &&
     typeof event.toolTitle === "string" &&
-    event.action === "escalate" &&
+    isPermissionEscalationAction(event.action) &&
     typeof event.message === "string" &&
     typeof event.timestamp === "string"
   );

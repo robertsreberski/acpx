@@ -51,13 +51,21 @@ export type AuthPolicy = (typeof AUTH_POLICIES)[number];
 export const NON_INTERACTIVE_PERMISSION_POLICIES = ["deny", "fail"] as const;
 export type NonInteractivePermissionPolicy = (typeof NON_INTERACTIVE_PERMISSION_POLICIES)[number];
 
-export const PERMISSION_POLICY_ACTIONS = ["approve", "deny", "escalate"] as const;
+export const PERMISSION_POLICY_ACTIONS = ["approve", "deny", "escalate", "defer"] as const;
 export type PermissionPolicyAction = (typeof PERMISSION_POLICY_ACTIONS)[number];
+
+/**
+ * Policy actions that hand the request back to a human or orchestrator instead
+ * of settling it. Both surface a `PermissionEscalationEvent`.
+ */
+export const PERMISSION_ESCALATION_ACTIONS = ["escalate", "defer"] as const;
+export type PermissionEscalationAction = (typeof PERMISSION_ESCALATION_ACTIONS)[number];
 
 export type PermissionPolicy = {
   autoApprove?: string[];
   autoDeny?: string[];
   escalate?: string[];
+  defer?: string[];
   defaultAction?: PermissionPolicyAction;
 };
 
@@ -69,7 +77,7 @@ export type PermissionEscalationEvent = {
   toolTitle: string;
   toolInput?: unknown;
   toolKind?: ToolKind;
-  action: "escalate";
+  action: PermissionEscalationAction;
   matchedRule?: string;
   message: string;
   timestamp: string;

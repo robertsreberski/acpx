@@ -9,6 +9,7 @@ import { promptForPermission } from "./permission-prompt.js";
 import type {
   AcpPermissionDecision,
   NonInteractivePermissionPolicy,
+  PermissionEscalationAction,
   PermissionEscalationEvent,
   PermissionMode,
   PermissionPolicy,
@@ -16,9 +17,12 @@ import type {
 } from "./types.js";
 
 type PermissionDecision = "approved" | "denied" | "cancelled";
-type PermissionPolicyMatch = {
+export type PermissionPolicyMatch = {
   action: PermissionPolicyAction;
   matchedRule?: string;
+};
+type PermissionEscalationPolicyMatch = PermissionPolicyMatch & {
+  action: PermissionEscalationAction;
 };
 export type ResolvedPermissionRequest = {
   response: RequestPermissionResponse;
@@ -192,7 +196,12 @@ function findPolicyRule(
   return undefined;
 }
 
-function matchPermissionPolicy(
+/**
+ * Rule precedence is autoDeny, then autoApprove, then escalate, then defer,
+ * then defaultAction. Exported so callers that park deferred requests can
+ * classify a request before it reaches the resolver.
+ */
+export function matchPermissionPolicy(
   params: RequestPermissionRequest,
   policy: PermissionPolicy | undefined,
 ): PermissionPolicyMatch | undefined {
@@ -215,11 +224,29 @@ function matchPermissionPolicy(
     return { action: "escalate", matchedRule: escalateRule };
   }
 
+  const deferRule = findPolicyRule(policy.defer, params);
+  if (deferRule) {
+    return { action: "defer", matchedRule: deferRule };
+  }
+
   return policy.defaultAction ? { action: policy.defaultAction } : undefined;
+}
+
+function isEscalationPolicyMatch(
+  match: PermissionPolicyMatch | undefined,
+): match is PermissionEscalationPolicyMatch {
+  return match?.action === "escalate" || match?.action === "defer";
+}
+
+function escalationMessage(action: PermissionEscalationAction, toolTitle: string): string {
+  return action === "defer"
+    ? `Permission deferral required for ${toolTitle}`
+    : `Permission escalation required for ${toolTitle}`;
 }
 
 function buildEscalationEvent(
   params: RequestPermissionRequest,
+  action: PermissionEscalationAction,
   matchedRule: string | undefined,
 ): PermissionEscalationEvent {
   const toolKind = inferToolKind(params);
@@ -233,9 +260,9 @@ function buildEscalationEvent(
     toolTitle,
     ...(params.toolCall.rawInput !== undefined ? { toolInput: params.toolCall.rawInput } : {}),
     ...(toolKind ? { toolKind } : {}),
-    action: "escalate",
+    action,
     ...(matchedRule ? { matchedRule } : {}),
-    message: `Permission escalation required for ${toolTitle}`,
+    message: escalationMessage(action, toolTitle),
     timestamp: new Date().toISOString(),
   };
 }
@@ -253,7 +280,7 @@ function selectedOrCancelled(option: PermissionOption | undefined): ResolvedPerm
 
 async function resolveEscalatingPermissionRequest(
   params: RequestPermissionRequest,
-  policyMatch: PermissionPolicyMatch,
+  policyMatch: PermissionEscalationPolicyMatch,
   allowOption: PermissionOption | undefined,
   rejectOption: PermissionOption | undefined,
 ): Promise<ResolvedPermissionRequest> {
@@ -261,7 +288,7 @@ async function resolveEscalatingPermissionRequest(
     return resolveInteractivePromptResult(params, allowOption, rejectOption);
   }
 
-  const escalation = buildEscalationEvent(params, policyMatch.matchedRule);
+  const escalation = buildEscalationEvent(params, policyMatch.action, policyMatch.matchedRule);
   const response = rejectOption ? selected(rejectOption.optionId) : cancelled();
   return {
     response: withEscalationMetadata(response, escalation),
@@ -297,7 +324,9 @@ function resolvePolicyMatch(
   if (policyMatch?.action === "deny") {
     return selectedOrCancelled(rejectOption);
   }
-  if (policyMatch?.action === "escalate") {
+  // `defer` degrades to the escalate path: without a host that parks the
+  // request, a deferred permission is denied for this turn and reported.
+  if (isEscalationPolicyMatch(policyMatch)) {
     return resolveEscalatingPermissionRequest(params, policyMatch, allowOption, rejectOption);
   }
   return undefined;

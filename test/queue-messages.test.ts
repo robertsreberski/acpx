@@ -572,3 +572,92 @@ test("parseQueueOwnerMessage rejects invalid structured owner message payloads",
     null,
   );
 });
+
+const ESCALATION_EVENT_BASE = {
+  type: "permission_escalation",
+  sessionId: "session-1",
+  toolCallId: "tool-1",
+  toolTitle: "Bash: pnpm test",
+  message: "Permission escalation required for Bash: pnpm test",
+  timestamp: "2026-08-12T00:00:00.000Z",
+} as const;
+
+test("parseQueueOwnerMessage accepts escalate and defer permission escalation actions", () => {
+  for (const action of ["escalate", "defer"] as const) {
+    const event = { ...ESCALATION_EVENT_BASE, action, matchedRule: "execute" };
+    assert.deepEqual(
+      parseQueueOwnerMessage({
+        type: "permission_escalation",
+        requestId: "req-escalation",
+        event,
+      }),
+      {
+        type: "permission_escalation",
+        requestId: "req-escalation",
+        ownerGeneration: undefined,
+        event,
+      },
+    );
+  }
+});
+
+test("parseQueueOwnerMessage rejects an unknown permission escalation action", () => {
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "permission_escalation",
+      requestId: "req-escalation",
+      event: { ...ESCALATION_EVENT_BASE, action: "postpone" },
+    }),
+    null,
+  );
+});
+
+test("parseQueueRequest accepts a permission policy carrying defer rules", () => {
+  const parsed = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-defer",
+    message: "hello",
+    permissionMode: "approve-reads",
+    permissionPolicy: {
+      autoApprove: ["read"],
+      autoDeny: ["delete"],
+      escalate: ["execute"],
+      defer: ["fetch"],
+      defaultAction: "defer",
+    },
+    waitForCompletion: true,
+  });
+
+  assert.deepEqual(parsed?.type === "submit_prompt" ? parsed.permissionPolicy : undefined, {
+    autoApprove: ["read"],
+    autoDeny: ["delete"],
+    escalate: ["execute"],
+    defer: ["fetch"],
+    defaultAction: "defer",
+  });
+});
+
+test("parseQueueRequest rejects a permission policy with a bad defer list or defaultAction", () => {
+  assert.equal(
+    parseQueueRequest({
+      type: "submit_prompt",
+      requestId: "req-defer-bad",
+      message: "hello",
+      permissionMode: "approve-reads",
+      permissionPolicy: { defer: "fetch" },
+      waitForCompletion: true,
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueRequest({
+      type: "submit_prompt",
+      requestId: "req-default-bad",
+      message: "hello",
+      permissionMode: "approve-reads",
+      permissionPolicy: { defaultAction: "postpone" },
+      waitForCompletion: true,
+    }),
+    null,
+  );
+});

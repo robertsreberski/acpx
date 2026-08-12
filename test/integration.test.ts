@@ -2980,6 +2980,73 @@ test("integration: permission policy emits structured escalation event", async (
   });
 });
 
+test("integration: deferred permission policy reports action defer", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const policyPath = path.join(cwd, "permission-policy.json");
+
+    try {
+      await fs.writeFile(policyPath, JSON.stringify({ defer: ["execute"] }), "utf8");
+      const result = await runCli(
+        [
+          "--agent",
+          MOCK_AGENT_COMMAND,
+          "--permission-policy",
+          policyPath,
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "permission execute Bash",
+        ],
+        homeDir,
+      );
+
+      assert.equal(result.code, 5, result.stderr);
+      const escalation = result.stdout
+        .trim()
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => JSON.parse(line) as { result?: unknown })
+        .map((payload) => {
+          const resultPayload =
+            payload.result && typeof payload.result === "object"
+              ? (payload.result as { _meta?: unknown })
+              : undefined;
+          const meta =
+            resultPayload?._meta && typeof resultPayload._meta === "object"
+              ? (resultPayload._meta as { acpx?: unknown })
+              : undefined;
+          const acpx =
+            meta?.acpx && typeof meta.acpx === "object"
+              ? (meta.acpx as { permissionEscalation?: unknown })
+              : undefined;
+          return acpx?.permissionEscalation as
+            | { action?: string; matchedRule?: string; message?: string }
+            | undefined;
+        })
+        .find(Boolean);
+
+      assert.deepEqual(
+        {
+          action: escalation?.action,
+          matchedRule: escalation?.matchedRule,
+          message: escalation?.message,
+        },
+        {
+          action: "defer",
+          matchedRule: "execute",
+          message: "Permission deferral required for Bash",
+        },
+        result.stdout,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: json-strict suppresses runtime stderr diagnostics", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

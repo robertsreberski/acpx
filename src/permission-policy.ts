@@ -54,7 +54,7 @@ function parseDefaultAction(
 
 function assignRuleList(
   policy: PermissionPolicy,
-  key: "autoApprove" | "autoDeny" | "escalate",
+  key: "autoApprove" | "autoDeny" | "escalate" | "defer",
   value: string[] | undefined,
 ): void {
   if (value) {
@@ -75,6 +75,7 @@ export function parsePermissionPolicy(
   assignRuleList(policy, "autoApprove", parseRuleList(record.autoApprove, "autoApprove", source));
   assignRuleList(policy, "autoDeny", parseRuleList(record.autoDeny, "autoDeny", source));
   assignRuleList(policy, "escalate", parseRuleList(record.escalate, "escalate", source));
+  assignRuleList(policy, "defer", parseRuleList(record.defer, "defer", source));
 
   const defaultAction = parseDefaultAction(record.defaultAction, source);
   if (defaultAction) {

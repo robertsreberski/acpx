@@ -6,6 +6,7 @@ import {
   classifyPermissionDecision,
   decisionToResponse,
   inferToolKind,
+  matchPermissionPolicy,
   resolvePermissionRequest,
   resolvePermissionRequestWithDetails,
 } from "../src/permissions.js";
@@ -215,6 +216,8 @@ test("permission policy escalation emits a structured event in non-TTY", async (
     assert.deepEqual(result.escalation?.toolInput, { command: "pnpm", args: ["test"] });
     assert.equal(result.escalation?.toolKind, "execute");
     assert.equal(result.escalation?.matchedRule, "execute");
+    assert.equal(result.escalation?.action, "escalate");
+    assert.equal(result.escalation?.message, "Permission escalation required for Bash: pnpm test");
     assert.deepEqual(result.response, {
       outcome: { outcome: "selected", optionId: "reject" },
       _meta: {
@@ -224,6 +227,159 @@ test("permission policy escalation emits a structured event in non-TTY", async (
       },
     });
   });
+});
+
+test("permission policy defer degrades to the escalation path in non-TTY", async () => {
+  await withNonTty(async () => {
+    const result = await resolvePermissionRequestWithDetails(
+      makeRequestWithTitle("Bash: pnpm test", "execute", undefined, {
+        command: "pnpm",
+        args: ["test"],
+      }),
+      "approve-reads",
+      "deny",
+      { defer: ["execute"] },
+    );
+
+    assert.equal(result.escalation?.type, "permission_escalation");
+    assert.equal(result.escalation?.action, "defer");
+    assert.equal(result.escalation?.sessionId, "session-1");
+    assert.equal(result.escalation?.toolName, "Bash");
+    assert.equal(result.escalation?.toolTitle, "Bash: pnpm test");
+    assert.deepEqual(result.escalation?.toolInput, { command: "pnpm", args: ["test"] });
+    assert.equal(result.escalation?.toolKind, "execute");
+    assert.equal(result.escalation?.matchedRule, "execute");
+    assert.equal(result.escalation?.message, "Permission deferral required for Bash: pnpm test");
+    assert.deepEqual(result.response, {
+      outcome: { outcome: "selected", optionId: "reject" },
+      _meta: {
+        acpx: {
+          permissionEscalation: result.escalation,
+        },
+      },
+    });
+  });
+});
+
+test("permission policy defer cancels when the request offers no reject option", async () => {
+  await withNonTty(async () => {
+    const result = await resolvePermissionRequestWithDetails(
+      makeRequestWithTitle("Bash: pnpm test", "execute", [
+        { optionId: "allow", kind: "allow_once" },
+      ]),
+      "approve-all",
+      "deny",
+      { defer: ["execute"] },
+    );
+
+    assert.equal(result.escalation?.action, "defer");
+    assert.deepEqual(result.response, {
+      outcome: { outcome: "cancelled" },
+      _meta: {
+        acpx: {
+          permissionEscalation: result.escalation,
+        },
+      },
+    });
+  });
+});
+
+test("permission policy defer prompts interactively just like escalate", async () => {
+  await withTtyState({ stdin: true, stderr: true }, async () => {
+    await withMockedReadline(
+      () => ({
+        question: async () => "yes",
+        close: () => {},
+      }),
+      async () => {
+        const result = await resolvePermissionRequestWithDetails(
+          makeRequestWithTitle("Bash: pnpm test", "execute"),
+          "deny-all",
+          "deny",
+          { defer: ["execute"] },
+        );
+
+        assert.equal(result.escalation, undefined);
+        assert.deepEqual(result.response, {
+          outcome: { outcome: "selected", optionId: "allow" },
+        });
+      },
+    );
+  });
+});
+
+test("permission policy defaultAction defer degrades to a defer escalation", async () => {
+  await withNonTty(async () => {
+    const result = await resolvePermissionRequestWithDetails(
+      makeRequestWithTitle("Write", "edit"),
+      "approve-all",
+      "deny",
+      { autoApprove: ["read"], defaultAction: "defer" },
+    );
+
+    assert.equal(result.escalation?.action, "defer");
+    assert.equal(result.escalation?.matchedRule, undefined);
+    assert.deepEqual(result.response, {
+      outcome: { outcome: "selected", optionId: "reject" },
+      _meta: {
+        acpx: {
+          permissionEscalation: result.escalation,
+        },
+      },
+    });
+  });
+});
+
+test("matchPermissionPolicy ranks autoDeny, autoApprove, escalate, defer, then defaultAction", () => {
+  const request = makeRequestWithTitle("Bash: pnpm test", "execute");
+
+  assert.deepEqual(
+    matchPermissionPolicy(request, {
+      autoDeny: ["execute"],
+      autoApprove: ["execute"],
+      escalate: ["execute"],
+      defer: ["execute"],
+      defaultAction: "approve",
+    }),
+    { action: "deny", matchedRule: "execute" },
+  );
+  assert.deepEqual(
+    matchPermissionPolicy(request, {
+      autoApprove: ["execute"],
+      escalate: ["execute"],
+      defer: ["execute"],
+      defaultAction: "approve",
+    }),
+    { action: "approve", matchedRule: "execute" },
+  );
+  assert.deepEqual(
+    matchPermissionPolicy(request, {
+      escalate: ["execute"],
+      defer: ["execute"],
+      defaultAction: "approve",
+    }),
+    { action: "escalate", matchedRule: "execute" },
+  );
+  assert.deepEqual(
+    matchPermissionPolicy(request, { defer: ["execute"], defaultAction: "approve" }),
+    { action: "defer", matchedRule: "execute" },
+  );
+  assert.deepEqual(matchPermissionPolicy(request, { defer: ["read"], defaultAction: "defer" }), {
+    action: "defer",
+  });
+});
+
+test("matchPermissionPolicy is unaffected by an absent defer list", () => {
+  const request = makeRequestWithTitle("Bash: pnpm test", "execute");
+
+  assert.equal(matchPermissionPolicy(request, undefined), undefined);
+  assert.equal(matchPermissionPolicy(request, {}), undefined);
+  assert.equal(matchPermissionPolicy(request, { escalate: ["read"] }), undefined);
+  assert.deepEqual(matchPermissionPolicy(request, { escalate: ["execute"] }), {
+    action: "escalate",
+    matchedRule: "execute",
+  });
+  assert.deepEqual(matchPermissionPolicy(request, { defaultAction: "deny" }), { action: "deny" });
 });
 
 test("permission policy matches raw tool names but not raw command arguments", async () => {

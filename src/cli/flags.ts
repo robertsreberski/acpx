@@ -316,7 +316,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--permission-policy <json-or-file>",
-      "Permission policy JSON or path (autoApprove, autoDeny, escalate, defaultAction)",
+      "Permission policy JSON or path (autoApprove, autoDeny, escalate, defer, defaultAction)",
     )
     .option("--policy <json-or-file>", "Alias for --permission-policy")
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
