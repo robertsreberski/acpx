@@ -144,6 +144,112 @@ test("session creation recovers the persisted provider record after post-create 
   });
 });
 
+test("session creation with a fresh key reconciles a post-create mode failure", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "fresh-create-calls.ndjson");
+    const failOnceMarker = path.join(homeDir, "fresh-create-mode-failed-once");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: [
+          "--supports-resume-session",
+          "--set-session-mode-fails-once",
+          failOnceMarker,
+          "--call-log",
+          callLog,
+        ],
+      },
+    });
+    const service = createAcpxSessionService({ cwd });
+    const firstInput = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      idempotencyKey: "fresh-create-first",
+    };
+
+    await assert.rejects(async () => await service.createSession(firstInput), /Internal error/u);
+    const [partial] = await listSessions();
+    assert.ok(partial);
+
+    const recovered = await service.createSession({
+      ...firstInput,
+      idempotencyKey: "fresh-create-second",
+    });
+    const originalReplay = await service.createSession(firstInput);
+    assert.equal(recovered.replayed, true);
+    assert.equal(recovered.result.acpxRecordId, partial.acpxRecordId);
+    assert.equal(recovered.result.mode, "plan");
+    assert.equal(originalReplay.replayed, true);
+    assert.equal(originalReplay.result.acpxRecordId, partial.acpxRecordId);
+    assert.equal((await listSessions()).length, 1);
+    const calls = (await fs.readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string });
+    assert.equal(calls.filter((entry) => entry.method === "session/new").length, 1);
+    assert.equal(calls.filter((entry) => entry.method === "session/resume").length, 1);
+    service.dispose();
+  });
+});
+
+test("adoption with a fresh key reconciles a post-adopt mode failure", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "fresh-adopt-calls.ndjson");
+    const failOnceMarker = path.join(homeDir, "fresh-adopt-mode-failed-once");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: [
+          "--supports-resume-session",
+          "--supports-list-sessions",
+          "--set-session-mode-fails-once",
+          failOnceMarker,
+          "--call-log",
+          callLog,
+        ],
+      },
+    });
+    const service = createAcpxSessionService({ cwd });
+    const [provider] = (await service.listProviderSessions({ agentId: "recoverable", cwd }))
+      .sessions;
+    assert.ok(provider);
+    const firstInput = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      providerSessionId: provider.providerSessionId,
+      idempotencyKey: "fresh-adopt-first",
+    };
+
+    await assert.rejects(async () => await service.adoptSession(firstInput), /Internal error/u);
+    const [partial] = await listSessions();
+    assert.ok(partial);
+
+    const recovered = await service.adoptSession({
+      ...firstInput,
+      idempotencyKey: "fresh-adopt-second",
+    });
+    const originalReplay = await service.adoptSession(firstInput);
+    assert.equal(recovered.replayed, true);
+    assert.equal(recovered.result.acpxRecordId, partial.acpxRecordId);
+    assert.equal(recovered.result.acpSessionId, provider.providerSessionId);
+    assert.equal(recovered.result.mode, "plan");
+    assert.equal(originalReplay.replayed, true);
+    assert.equal(originalReplay.result.acpxRecordId, partial.acpxRecordId);
+    assert.equal((await listSessions()).length, 1);
+    const calls = (await fs.readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string });
+    assert.equal(calls.filter((entry) => entry.method === "session/new").length, 0);
+    assert.equal(calls.filter((entry) => entry.method === "session/resume").length, 2);
+    service.dispose();
+  });
+});
+
 test("adoption is strict and never replaces an unsupported provider session with a new one", async () => {
   await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -277,7 +383,12 @@ test("adapter-scoped provider ids can map to distinct registered agent identitie
     assert.equal(records.length, 2);
     assert.notEqual(beta.result.acpxRecordId, adopted.result.acpxRecordId);
     assert.equal(beta.result.acpSessionId, adopted.result.acpSessionId);
-    assert.deepEqual(records.map((record) => record.acpx?.agent_id).toSorted(), ["alpha", "beta"]);
+    assert.deepEqual(
+      records
+        .map((record) => record.acpx?.agent_id)
+        .toSorted((left, right) => String(left).localeCompare(String(right))),
+      ["alpha", "beta"],
+    );
     assert.equal(
       (await service.getSession({ acpxRecordId: adopted.result.acpxRecordId }))?.agentId,
       "alpha",
@@ -319,7 +430,12 @@ test("fresh sessions use collision-safe local ids when adapters return the same 
     assert.equal(beta.result.agentId, "beta");
     const records = await listSessions();
     assert.equal(records.length, 2);
-    assert.deepEqual(records.map((record) => record.acpx?.agent_id).toSorted(), ["alpha", "beta"]);
+    assert.deepEqual(
+      records
+        .map((record) => record.acpx?.agent_id)
+        .toSorted((left, right) => String(left).localeCompare(String(right))),
+      ["alpha", "beta"],
+    );
     service.dispose();
   });
 });

@@ -93,6 +93,66 @@ test("a checkpointed mutation recovers its persisted side effect instead of repe
   });
 });
 
+test("a fresh idempotency key recovers a checkpointed mutation in the same scope", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    let runs = 0;
+    let recoveries = 0;
+    const recoveryScope = { agentId: "mock", cwd: "/workspace", mode: "plan" };
+    const recover = async (checkpoint: unknown) => {
+      recoveries += 1;
+      assert.deepEqual(checkpoint, { recordId: "record-scoped", phase: "created" });
+      return { id: "record-scoped" };
+    };
+
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "create_session",
+          idempotencyKey: "scoped-create-first",
+          input: { ...recoveryScope, idempotencyKey: "scoped-create-first" },
+          recoveryScope,
+          recover,
+          run: async (checkpoint) => {
+            runs += 1;
+            await checkpoint({ recordId: "record-scoped", phase: "created" });
+            throw new Error("mode failed after create");
+          },
+        }),
+      /mode failed after create/u,
+    );
+
+    const freshKey = await runIdempotentMutation({
+      operation: "create_session",
+      idempotencyKey: "scoped-create-second",
+      input: { ...recoveryScope, idempotencyKey: "scoped-create-second" },
+      recoveryScope,
+      recover,
+      run: async () => {
+        runs += 1;
+        return { id: "duplicate" };
+      },
+    });
+    const originalKey = await runIdempotentMutation({
+      operation: "create_session",
+      idempotencyKey: "scoped-create-first",
+      input: { ...recoveryScope, idempotencyKey: "scoped-create-first" },
+      recoveryScope,
+      recover,
+      run: async () => {
+        runs += 1;
+        return { id: "duplicate" };
+      },
+    });
+
+    assert.deepEqual(freshKey.result, { id: "record-scoped" });
+    assert.equal(freshKey.replayed, true);
+    assert.deepEqual(originalKey.result, { id: "record-scoped" });
+    assert.equal(originalKey.replayed, true);
+    assert.equal(runs, 1);
+    assert.equal(recoveries, 1);
+  });
+});
+
 test("an ambiguous mutation keeps its recovery result instead of caching failure", async () => {
   await withTempHome("acpx-sessions-idempotency-", async () => {
     let runs = 0;

@@ -25,6 +25,7 @@ type StoredMutation = {
   created_at: string;
   updated_at: string;
   pid: number;
+  recovery_scope?: string;
   recovery_result?: unknown;
   result?: unknown;
   error?: { name: string; message: string };
@@ -99,6 +100,10 @@ function lockPath(idempotencyKey: string): string {
   return path.join(baseDir(), `${keyHash(idempotencyKey)}.lock`);
 }
 
+function recoveryLockPath(scopeHash: string): string {
+  return path.join(baseDir(), `${scopeHash}.recovery.lock`);
+}
+
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((entry) => canonicalize(entry));
@@ -142,6 +147,7 @@ async function readStored(idempotencyKey: string): Promise<StoredMutation | unde
       typeof record.created_at !== "string" ||
       typeof record.updated_at !== "string" ||
       typeof record.pid !== "number" ||
+      (record.recovery_scope !== undefined && typeof record.recovery_scope !== "string") ||
       (record.state !== "started" && record.state !== "succeeded" && record.state !== "failed")
     ) {
       throw new AcpxIdempotencyCorruptError(idempotencyKey);
@@ -189,10 +195,9 @@ async function removeStaleLock(filePath: string): Promise<boolean> {
   }
 }
 
-async function acquireLock(idempotencyKey: string): Promise<MutationLock> {
+async function acquireLockAt(filePath: string): Promise<MutationLock> {
   await fs.mkdir(baseDir(), { recursive: true, mode: 0o700 });
   await fs.chmod(baseDir(), 0o700);
-  const filePath = lockPath(idempotencyKey);
   for (;;) {
     try {
       await fs.writeFile(
@@ -213,6 +218,10 @@ async function acquireLock(idempotencyKey: string): Promise<MutationLock> {
   }
 }
 
+async function acquireLock(idempotencyKey: string): Promise<MutationLock> {
+  return await acquireLockAt(lockPath(idempotencyKey));
+}
+
 async function releaseLock(lock: MutationLock): Promise<void> {
   await fs.unlink(lock.filePath).catch((error) => {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -231,18 +240,125 @@ function errorShape(error: unknown): { name: string; message: string } {
     : { name: "Error", message: String(error) };
 }
 
+// oxlint-disable-next-line eslint/complexity -- Durable record validation intentionally checks every scoped recovery discriminator.
+function isRecoverableScopeMatch(
+  value: unknown,
+  operation: AcpxMutationOperation,
+  scopeHash: string,
+  currentKey: string,
+): value is StoredMutation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    record.schema === IDEMPOTENCY_SCHEMA &&
+    record.operation === operation &&
+    record.state === "started" &&
+    record.recovery_scope === scopeHash &&
+    typeof record.idempotency_key === "string" &&
+    record.idempotency_key !== currentKey &&
+    record.recovery_result !== undefined
+  );
+}
+
+// oxlint-disable-next-line eslint/complexity -- Directory scanning distinguishes I/O failure, foreign corruption, and conflicting checkpoints.
+async function findScopedRecovery(
+  operation: AcpxMutationOperation,
+  scopeHash: string,
+  currentKey: string,
+): Promise<StoredMutation | undefined> {
+  let files: string[];
+  try {
+    files = await fs.readdir(baseDir());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  const candidates: StoredMutation[] = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) {
+      continue;
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(await fs.readFile(path.join(baseDir(), file), "utf8")) as unknown;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) {
+        throw error;
+      }
+      // A corrupt record for another idempotency key must not disable recovery
+      // for this scope. Direct use of that key still fails closed in readStored.
+      continue;
+    }
+    if (isRecoverableScopeMatch(value, operation, scopeHash, currentKey)) {
+      candidates.push(value);
+    }
+  }
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  const checkpoint = JSON.stringify(canonicalize(candidates[0]?.recovery_result));
+  if (
+    candidates.some(
+      (candidate) => JSON.stringify(canonicalize(candidate.recovery_result)) !== checkpoint,
+    )
+  ) {
+    throw new AcpxIdempotencyInDoubtError(currentKey, operation);
+  }
+  return candidates.toSorted((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+}
+
+async function completeRecovery<T>(
+  operation: AcpxMutationOperation,
+  idempotencyKey: string,
+  recover: (checkpoint: unknown) => Promise<T>,
+  stored: StoredMutation,
+): Promise<AcpxMutationReceipt<T>> {
+  const result = await recover(stored.recovery_result);
+  await writeStored(idempotencyKey, {
+    ...stored,
+    idempotency_key: idempotencyKey,
+    state: "succeeded",
+    updated_at: new Date().toISOString(),
+    result,
+  });
+  return {
+    operation,
+    idempotencyKey,
+    replayed: true,
+    result,
+  };
+}
+
 // oxlint-disable-next-line eslint/complexity -- Durable replay, recovery, ambiguity, and failure are separate terminal states.
 export async function runIdempotentMutation<T>(options: {
   operation: AcpxMutationOperation;
   idempotencyKey: string;
   input: unknown;
   recoveryResult?: T;
+  /** Groups incomplete side effects that may be reconciled by a retry using a fresh key. */
+  recoveryScope?: unknown;
   recover?: (checkpoint: unknown) => Promise<T>;
   outcomeUnknown?: (error: unknown) => boolean;
   run: (checkpoint: (value: unknown) => Promise<void>) => Promise<T>;
 }): Promise<AcpxMutationReceipt<T>> {
   assertIdempotencyKey(options.idempotencyKey);
-  const lock = await acquireLock(options.idempotencyKey);
+  const scopeHash =
+    options.recoveryScope === undefined ? undefined : fingerprint(options.recoveryScope);
+  const recoveryLock = scopeHash ? await acquireLockAt(recoveryLockPath(scopeHash)) : undefined;
+  let lock: MutationLock;
+  try {
+    lock = await acquireLock(options.idempotencyKey);
+  } catch (error) {
+    if (recoveryLock) {
+      await releaseLock(recoveryLock);
+    }
+    throw error;
+  }
   try {
     const inputHash = fingerprint(options.input);
     const stored = await readStored(options.idempotencyKey);
@@ -267,19 +383,12 @@ export async function runIdempotentMutation<T>(options: {
       }
       if (stored.recovery_result !== undefined) {
         if (options.recover) {
-          const result = await options.recover(stored.recovery_result);
-          await writeStored(options.idempotencyKey, {
-            ...stored,
-            state: "succeeded",
-            updated_at: new Date().toISOString(),
-            result,
-          });
-          return {
-            operation: options.operation,
-            idempotencyKey: options.idempotencyKey,
-            replayed: true,
-            result,
-          };
+          return await completeRecovery(
+            options.operation,
+            options.idempotencyKey,
+            options.recover,
+            stored,
+          );
         }
         return {
           operation: options.operation,
@@ -292,6 +401,10 @@ export async function runIdempotentMutation<T>(options: {
     }
 
     const now = new Date().toISOString();
+    const prior =
+      scopeHash && options.recover
+        ? await findScopedRecovery(options.operation, scopeHash, options.idempotencyKey)
+        : undefined;
     const started: StoredMutation = {
       schema: IDEMPOTENCY_SCHEMA,
       idempotency_key: options.idempotencyKey,
@@ -301,9 +414,35 @@ export async function runIdempotentMutation<T>(options: {
       created_at: now,
       updated_at: now,
       pid: process.pid,
-      recovery_result: options.recoveryResult,
+      recovery_scope: scopeHash,
+      recovery_result: prior?.recovery_result ?? options.recoveryResult,
     };
     await writeStored(options.idempotencyKey, started);
+
+    if (prior && options.recover) {
+      try {
+        const receipt = await completeRecovery(
+          options.operation,
+          options.idempotencyKey,
+          options.recover,
+          started,
+        );
+        await writeStored(prior.idempotency_key, {
+          ...prior,
+          state: "succeeded",
+          updated_at: new Date().toISOString(),
+          result: receipt.result,
+        });
+        return receipt;
+      } catch (error) {
+        await writeStored(options.idempotencyKey, {
+          ...started,
+          updated_at: new Date().toISOString(),
+          error: errorShape(error),
+        });
+        throw error;
+      }
+    }
 
     try {
       const checkpoint = async (value: unknown): Promise<void> => {
@@ -345,7 +484,13 @@ export async function runIdempotentMutation<T>(options: {
       throw error;
     }
   } finally {
-    await releaseLock(lock);
+    try {
+      await releaseLock(lock);
+    } finally {
+      if (recoveryLock) {
+        await releaseLock(recoveryLock);
+      }
+    }
   }
 }
 
@@ -354,6 +499,7 @@ export const idempotencyTestInternals = {
   canonicalize,
   fingerprint,
   lockPath,
+  recoveryLockPath,
   mutationPath,
   removeStaleLock,
 };

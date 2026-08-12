@@ -562,6 +562,68 @@ test("a first pending request on a newly observed session emits an invalidation"
   });
 });
 
+test("invalidation polling reports background failures and retries", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const acpxPath = path.join(homeDir, ".acpx");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.writeFile(acpxPath, "blocks session directory creation", "utf8");
+    const errors: unknown[] = [];
+    let resolveError: (() => void) | undefined;
+    const firstError = new Promise<void>((resolve) => {
+      resolveError = resolve;
+    });
+    const service = createAcpxSessionService({
+      cwd,
+      timelinePollMs: 100,
+      onBackgroundError: (error) => {
+        errors.push(error);
+        resolveError?.();
+      },
+    });
+    let resolveRetry: (() => void) | undefined;
+    const retried = new Promise<void>((resolve) => {
+      resolveRetry = resolve;
+    });
+    const unsubscribe = service.subscribe((event) => {
+      if (event.type === "session" && event.acpxRecordId === "session-poll-retry") {
+        resolveRetry?.();
+      }
+    });
+    try {
+      await Promise.race([
+        firstError,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("timed out waiting for polling failure")), 2_000),
+        ),
+      ]);
+      assert.equal(errors.length, 1);
+
+      await fs.unlink(acpxPath);
+      const record = makeSessionRecord({
+        acpxRecordId: "session-poll-retry",
+        acpSessionId: "provider-poll-retry",
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+      });
+      await writeSessionRecordFile(homeDir, record);
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      record.lastUsedAt = new Date(Date.now() + 1_000).toISOString();
+      await writeSessionRecordFile(homeDir, record);
+      await Promise.race([
+        retried,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("timed out waiting for polling retry")), 2_000),
+        ),
+      ]);
+      assert.equal(errors.length, 1);
+    } finally {
+      unsubscribe();
+      service.dispose();
+    }
+  });
+});
+
 test("pending responses inherit a bounded service timeout when the request omits one", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

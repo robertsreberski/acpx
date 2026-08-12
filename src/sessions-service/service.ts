@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import {
   mergeAgentRegistry,
   normalizeAgentName,
@@ -206,6 +207,22 @@ function defaultMode(agentId: string): string | undefined {
   }
 }
 
+function sessionStartRecoveryScope(
+  input: AcpxCreateSessionInput,
+  providerSessionId?: string,
+): Record<string, unknown> {
+  return {
+    agentId: normalizeAgentName(input.agentId),
+    cwd: path.resolve(input.cwd),
+    name: input.name,
+    mode: input.mode,
+    model: input.model,
+    permissionMode: input.permissionMode,
+    permissionPolicy: input.permissionPolicy,
+    providerSessionId,
+  };
+}
+
 function exactRecord(records: SessionRecord[], acpxRecordId: string): SessionRecord | undefined {
   return records.find((record) => record.acpxRecordId === acpxRecordId);
 }
@@ -316,6 +333,51 @@ class SessionService implements AcpxSessionService {
     return await projectSession(record, false, await this.registry(record.cwd));
   }
 
+  // oxlint-disable-next-line eslint/complexity -- Recovery must validate each durable identity axis before reconnecting.
+  private assertStartedSessionIdentity(
+    record: SessionRecord,
+    agent: ResolvedAgent,
+    providerSessionId?: string,
+  ): void {
+    const sameAgent =
+      record.acpx?.agent_id === agent.agentId ||
+      (record.acpx?.agent_id === undefined && record.agentCommand === agent.agentCommand);
+    if (
+      !sameAgent ||
+      record.closed === true ||
+      (providerSessionId !== undefined && record.acpSessionId !== providerSessionId)
+    ) {
+      throw new Error(
+        `Persisted session-start checkpoint does not match the requested session ` +
+          `(record agent ${JSON.stringify(record.acpx?.agent_id)}, requested agent ${JSON.stringify(agent.agentId)}, ` +
+          `record command ${JSON.stringify(record.agentCommand)}, requested command ${JSON.stringify(agent.agentCommand)}, ` +
+          `record provider ${JSON.stringify(record.acpSessionId)}, requested provider ${JSON.stringify(providerSessionId)})`,
+      );
+    }
+  }
+
+  private async ensureStartedSessionMode(
+    input: AcpxCreateSessionInput,
+    agent: ResolvedAgent,
+    record: SessionRecord,
+  ): Promise<SessionRecord> {
+    const mode = input.mode ?? defaultMode(agent.agentId);
+    if (!mode || record.acpx?.desired_mode_id === mode) {
+      return record;
+    }
+    const applied = await setSessionMode({
+      sessionId: record.acpxRecordId,
+      modeId: mode,
+      mcpServers: agent.config.mcpServers,
+      nonInteractivePermissions:
+        this.options.nonInteractivePermissions ?? agent.config.nonInteractivePermissions,
+      authCredentials: { ...agent.config.auth, ...this.options.authCredentials },
+      authPolicy: this.options.authPolicy ?? agent.config.authPolicy,
+      timeoutMs: this.adapterTimeout(agent.config),
+    });
+    return applied.record;
+  }
+
   private emit(event: AcpxSessionInvalidation): void {
     for (const listener of this.listeners) {
       try {
@@ -394,7 +456,11 @@ class SessionService implements AcpxSessionService {
           existing.acpx = { ...existing.acpx, agent_id: agent.agentId };
           await writeSessionRecord(existing);
         }
-        return await this.projectDetail(existing);
+        this.assertStartedSessionIdentity(existing, agent, providerSessionId);
+        await checkpoint?.({ recordId: existing.acpxRecordId, phase: "created" });
+        const configured = await this.ensureStartedSessionMode(input, agent, existing);
+        await checkpoint?.({ recordId: existing.acpxRecordId, phase: "configured" });
+        return await this.projectDetail(configured);
       }
       const unverified = candidates.find((record) => record.acpx?.agent_id === undefined);
       if (unverified) {
@@ -466,30 +532,9 @@ class SessionService implements AcpxSessionService {
       this.resolveAgent(input.agentId, input.cwd),
       this.requireExactRecord(checkpoint.recordId),
     ]);
-    if (
-      record.agentCommand !== agent.agentCommand ||
-      (providerSessionId !== undefined && record.acpSessionId !== providerSessionId)
-    ) {
-      throw new Error(
-        `Persisted session-start checkpoint does not match the requested session ` +
-          `(record command ${JSON.stringify(record.agentCommand)}, requested command ${JSON.stringify(agent.agentCommand)}, ` +
-          `record provider ${JSON.stringify(record.acpSessionId)}, requested provider ${JSON.stringify(providerSessionId)})`,
-      );
-    }
+    this.assertStartedSessionIdentity(record, agent, providerSessionId);
     if (checkpoint.phase === "created") {
-      const mode = input.mode ?? defaultMode(agent.agentId);
-      if (mode) {
-        await setSessionMode({
-          sessionId: record.acpxRecordId,
-          modeId: mode,
-          mcpServers: agent.config.mcpServers,
-          nonInteractivePermissions:
-            this.options.nonInteractivePermissions ?? agent.config.nonInteractivePermissions,
-          authCredentials: { ...agent.config.auth, ...this.options.authCredentials },
-          authPolicy: this.options.authPolicy ?? agent.config.authPolicy,
-          timeoutMs: this.adapterTimeout(agent.config),
-        });
-      }
+      await this.ensureStartedSessionMode(input, agent, record);
     }
     return await this.projectDetail(await this.requireExactRecord(checkpoint.recordId));
   }
@@ -501,6 +546,7 @@ class SessionService implements AcpxSessionService {
       operation: "create_session",
       idempotencyKey: input.idempotencyKey,
       input,
+      recoveryScope: sessionStartRecoveryScope(input),
       recover: async (checkpoint) => await this.recoverStartedSession(input, checkpoint),
       run: async (checkpoint) => await this.startSession(input, undefined, checkpoint),
     });
@@ -515,6 +561,7 @@ class SessionService implements AcpxSessionService {
       operation: "adopt_session",
       idempotencyKey: input.idempotencyKey,
       input,
+      recoveryScope: sessionStartRecoveryScope(input, input.providerSessionId),
       recover: async (checkpoint) =>
         await this.recoverStartedSession(input, checkpoint, input.providerSessionId),
       run: async (checkpoint) =>
@@ -758,11 +805,25 @@ class SessionService implements AcpxSessionService {
       return;
     }
     this.pollTimer = setInterval(
-      () => void this.pollInvalidations(),
+      () => this.pollInvalidationsInBackground(),
       Math.max(100, this.options.timelinePollMs ?? DEFAULT_TIMELINE_POLL_MS),
     );
     this.pollTimer.unref();
-    void this.pollInvalidations();
+    this.pollInvalidationsInBackground();
+  }
+
+  private pollInvalidationsInBackground(): void {
+    void this.pollInvalidations().catch((error: unknown) => {
+      if (this.options.onBackgroundError) {
+        try {
+          this.options.onBackgroundError(error);
+          return;
+        } catch (callbackError) {
+          console.warn("[acpx sessions] background error callback failed", callbackError);
+        }
+      }
+      console.warn("[acpx sessions] invalidation polling failed", error);
+    });
   }
 
   // oxlint-disable-next-line eslint/complexity -- Polling compares four independent invalidation sources in one serialized pass.
