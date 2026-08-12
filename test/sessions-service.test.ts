@@ -32,6 +32,10 @@ test("session lookup requires an exact acpx record id and returns browser-safe D
       acpSessionId: "provider-secret-id",
       agentCommand: AGENT_REGISTRY.codex,
       cwd,
+      agentCapabilities: {
+        loadSession: false,
+        sessionCapabilities: { resume: null, close: null, list: null },
+      },
     });
     await writeSessionRecordFile(homeDir, record);
     const service = createAcpxSessionService({ cwd });
@@ -42,6 +46,12 @@ test("session lookup requires an exact acpx record id and returns browser-safe D
     assert.equal(Object.hasOwn(projected ?? {}, "agentCommand"), false);
     assert.equal(Object.hasOwn(projected ?? {}, "messages"), false);
     assert.equal(Object.hasOwn(projected ?? {}, "authCredentials"), false);
+    assert.deepEqual(projected?.agentCapabilities, {
+      loadSession: false,
+      resumeSession: false,
+      closeSession: false,
+      listSessions: false,
+    });
     service.dispose();
   });
 });

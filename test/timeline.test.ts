@@ -277,6 +277,52 @@ test("timeline metadata survives a crash boundary before writer close", async ()
   });
 });
 
+test("a corrupt timeline tail is disclosed and rotates the epoch before the next append", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-corrupt-tail", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    await writer.appendAcpEvents([
+      captureAcpTimelineEvent("inbound", updateMessage(record.acpSessionId, "kept")),
+    ]);
+    await writer.close({ checkpoint: true });
+
+    const before = await resolveSessionRecord(record.acpxRecordId);
+    assert.ok(before.timeline);
+    const originalEpoch = before.timeline.epoch;
+    await fs.appendFile(before.timeline.active_path, "{not-json}\n", "utf8");
+
+    const corruptPage = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal(corruptPage.coverage, "incomplete");
+    assert.equal(corruptPage.items[0]?.schema, "acpx.session_history_gap.v1");
+    assert.equal(
+      corruptPage.items[0] && "reason" in corruptPage.items[0]
+        ? corruptPage.items[0].reason
+        : undefined,
+      "corrupt",
+    );
+
+    const reopened = await SessionTimelineWriter.open(before);
+    await reopened.appendAcpEvents([
+      captureAcpTimelineEvent("inbound", updateMessage(record.acpSessionId, "new epoch")),
+    ]);
+    await reopened.close({ checkpoint: true });
+
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    assert.notEqual(stored.timeline?.epoch, originalEpoch);
+    assert.equal(stored.timeline?.last_seq, 1);
+    assert.equal(stored.timeline?.history_incomplete, true);
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal(page.coverage, "incomplete");
+    assert.deepEqual(
+      page.items.flatMap((item) => ("payload" in item ? [item.seq] : [])),
+      [1],
+    );
+  });
+});
+
 test("legacy retained sessions disclose a gap instead of claiming complete history", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

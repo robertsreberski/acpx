@@ -56,6 +56,7 @@ export type QueueCancelRequest = {
   type: "cancel_prompt";
   requestId: string;
   ownerGeneration?: number;
+  targetTurnId?: string;
 };
 
 export type QueueSetModeRequest = {
@@ -486,6 +487,7 @@ function parsePositiveTimeout(value: unknown): number | undefined {
   return Math.round(value);
 }
 
+// oxlint-disable-next-line eslint/complexity -- Each wire request variant is validated independently.
 function parseTypedQueueRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
@@ -498,6 +500,9 @@ function parseTypedQueueRequest(
         type: "cancel_prompt",
         requestId: context.requestId,
         ownerGeneration: context.ownerGeneration,
+        ...(typeof request.targetTurnId === "string" && request.targetTurnId.length > 0
+          ? { targetTurnId: request.targetTurnId }
+          : {}),
       };
     case "close_session":
       return { type: "close_session", ...context };

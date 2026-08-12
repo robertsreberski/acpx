@@ -32,6 +32,7 @@ export class QueueOwnerTurnController {
   private readonly options: QueueOwnerTurnControllerOptions;
   private state: QueueOwnerTurnState = "idle";
   private pendingCancel = false;
+  private activeTurnId?: string;
   private activeController?: QueueOwnerActiveSessionController;
 
   constructor(options: QueueOwnerTurnControllerOptions) {
@@ -46,9 +47,10 @@ export class QueueOwnerTurnController {
     return this.pendingCancel;
   }
 
-  beginTurn(): void {
+  beginTurn(turnId?: string): void {
     this.state = "starting";
     this.pendingCancel = false;
+    this.activeTurnId = turnId;
   }
 
   markPromptActive(): void {
@@ -60,11 +62,13 @@ export class QueueOwnerTurnController {
   endTurn(): void {
     this.state = "idle";
     this.pendingCancel = false;
+    this.activeTurnId = undefined;
   }
 
   beginClosing(): void {
     this.state = "closing";
     this.pendingCancel = false;
+    this.activeTurnId = undefined;
     this.activeController = undefined;
   }
 
@@ -86,7 +90,10 @@ export class QueueOwnerTurnController {
     }
   }
 
-  async requestCancel(): Promise<boolean> {
+  async requestCancel(targetTurnId?: string): Promise<boolean> {
+    if (targetTurnId !== undefined && targetTurnId !== this.activeTurnId) {
+      return false;
+    }
     const activeController = this.activeController;
     if (activeController?.hasActivePrompt()) {
       const cancelled = await activeController.requestCancelActivePrompt();

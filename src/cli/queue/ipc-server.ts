@@ -99,7 +99,7 @@ export type QueueTask = {
 };
 
 export type QueueOwnerControlHandlers = {
-  cancelPrompt: () => Promise<boolean>;
+  cancelPrompt: (targetTurnId?: string) => Promise<boolean>;
   closeSession: (timeoutMs?: number) => Promise<boolean>;
   setSessionMode: (modeId: string, timeoutMs?: number) => Promise<void>;
   setSessionModel: (
@@ -447,7 +447,7 @@ export class SessionQueueOwner {
         run: async () => ({
           type: "cancel_result",
           requestId: request.requestId,
-          cancelled: await this.controlHandlers.cancelPrompt(),
+          cancelled: await this.controlHandlers.cancelPrompt(request.targetTurnId),
         }),
       });
       return true;

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -53,6 +53,7 @@ type MockAgentOptions = {
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
+  setSessionModeFailsOnceMarker?: string;
   setSessionModeInvalidParams: boolean;
   setSessionConfigInvalidParams: boolean;
   setSessionModelFails: boolean;
@@ -410,6 +411,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
+  let setSessionModeFailsOnceMarker: string | undefined;
   let setSessionModeInvalidParams = false;
   let setSessionConfigInvalidParams = false;
   let setSessionModelFails = false;
@@ -462,6 +464,15 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--set-session-mode-fails") {
       setSessionModeFails = true;
+      continue;
+    }
+
+    if (token === "--set-session-mode-fails-once") {
+      setSessionModeFailsOnceMarker = argv[index + 1];
+      if (!setSessionModeFailsOnceMarker) {
+        throw new Error("--set-session-mode-fails-once requires a marker path");
+      }
+      index += 1;
       continue;
     }
 
@@ -635,6 +646,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
+    setSessionModeFailsOnceMarker,
     setSessionModeInvalidParams,
     setSessionConfigInvalidParams,
     setSessionModelFails,
@@ -1085,6 +1097,13 @@ class MockAgent implements Agent {
     }
     if (this.options.setSessionModeFails) {
       throw new Error("setSessionMode failed");
+    }
+    if (
+      this.options.setSessionModeFailsOnceMarker &&
+      !existsSync(this.options.setSessionModeFailsOnceMarker)
+    ) {
+      writeFileSync(this.options.setSessionModeFailsOnceMarker, "failed\n", "utf8");
+      throw new Error("setSessionMode failed once");
     }
     session.modeId = params.modeId;
     return {};

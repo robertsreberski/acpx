@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import readline from "node:readline";
 import test from "node:test";
 import {
+  isQueueAdmissionOutcomeUnknown,
   MAX_MESSAGE_BUFFER_SIZE,
   SessionQueueOwner,
   releaseQueueOwnerLease,
@@ -45,6 +46,28 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
     // no-op
   },
 };
+
+test("queue admission ambiguity distinguishes transport loss from explicit rejection", () => {
+  assert.equal(
+    isQueueAdmissionOutcomeUnknown(
+      new QueueConnectionError("disconnected", {
+        detailCode: "QUEUE_DISCONNECTED_BEFORE_ACK",
+        origin: "queue",
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    isQueueAdmissionOutcomeUnknown(
+      new QueueConnectionError("overloaded", {
+        detailCode: "QUEUE_OWNER_OVERLOADED",
+        origin: "queue",
+      }),
+    ),
+    false,
+  );
+  assert.equal(isQueueAdmissionOutcomeUnknown(new Error("not a queue error")), false);
+});
 
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {

@@ -12,6 +12,12 @@ import {
   parseSessionRecord,
   writeSessionRecord,
 } from "./persistence.js";
+import {
+  parseSessionTimelineEvent,
+  SessionTimelineWriter,
+  type SessionTimelineCoverage,
+  type SessionTimelineEvent,
+} from "./timeline.js";
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
@@ -32,6 +38,12 @@ const exportedSessionSchema = z.object({
     state: z.unknown(),
   }),
   history: z.array(z.unknown()),
+  timeline: z
+    .object({
+      coverage: z.enum(["complete", "legacy_retained", "incomplete"]),
+      events: z.array(z.unknown()),
+    })
+    .optional(),
 });
 
 type ParsedExportedSession = z.infer<typeof exportedSessionSchema>;
@@ -291,6 +303,78 @@ function buildImportedRecord(
   };
 }
 
+function parseArchivedTimeline(parsed: ParsedExportedSession):
+  | {
+      coverage: SessionTimelineCoverage;
+      events: SessionTimelineEvent[];
+    }
+  | undefined {
+  if (!parsed.timeline) {
+    return undefined;
+  }
+  const events = parsed.timeline.events.map((value) => {
+    const event = parseSessionTimelineEvent(value);
+    if (!event) {
+      throw importError(
+        "Invalid session export archive: timeline event is invalid",
+        "invalid-archive",
+      );
+    }
+    return event;
+  });
+  for (let index = 1; index < events.length; index += 1) {
+    if ((events[index]?.seq ?? 0) <= (events[index - 1]?.seq ?? 0)) {
+      throw importError(
+        "Invalid session export archive: timeline events are not strictly ordered",
+        "invalid-archive",
+      );
+    }
+  }
+  return { coverage: parsed.timeline.coverage, events };
+}
+
+async function importTimeline(
+  record: SessionRecord,
+  timeline: ReturnType<typeof parseArchivedTimeline>,
+): Promise<void> {
+  if (!timeline) {
+    return;
+  }
+  const writer = await SessionTimelineWriter.open(record);
+  try {
+    for (const event of timeline.events) {
+      if (event.payload.kind === "acp") {
+        await writer.appendAcpEvents([
+          {
+            direction: event.direction,
+            message: event.payload.message,
+            capturedAt: event.captured_at,
+            turnId: event.turn_id,
+            requestId: event.request_id,
+            source: event.payload.source,
+          },
+        ]);
+      } else {
+        await writer.appendLifecycleEvent(event.payload.event, {
+          capturedAt: event.captured_at,
+          turnId: event.turn_id,
+          requestId: event.request_id,
+        });
+      }
+    }
+    const metadata = writer.getRecord().timeline;
+    if (metadata) {
+      metadata.legacy_retained = timeline.coverage === "legacy_retained";
+      metadata.legacy_import_complete = true;
+      metadata.history_incomplete = timeline.coverage === "incomplete";
+    }
+    await writer.close({ checkpoint: true });
+  } catch (error) {
+    await writer.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function importSession(
   archivePath: string,
   options: ImportSessionOptions = {},
@@ -304,6 +388,7 @@ export async function importSession(
     );
   }
   assertExpectedAgentCommand(parsed, sourceRecord, options);
+  const timeline = parseArchivedTimeline(parsed);
 
   const sessionsDir = path.join(os.homedir(), ".acpx", "sessions");
   await fs.mkdir(sessionsDir, { recursive: true });
@@ -319,6 +404,8 @@ export async function importSession(
   await assertDestinationScopeAvailable(newRecord);
   await assertProviderSessionAvailable(newRecord);
   await writeSessionRecord(newRecord);
+
+  await importTimeline(newRecord, timeline);
 
   if (parsed.history.length > 0) {
     const history = parsed.history as AcpJsonRpcMessage[];

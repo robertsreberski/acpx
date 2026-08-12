@@ -117,9 +117,9 @@ function capabilityProjection(
   }
   return {
     loadSession: capabilities.loadSession === true,
-    resumeSession: capabilities.sessionCapabilities?.resume !== undefined,
-    closeSession: capabilities.sessionCapabilities?.close !== undefined,
-    listSessions: capabilities.sessionCapabilities?.list !== undefined,
+    resumeSession: capabilities.sessionCapabilities?.resume != null,
+    closeSession: capabilities.sessionCapabilities?.close != null,
+    listSessions: capabilities.sessionCapabilities?.list != null,
   };
 }
 

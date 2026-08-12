@@ -143,6 +143,13 @@ export function buildQueueOwnerArgOverride(
   return JSON.stringify([...sanitized, entryPath, "__queue-owner"]);
 }
 
+export function queueOwnerSpawnArgsForEntry(
+  entryPath: string,
+  execArgv: readonly string[] = process.execArgv,
+): string[] {
+  return [...sanitizeQueueOwnerExecArgv(execArgv), entryPath, "__queue-owner"];
+}
+
 export function resolveQueueOwnerSpawnArgs(argv: readonly string[] = process.argv): string[] {
   const override = process.env.ACPX_QUEUE_OWNER_ARGS;
   if (override) {
@@ -265,7 +272,10 @@ export function formatQueueOwnerStartupFailure(params: {
   return parts.join(": ");
 }
 
-export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): QueueOwnerProcessHandle {
+export function spawnQueueOwnerProcess(
+  options: QueueOwnerRuntimeOptions,
+  spawnArgs: readonly string[] = resolveQueueOwnerSpawnArgs(),
+): QueueOwnerProcessHandle {
   const payload = JSON.stringify(options);
   const payloadPath = writeQueueOwnerPayloadFile(payload);
 
@@ -278,7 +288,7 @@ export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): Queue
 
   const child = spawn(
     process.execPath,
-    resolveQueueOwnerSpawnArgs(),
+    [...spawnArgs],
     buildQueueOwnerSpawnOptions(payloadPath, { captureStderr: true }),
   );
 

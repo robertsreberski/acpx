@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import {
   buildQueueOwnerArgOverride,
   queueOwnerRuntimeOptionsFromSend,
+  queueOwnerSpawnArgsForEntry,
   resolveQueueOwnerSpawnArgs,
   sanitizeQueueOwnerExecArgv,
   writeQueueOwnerPayloadFile,
@@ -128,6 +129,17 @@ describe("buildQueueOwnerArgOverride", () => {
       buildQueueOwnerArgOverride("/tmp/cli.js", ["--import", "tsx"]),
       JSON.stringify(["--import", "tsx", "/tmp/cli.js", "__queue-owner"]),
     );
+  });
+});
+
+describe("queueOwnerSpawnArgsForEntry", () => {
+  it("targets the supplied acpx entry instead of the embedding process argv", () => {
+    assert.deepEqual(queueOwnerSpawnArgsForEntry("/tmp/acpx-cli.js", ["--import", "tsx"]), [
+      "--import",
+      "tsx",
+      "/tmp/acpx-cli.js",
+      "__queue-owner",
+    ]);
   });
 });
 

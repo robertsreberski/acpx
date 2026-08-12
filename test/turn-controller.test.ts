@@ -47,6 +47,28 @@ test("QueueOwnerTurnController cancels immediately for active prompts", async ()
   assert.equal(controller.hasPendingCancel, false);
 });
 
+test("QueueOwnerTurnController rejects cancellation for a different active turn", async () => {
+  const controller = createQueueOwnerTurnController();
+  let cancelCalls = 0;
+
+  controller.beginTurn("turn-b");
+  controller.setActiveController(
+    makeActiveController({
+      hasActivePrompt: () => true,
+      requestCancelActivePrompt: async () => {
+        cancelCalls += 1;
+        return true;
+      },
+    }),
+  );
+  controller.markPromptActive();
+
+  assert.equal(await controller.requestCancel("turn-a"), false);
+  assert.equal(cancelCalls, 0);
+  assert.equal(await controller.requestCancel("turn-b"), true);
+  assert.equal(cancelCalls, 1);
+});
+
 test("QueueOwnerTurnController defers cancel while turn is starting", async () => {
   const controller = createQueueOwnerTurnController();
   let promptActive = false;

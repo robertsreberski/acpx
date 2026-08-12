@@ -28,6 +28,7 @@ import { connectToQueueOwner, type QueueRequestBudget } from "./ipc-transport.js
 import {
   ensureOwnerIsUsable,
   QUEUE_PROTOCOL_DEFER_VERSION,
+  QUEUE_PROTOCOL_EXACT_CANCEL_VERSION,
   readLiveQueueOwner,
   type QueueOwnerRecord,
   queueOwnerProtocolVersion,
@@ -58,6 +59,25 @@ import { DEFAULT_DEFER_MAX_AGE_MS } from "./pending-request-manager.js";
 
 export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
+
+const DEFINITIVE_QUEUE_ADMISSION_FAILURES = new Set([
+  "QUEUE_CONNECT_TIMEOUT",
+  "QUEUE_NOT_ACCEPTING_REQUESTS",
+  "QUEUE_OWNER_CLOSED",
+  "QUEUE_OWNER_GENERATION_MISMATCH",
+  "QUEUE_OWNER_OVERLOADED",
+  "QUEUE_OWNER_PARKING_UNSUPPORTED",
+  "QUEUE_OWNER_PROTOCOL_MISMATCH",
+  "QUEUE_OWNER_SHUTTING_DOWN",
+]);
+
+/** Whether a submit error may have happened after the owner accepted the turn. */
+export function isQueueAdmissionOutcomeUnknown(error: unknown): boolean {
+  if (!(error instanceof QueueConnectionError) && !(error instanceof QueueProtocolError)) {
+    return false;
+  }
+  return !DEFINITIVE_QUEUE_ADMISSION_FAILURES.has(error.detailCode ?? "");
+}
 export {
   isProcessAlive,
   releaseQueueOwnerLease,
@@ -631,11 +651,15 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   });
 }
 
-async function submitCancelToQueueOwner(owner: QueueOwnerRecord): Promise<boolean | undefined> {
+async function submitCancelToQueueOwner(
+  owner: QueueOwnerRecord,
+  targetTurnId?: string,
+): Promise<boolean | undefined> {
   const request: QueueCancelRequest = {
     type: "cancel_prompt",
     requestId: randomUUID(),
     ownerGeneration: owner.ownerGeneration,
+    targetTurnId,
   };
   const response = await submitControlToQueueOwner(
     owner,
@@ -989,6 +1013,7 @@ export async function tryCloseSessionOnRunningOwner(options: {
 
 export async function tryCancelOnRunningOwner(options: {
   sessionId: string;
+  turnId?: string;
   verbose?: boolean;
 }): Promise<boolean | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
@@ -996,7 +1021,21 @@ export async function tryCancelOnRunningOwner(options: {
     return undefined;
   }
 
-  const cancelled = await submitCancelToQueueOwner(owner);
+  if (
+    options.turnId !== undefined &&
+    queueOwnerProtocolVersion(owner) < QUEUE_PROTOCOL_EXACT_CANCEL_VERSION
+  ) {
+    throw new QueueConnectionError(
+      "Session queue owner cannot safely target cancellation to an exact turn; close the session so a new owner can start",
+      {
+        detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
+        origin: "queue",
+        retryable: false,
+      },
+    );
+  }
+
+  const cancelled = await submitCancelToQueueOwner(owner, options.turnId);
   if (cancelled !== undefined) {
     if (options.verbose) {
       process.stderr.write(

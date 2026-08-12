@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { trySubmitToRunningOwner } from "../src/cli/queue/ipc.js";
+import { tryCancelOnRunningOwner, trySubmitToRunningOwner } from "../src/cli/queue/ipc.js";
 import {
   QUEUE_PROTOCOL_RULE_KEY_COUNT,
   QUEUE_PROTOCOL_VERSION,
@@ -182,6 +182,24 @@ test("a pre-defer queue owner still serves policies that do not use defer", asyn
           ...(permissionPolicy ? { permissionPolicy } : {}),
         });
       }
+    });
+  });
+});
+
+test("a pre-v3 queue owner cannot receive an exact-turn cancellation", async () => {
+  await withTempHome(async (homeDir) => {
+    await withFakeOwner(homeDir, "owner-legacy-cancel", { queueProtocol: 2 }, async () => {
+      await assert.rejects(
+        async () =>
+          await tryCancelOnRunningOwner({
+            sessionId: "owner-legacy-cancel",
+            turnId: "turn-a",
+          }),
+        (error: unknown) =>
+          error instanceof QueueConnectionError &&
+          error.detailCode === "QUEUE_OWNER_PROTOCOL_MISMATCH" &&
+          error.retryable === false,
+      );
     });
   });
 });

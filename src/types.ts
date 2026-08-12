@@ -281,6 +281,8 @@ export type SessionTimelineMetadata = {
   legacy_retained: boolean;
   /** False only while retained compatibility-stream messages are being imported. */
   legacy_import_complete?: boolean;
+  /** True when corruption or truncation made the authoritative history incomplete. */
+  history_incomplete?: boolean;
 };
 
 export type PerfMetricSummary = {

@@ -603,6 +603,7 @@ function parseEventLog(raw: unknown, sessionId: string): SessionEventLog {
   };
 }
 
+// oxlint-disable-next-line eslint/complexity -- Persisted metadata is checked field-by-field and fails closed.
 function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined {
   if (raw === undefined) {
     return undefined;
@@ -628,6 +629,8 @@ function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined
     // compatibility messages after newer lossless events.
     legacy_import_complete:
       typeof record.legacy_import_complete === "boolean" ? record.legacy_import_complete : true,
+    history_incomplete:
+      typeof record.history_incomplete === "boolean" ? record.history_incomplete : undefined,
   };
 }
 

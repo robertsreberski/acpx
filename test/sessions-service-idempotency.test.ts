@@ -49,6 +49,86 @@ test("idempotent mutations execute once and reject key reuse with different inpu
   });
 });
 
+test("a checkpointed mutation recovers its persisted side effect instead of repeating it", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    let runs = 0;
+    let recoveries = 0;
+    const mutation = {
+      operation: "create_session" as const,
+      idempotencyKey: "checkpointed-create",
+      input: { cwd: "/workspace" },
+      recover: async (checkpoint: unknown) => {
+        recoveries += 1;
+        assert.deepEqual(checkpoint, { recordId: "record-1", phase: "created" });
+        return { id: "record-1" };
+      },
+    };
+
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          ...mutation,
+          run: async (checkpoint) => {
+            runs += 1;
+            await checkpoint({ recordId: "record-1", phase: "created" });
+            throw new Error("projection failed after create");
+          },
+        }),
+      /projection failed/,
+    );
+
+    const replay = await runIdempotentMutation({
+      ...mutation,
+      run: async () => {
+        runs += 1;
+        return { id: "unexpected" };
+      },
+    });
+    assert.deepEqual(replay.result, { id: "record-1" });
+    assert.equal(replay.replayed, true);
+    assert.equal(runs, 1);
+    assert.equal(recoveries, 1);
+  });
+});
+
+test("an ambiguous mutation keeps its recovery result instead of caching failure", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    let runs = 0;
+    const options = {
+      operation: "enqueue_prompt" as const,
+      idempotencyKey: "ambiguous-enqueue",
+      input: { prompt: "hello" },
+      recoveryResult: { turnId: "turn-1", admission: "unknown" as const },
+      outcomeUnknown: (error: unknown) =>
+        error instanceof Error && error.message === "disconnected after write",
+    };
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation<{ turnId: string; admission: "unknown" | "queued" }>({
+          ...options,
+          run: async () => {
+            runs += 1;
+            throw new Error("disconnected after write");
+          },
+        }),
+      /disconnected after write/,
+    );
+    const replay = await runIdempotentMutation<{
+      turnId: string;
+      admission: "unknown" | "queued";
+    }>({
+      ...options,
+      run: async () => {
+        runs += 1;
+        return { turnId: "turn-1", admission: "queued" as const };
+      },
+    });
+    assert.deepEqual(replay.result, { turnId: "turn-1", admission: "unknown" });
+    assert.equal(replay.replayed, true);
+    assert.equal(runs, 1);
+  });
+});
+
 test("a schema-invalid mutation record fails closed instead of repeating the mutation", async () => {
   await withTempHome("acpx-sessions-idempotency-", async () => {
     const key = "corrupt-record";

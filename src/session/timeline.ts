@@ -58,18 +58,19 @@ export type CapturedAcpTimelineEvent = {
   capturedAt: string;
   turnId?: string;
   requestId?: string;
+  source?: "legacy_stream";
 };
 
 export type SessionTimelineHistoryGap = {
   schema: typeof SESSION_TIMELINE_GAP_SCHEMA;
   kind: "history_gap";
-  reason: "legacy_retained";
+  reason: "legacy_retained" | "corrupt";
   message: string;
 };
 
 export type SessionTimelineItem = SessionTimelineHistoryGap | SessionTimelineEvent;
 
-export type SessionTimelineCoverage = "complete" | "legacy_retained";
+export type SessionTimelineCoverage = "complete" | "legacy_retained" | "incomplete";
 
 export type SessionTimelinePage = {
   items: SessionTimelineItem[];
@@ -297,7 +298,7 @@ function hasValidTimelinePayload(payload: Record<string, unknown> | undefined): 
   return typeof payload.kind === "string" && (validators[payload.kind]?.() ?? false);
 }
 
-function parseTimelineEvent(value: unknown): SessionTimelineEvent | undefined {
+export function parseSessionTimelineEvent(value: unknown): SessionTimelineEvent | undefined {
   const record = asRecord(value);
   if (
     !record ||
@@ -420,10 +421,24 @@ export class SessionTimelineWriter {
     const lock = await acquireTimelineLock(record.acpxRecordId);
     try {
       const metadata = await initializeMetadata(record);
+      let corrupt = false;
       const [latest] = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
         limit: 1,
+        onCorrupt: () => {
+          corrupt = true;
+        },
       });
-      metadata.last_seq = latest?.seq ?? 0;
+      const latestSeq = latest?.seq ?? 0;
+      if (corrupt || metadata.last_seq > latestSeq) {
+        metadata.epoch = randomUUID();
+        metadata.last_seq = 0;
+        metadata.active_path = timelinePath(record.acpxRecordId, metadata.epoch);
+        metadata.created_at = isoNow();
+        metadata.history_incomplete = true;
+        await checkpointTimelineMetadata(record, metadata);
+      } else {
+        metadata.last_seq = latestSeq;
+      }
       const writer = new SessionTimelineWriter(record, lock, metadata);
       await writer.importLegacyCompatibilityMessagesIfNeeded();
       return writer;
@@ -447,7 +462,7 @@ export class SessionTimelineWriter {
         capturedAt: event.capturedAt,
         turnId: event.turnId,
         requestId: event.requestId ?? requestIdFromMessage(event.message),
-        payload: { kind: "acp", message: event.message },
+        payload: { kind: "acp", message: event.message, source: event.source },
       });
     }
   }
@@ -561,8 +576,10 @@ type ReverseTimelineReadOptions = {
   limit: number;
   predicate?: (event: SessionTimelineEvent) => boolean;
   onBytesRead?: (bytes: number) => void;
+  onCorrupt?: () => void;
 };
 
+// oxlint-disable-next-line eslint/complexity -- Corruption and filtering are deliberately distinguished for coverage reporting.
 function matchingTimelineLine(
   line: Buffer,
   sessionId: string,
@@ -573,12 +590,17 @@ function matchingTimelineLine(
     return undefined;
   }
   try {
-    const event = parseTimelineEvent(JSON.parse(line.toString("utf8")) as unknown);
-    if (!event || !timelineEventMatches(event, sessionId, metadata, options)) {
+    const event = parseSessionTimelineEvent(JSON.parse(line.toString("utf8")) as unknown);
+    if (!event || event.acpx_record_id !== sessionId || event.epoch !== metadata.epoch) {
+      options.onCorrupt?.();
+      return undefined;
+    }
+    if (!timelineEventMatches(event, sessionId, metadata, options)) {
       return undefined;
     }
     return event;
   } catch {
+    options.onCorrupt?.();
     return undefined;
   }
 }
@@ -795,7 +817,13 @@ function normalizePageLimit(value: number | undefined): number {
   return Math.min(MAX_PAGE_LIMIT, Math.max(1, Math.trunc(finite)));
 }
 
-function timelineCoverage(metadata: SessionTimelineMetadata): SessionTimelineCoverage {
+function timelineCoverage(
+  metadata: SessionTimelineMetadata,
+  observedCorrupt = false,
+): SessionTimelineCoverage {
+  if (metadata.history_incomplete === true || observedCorrupt) {
+    return "incomplete";
+  }
   return metadata.legacy_retained ? "legacy_retained" : "complete";
 }
 
@@ -804,8 +832,9 @@ function timelinePageItems(
   metadata: SessionTimelineMetadata,
   hasMore: boolean,
   selected: SessionTimelineEvent[],
+  observedCorrupt: boolean,
 ): SessionTimelineItem[] {
-  const prefix = !hasMore && metadata.legacy_retained ? legacyGap(record) : [];
+  const prefix = !hasMore ? historyGaps(record, observedCorrupt) : [];
   return [...prefix, ...selected];
 }
 
@@ -814,18 +843,25 @@ function pageFromEvents(params: {
   metadata: SessionTimelineMetadata;
   newestFirstEvents: SessionTimelineEvent[];
   limit: number;
+  observedCorrupt?: boolean;
 }): SessionTimelinePage {
   const hasMore = params.newestFirstEvents.length > params.limit;
   const selected = params.newestFirstEvents.slice(0, params.limit).toReversed();
   const first = selected[0];
   return {
-    items: timelinePageItems(params.record, params.metadata, hasMore, selected),
+    items: timelinePageItems(
+      params.record,
+      params.metadata,
+      hasMore,
+      selected,
+      params.observedCorrupt === true,
+    ),
     previousCursor:
       hasMore && first
         ? encodeCursor(params.record.acpxRecordId, params.metadata.epoch, first.seq)
         : undefined,
     hasMore,
-    coverage: timelineCoverage(params.metadata),
+    coverage: timelineCoverage(params.metadata, params.observedCorrupt),
     writeError: params.metadata.last_write_error ?? undefined,
   };
 }
@@ -843,15 +879,20 @@ export async function listSessionTimelinePage(
   }
   assertCursorEpoch(cursor, record, metadata);
   const limit = normalizePageLimit(options.limit);
+  let observedCorrupt = false;
   const events = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
     beforeSeq: cursor?.seq,
     limit: limit + 1,
+    onCorrupt: () => {
+      observedCorrupt = true;
+    },
   });
   return pageFromEvents({
     record,
     metadata,
     newestFirstEvents: events,
     limit,
+    observedCorrupt,
   });
 }
 
@@ -940,6 +981,23 @@ function legacyGap(record: SessionRecord): SessionTimelineHistoryGap[] {
         },
       ]
     : [];
+}
+
+function corruptGap(): SessionTimelineHistoryGap {
+  return {
+    schema: SESSION_TIMELINE_GAP_SCHEMA,
+    kind: "history_gap",
+    reason: "corrupt",
+    message:
+      "The authoritative timeline was corrupt or truncated; retained events remain available, but this history is incomplete.",
+  };
+}
+
+function historyGaps(record: SessionRecord, observedCorrupt = false): SessionTimelineHistoryGap[] {
+  return [
+    ...(record.timeline?.history_incomplete === true || observedCorrupt ? [corruptGap()] : []),
+    ...(record.timeline?.legacy_retained === true ? legacyGap(record) : []),
+  ];
 }
 
 export async function deleteSessionTimeline(sessionId: string): Promise<number> {

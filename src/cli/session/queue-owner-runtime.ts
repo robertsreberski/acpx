@@ -592,8 +592,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     return true;
   };
 
-  const runPromptTurn = async <T>(run: () => Promise<T>): Promise<T> => {
-    turnController.beginTurn();
+  const runPromptTurn = async <T>(turnId: string, run: () => Promise<T>): Promise<T> => {
+    turnController.beginTurn(turnId);
     try {
       return await run();
     } finally {
@@ -629,8 +629,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     owner = await SessionQueueOwner.start(
       lease,
       {
-        cancelPrompt: async () => {
-          const accepted = await turnController.requestCancel();
+        cancelPrompt: async (targetTurnId?: string) => {
+          const accepted = await turnController.requestCancel(targetTurnId);
           if (!accepted) {
             return false;
           }
@@ -695,7 +695,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       }
       isFirstTask = false;
 
-      const turnPromise = runPromptTurn(async () => {
+      const turnPromise = runPromptTurn(task.requestId, async () => {
         try {
           parking?.beginTask(task.requestId);
           await runQueuedTask(options.sessionId, task, {
@@ -745,7 +745,10 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
     return queuedToOwner;
   }
 
-  const owner = spawnQueueOwnerProcess(queueOwnerRuntimeOptionsFromSend(options));
+  const owner = spawnQueueOwnerProcess(
+    queueOwnerRuntimeOptionsFromSend(options),
+    options.queueOwnerSpawnArgs,
+  );
   // Stop retaining diagnostics at first IPC accept (not after full turn completion).
   const onQueueAccepted = () => {
     owner.stopStartupCapture();

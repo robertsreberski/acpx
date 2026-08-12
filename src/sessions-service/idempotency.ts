@@ -231,12 +231,15 @@ function errorShape(error: unknown): { name: string; message: string } {
     : { name: "Error", message: String(error) };
 }
 
+// oxlint-disable-next-line eslint/complexity -- Durable replay, recovery, ambiguity, and failure are separate terminal states.
 export async function runIdempotentMutation<T>(options: {
   operation: AcpxMutationOperation;
   idempotencyKey: string;
   input: unknown;
   recoveryResult?: T;
-  run: () => Promise<T>;
+  recover?: (checkpoint: unknown) => Promise<T>;
+  outcomeUnknown?: (error: unknown) => boolean;
+  run: (checkpoint: (value: unknown) => Promise<void>) => Promise<T>;
 }): Promise<AcpxMutationReceipt<T>> {
   assertIdempotencyKey(options.idempotencyKey);
   const lock = await acquireLock(options.idempotencyKey);
@@ -263,6 +266,21 @@ export async function runIdempotentMutation<T>(options: {
         );
       }
       if (stored.recovery_result !== undefined) {
+        if (options.recover) {
+          const result = await options.recover(stored.recovery_result);
+          await writeStored(options.idempotencyKey, {
+            ...stored,
+            state: "succeeded",
+            updated_at: new Date().toISOString(),
+            result,
+          });
+          return {
+            operation: options.operation,
+            idempotencyKey: options.idempotencyKey,
+            replayed: true,
+            result,
+          };
+        }
         return {
           operation: options.operation,
           idempotencyKey: options.idempotencyKey,
@@ -288,7 +306,12 @@ export async function runIdempotentMutation<T>(options: {
     await writeStored(options.idempotencyKey, started);
 
     try {
-      const result = await options.run();
+      const checkpoint = async (value: unknown): Promise<void> => {
+        started.recovery_result = value;
+        started.updated_at = new Date().toISOString();
+        await writeStored(options.idempotencyKey, started);
+      };
+      const result = await options.run(checkpoint);
       await writeStored(options.idempotencyKey, {
         ...started,
         state: "succeeded",
@@ -302,6 +325,17 @@ export async function runIdempotentMutation<T>(options: {
         result,
       };
     } catch (error) {
+      if (
+        (started.recovery_result !== undefined && options.recover !== undefined) ||
+        options.outcomeUnknown?.(error) === true
+      ) {
+        await writeStored(options.idempotencyKey, {
+          ...started,
+          updated_at: new Date().toISOString(),
+          error: errorShape(error),
+        });
+        throw error;
+      }
       await writeStored(options.idempotencyKey, {
         ...started,
         state: "failed",

@@ -12,6 +12,11 @@ import {
 } from "./event-log.js";
 import { findSession, listSessions, normalizeName } from "./persistence.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
+import {
+  listSessionTimelinePage,
+  type SessionTimelineCoverage,
+  type SessionTimelineEvent,
+} from "./timeline.js";
 
 export type ExportedSession = {
   format_version: 1;
@@ -29,6 +34,10 @@ export type ExportedSession = {
     state: Record<string, unknown>;
   };
   history: AcpJsonRpcMessage[];
+  timeline?: {
+    coverage: SessionTimelineCoverage;
+    events: SessionTimelineEvent[];
+  };
 };
 
 export type SessionExportLookup = {
@@ -197,8 +206,35 @@ function serializeSessionRecordForArchive(
       active_path: ".stream.ndjson",
     };
   }
+  delete state.timeline;
 
   return state;
+}
+
+async function readSessionTimeline(record: SessionRecord): Promise<ExportedSession["timeline"]> {
+  if (!record.timeline) {
+    return undefined;
+  }
+  const events: SessionTimelineEvent[] = [];
+  let before: string | undefined;
+  let coverage: SessionTimelineCoverage = "complete";
+  do {
+    const page = await listSessionTimelinePage(record.acpxRecordId, { before, limit: 1_000 });
+    coverage = mergeTimelineCoverage(coverage, page.coverage);
+    events.unshift(...page.items.filter((item): item is SessionTimelineEvent => "payload" in item));
+    before = page.previousCursor;
+  } while (before);
+  return { coverage, events };
+}
+
+function mergeTimelineCoverage(
+  left: SessionTimelineCoverage,
+  right: SessionTimelineCoverage,
+): SessionTimelineCoverage {
+  if (left === "incomplete" || right === "incomplete") {
+    return "incomplete";
+  }
+  return left === "legacy_retained" || right === "legacy_retained" ? "legacy_retained" : "complete";
 }
 
 export async function exportSession(
@@ -219,6 +255,10 @@ export async function exportSession(
 
   const home = os.homedir();
   const cwdRelative = cwdRelativeToHome(record.cwd, home);
+  const [history, timeline] = await Promise.all([
+    readSessionHistory(record),
+    readSessionTimeline(record),
+  ]);
   const exported: ExportedSession = {
     format_version: 1,
     exported_at: new Date().toISOString(),
@@ -234,7 +274,8 @@ export async function exportSession(
       updated_at: record.lastUsedAt,
       state: serializeSessionRecordForArchive(record, cwdRelative),
     },
-    history: await readSessionHistory(record),
+    history,
+    timeline,
   };
 
   await fs.mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });

@@ -114,6 +114,8 @@ export type SessionSendOptions = {
   /** Milliseconds a parked request waits before expiring; 0 parks forever. */
   deferMaxAgeMs?: number;
   client?: AcpClient;
+  /** Internal executable arguments used by embedded services to start acpx's queue owner. */
+  queueOwnerSpawnArgs?: string[];
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;
 } & TimedRunOptions;
@@ -159,6 +161,8 @@ export type SessionListResult = AgentSessionListResult | undefined;
 
 export type SessionCancelOptions = {
   sessionId: string;
+  /** Cancel only this turn; a different active turn is left untouched. */
+  turnId?: string;
   verbose?: boolean;
 };
 

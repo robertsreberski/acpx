@@ -30,12 +30,16 @@ const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
  * 2: permission policies carry `defer` rules and permission_escalation events
  *    carry action "defer". A v1 owner drops unknown rule lists, so a request
  *    the user asked to park is instead settled by the permission mode.
+ * 3: cancel requests may name the exact turn they target. Older owners would
+ *    ignore that field and could cancel a newer turn after a handoff race.
  */
-export const QUEUE_PROTOCOL_VERSION = 2;
+export const QUEUE_PROTOCOL_VERSION = 3;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
+/** First protocol version that atomically checks a cancel request's turn id. */
+export const QUEUE_PROTOCOL_EXACT_CANCEL_VERSION = 3;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided

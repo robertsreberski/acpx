@@ -8,7 +8,6 @@ import { AcpxSessionAdoptionError, createAcpxSessionService } from "../src/sessi
 import { withTempHome } from "./runtime-test-helpers.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
-const QUEUE_OWNER_CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 
 async function waitFor<T>(read: () => Promise<T | undefined>, timeoutMs = 10_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -101,6 +100,50 @@ test("session service creates without prompting, replays idempotently, and lists
   });
 });
 
+test("session creation recovers the persisted provider record after post-create mode failure", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "calls.ndjson");
+    const failOnceMarker = path.join(homeDir, "mode-failed-once");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: [
+          "--supports-resume-session",
+          "--set-session-mode-fails-once",
+          failOnceMarker,
+          "--call-log",
+          callLog,
+        ],
+      },
+    });
+    const service = createAcpxSessionService({ cwd });
+    const input = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      idempotencyKey: "recover-create",
+    };
+
+    await assert.rejects(async () => await service.createSession(input), /Internal error/);
+    const [persisted] = await listSessions();
+    assert.ok(persisted);
+
+    const recovered = await service.createSession(input);
+    assert.equal(recovered.replayed, true);
+    assert.equal(recovered.result.acpxRecordId, persisted.acpxRecordId);
+    assert.equal(recovered.result.mode, "plan");
+    assert.equal((await listSessions()).length, 1);
+    const calls = (await fs.readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string });
+    assert.equal(calls.filter((entry) => entry.method === "session/new").length, 1);
+    assert.equal(calls.filter((entry) => entry.method === "session/resume").length, 1);
+    service.dispose();
+  });
+});
+
 test("adoption is strict and never replaces an unsupported provider session with a new one", async () => {
   await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -156,8 +199,6 @@ test("the service drives create, queue, park, answer, transcript, and close end 
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
     await writeAgentConfig(homeDir, { queue: { args: ["--supports-resume-session"] } });
-    const previousOwnerArgs = process.env.ACPX_QUEUE_OWNER_ARGS;
-    process.env.ACPX_QUEUE_OWNER_ARGS = JSON.stringify([QUEUE_OWNER_CLI_PATH, "__queue-owner"]);
     const service = createAcpxSessionService({ cwd, pendingResponseTimeoutMs: 2_000 });
     try {
       const created = await service.createSession({
@@ -221,11 +262,6 @@ test("the service drives create, queue, park, answer, transcript, and close end 
       assert.equal(closed.result.sessionState, "closed");
     } finally {
       service.dispose();
-      if (previousOwnerArgs === undefined) {
-        delete process.env.ACPX_QUEUE_OWNER_ARGS;
-      } else {
-        process.env.ACPX_QUEUE_OWNER_ARGS = previousOwnerArgs;
-      }
     }
   });
 });

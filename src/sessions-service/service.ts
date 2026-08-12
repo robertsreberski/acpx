@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   mergeAgentRegistry,
   normalizeAgentName,
@@ -8,12 +9,18 @@ import {
 import { withTimeout } from "../async-control.js";
 import { loadResolvedConfig, type ResolvedAcpxConfig } from "../cli/config.js";
 import { createOutputFormatter } from "../cli/output/output.js";
-import { tryListRequestsOnRunningOwner, tryRespondOnRunningOwner } from "../cli/queue/ipc.js";
+import {
+  isQueueAdmissionOutcomeUnknown,
+  tryListRequestsOnRunningOwner,
+  tryRespondOnRunningOwner,
+} from "../cli/queue/ipc.js";
 import { readLiveQueueOwner, readQueueOwnerRecord } from "../cli/queue/lease-store.js";
+import { queueOwnerSpawnArgsForEntry } from "../cli/session/queue-owner-process.js";
 import { sendSession } from "../cli/session/queue-owner-runtime.js";
 import {
   cancelSessionPrompt,
   closeSession as closeOwnedSession,
+  setSessionMode,
 } from "../cli/session/session-control.js";
 import { createSessionWithClient, listAgentSessions } from "../cli/session/session-management.js";
 import { PendingRequestOwnerGoneError, SessionNotFoundError } from "../errors.js";
@@ -62,6 +69,9 @@ const LIVE_PENDING_LIST_TIMEOUT_MS = 2_000;
 const DEFAULT_PENDING_RESPONSE_TIMEOUT_MS = 60_000;
 const DEFAULT_DEFER_MAX_AGE_MS = 86_400_000;
 const NO_LIVE_OWNER_GENERATION = 0;
+const SESSION_SERVICE_QUEUE_OWNER_ARGS = queueOwnerSpawnArgsForEntry(
+  fileURLToPath(new URL("../cli.js", import.meta.url)),
+);
 
 /** Browser-created sessions stop at the human boundary unless a caller opts into another policy. */
 export const DEFAULT_SESSIONS_PERMISSION_POLICY: Readonly<PermissionPolicy> = {
@@ -75,6 +85,25 @@ type ResolvedAgent = {
   agentArgv?: string[];
   config: ResolvedAcpxConfig;
 };
+
+type StartSessionCheckpoint = {
+  recordId: string;
+  phase: "created" | "configured";
+};
+
+function parseStartSessionCheckpoint(value: unknown): StartSessionCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid persisted session-start recovery checkpoint");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.recordId !== "string" ||
+    (record.phase !== "created" && record.phase !== "configured")
+  ) {
+    throw new Error("Invalid persisted session-start recovery checkpoint");
+  }
+  return { recordId: record.recordId, phase: record.phase };
+}
 
 export class AcpxAgentCapabilityError extends Error {
   readonly code = "AGENT_CAPABILITY_UNSUPPORTED";
@@ -350,6 +379,7 @@ class SessionService implements AcpxSessionService {
   private async startSession(
     input: AcpxCreateSessionInput,
     providerSessionId?: string,
+    checkpoint?: (value: StartSessionCheckpoint) => Promise<void>,
   ): Promise<AcpxSessionDetail> {
     const agent = await this.resolveAgent(input.agentId, input.cwd);
     if (providerSessionId) {
@@ -388,6 +418,7 @@ class SessionService implements AcpxSessionService {
     }
     const { record, client } = created;
     try {
+      await checkpoint?.({ recordId: record.acpxRecordId, phase: "created" });
       const mode = input.mode ?? defaultMode(agent.agentId);
       if (mode) {
         await withTimeout(
@@ -397,12 +428,53 @@ class SessionService implements AcpxSessionService {
         setDesiredModeId(record, mode);
         record.acpx = { ...record.acpx, current_mode_id: mode };
       }
+      await writeSessionRecord(record);
+      await checkpoint?.({ recordId: record.acpxRecordId, phase: "configured" });
     } finally {
       await client.close();
       applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
       await writeSessionRecord(record);
     }
     return await this.projectDetail(record);
+  }
+
+  // oxlint-disable-next-line eslint/complexity -- Recovery validates identity and resumes only the unfinished phase.
+  private async recoverStartedSession(
+    input: AcpxCreateSessionInput,
+    checkpointValue: unknown,
+    providerSessionId?: string,
+  ): Promise<AcpxSessionDetail> {
+    const checkpoint = parseStartSessionCheckpoint(checkpointValue);
+    const [agent, record] = await Promise.all([
+      this.resolveAgent(input.agentId, input.cwd),
+      this.requireExactRecord(checkpoint.recordId),
+    ]);
+    if (
+      record.agentCommand !== agent.agentCommand ||
+      (providerSessionId !== undefined && record.acpSessionId !== providerSessionId)
+    ) {
+      throw new Error(
+        `Persisted session-start checkpoint does not match the requested session ` +
+          `(record command ${JSON.stringify(record.agentCommand)}, requested command ${JSON.stringify(agent.agentCommand)}, ` +
+          `record provider ${JSON.stringify(record.acpSessionId)}, requested provider ${JSON.stringify(providerSessionId)})`,
+      );
+    }
+    if (checkpoint.phase === "created") {
+      const mode = input.mode ?? defaultMode(agent.agentId);
+      if (mode) {
+        await setSessionMode({
+          sessionId: record.acpxRecordId,
+          modeId: mode,
+          mcpServers: agent.config.mcpServers,
+          nonInteractivePermissions:
+            this.options.nonInteractivePermissions ?? agent.config.nonInteractivePermissions,
+          authCredentials: { ...agent.config.auth, ...this.options.authCredentials },
+          authPolicy: this.options.authPolicy ?? agent.config.authPolicy,
+          timeoutMs: this.adapterTimeout(agent.config),
+        });
+      }
+    }
+    return await this.projectDetail(await this.requireExactRecord(checkpoint.recordId));
   }
 
   async createSession(
@@ -412,7 +484,8 @@ class SessionService implements AcpxSessionService {
       operation: "create_session",
       idempotencyKey: input.idempotencyKey,
       input,
-      run: async () => await this.startSession(input),
+      recover: async (checkpoint) => await this.recoverStartedSession(input, checkpoint),
+      run: async (checkpoint) => await this.startSession(input, undefined, checkpoint),
     });
     this.emit({ type: "sessions", acpxRecordId: receipt.result.acpxRecordId });
     return receipt;
@@ -425,7 +498,10 @@ class SessionService implements AcpxSessionService {
       operation: "adopt_session",
       idempotencyKey: input.idempotencyKey,
       input,
-      run: async () => await this.startSession(input, input.providerSessionId),
+      recover: async (checkpoint) =>
+        await this.recoverStartedSession(input, checkpoint, input.providerSessionId),
+      run: async (checkpoint) =>
+        await this.startSession(input, input.providerSessionId, checkpoint),
     });
     this.emit({ type: "sessions", acpxRecordId: receipt.result.acpxRecordId });
     return receipt;
@@ -441,6 +517,7 @@ class SessionService implements AcpxSessionService {
       idempotencyKey: input.idempotencyKey,
       input,
       recoveryResult: unknown,
+      outcomeUnknown: isQueueAdmissionOutcomeUnknown,
       // oxlint-disable-next-line eslint/complexity -- Queue admission must assemble the complete existing send contract atomically.
       run: async () => {
         const record = await this.requireExactRecord(input.acpxRecordId);
@@ -473,6 +550,7 @@ class SessionService implements AcpxSessionService {
               stderr: { write() {} },
             }),
             suppressSdkConsoleErrors: true,
+            queueOwnerSpawnArgs: SESSION_SERVICE_QUEUE_OWNER_ARGS,
             timeoutMs: config.timeoutMs,
             ttlMs: config.ttlMs,
             defer: true,
@@ -490,14 +568,16 @@ class SessionService implements AcpxSessionService {
               : undefined,
           });
         } catch (error) {
-          await appendSessionTimelineLifecycleEvent(
-            record,
-            {
-              type: "turn_failed",
-              message: error instanceof Error ? error.message : String(error),
-            },
-            { turnId, requestId: turnId },
-          );
+          if (!isQueueAdmissionOutcomeUnknown(error)) {
+            await appendSessionTimelineLifecycleEvent(
+              record,
+              {
+                type: "turn_failed",
+                message: error instanceof Error ? error.message : String(error),
+              },
+              { turnId, requestId: turnId },
+            );
+          }
           throw error;
         }
         const admission: AcpxEnqueuePromptResult["admission"] =
@@ -521,7 +601,10 @@ class SessionService implements AcpxSessionService {
         if (activeTurn?.turn_id !== input.turnId) {
           throw new AcpxTurnNotActiveError(input.turnId, activeTurn?.turn_id);
         }
-        const cancelled = await cancelSessionPrompt({ sessionId: input.acpxRecordId });
+        const cancelled = await cancelSessionPrompt({
+          sessionId: input.acpxRecordId,
+          turnId: input.turnId,
+        });
         return {
           turnId: input.turnId,
           state: cancelled.cancelled ? "cancelling" : "unknown",
