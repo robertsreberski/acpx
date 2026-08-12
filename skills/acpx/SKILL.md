@@ -197,6 +197,8 @@ Behavior:
 acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
 acpx codex requests --json
 acpx codex respond <request-id> --option allow
+acpx codex respond <request-id> --field question_0='Greeting A'
+acpx codex respond <request-id> --text 'my own answer'
 acpx codex respond <request-id> --decline
 acpx codex respond <request-id> --cancel
 ```
@@ -209,10 +211,14 @@ Behavior:
 - `requests` observes only: it never rewrites request state and never touches the owner process. A request left `pending` by a dead owner is reconciled to `orphaned` by `respond` or by the session's next queue owner.
 - `-s` takes a session **name**; the JSON carries `session_id` and `cwd`. Answer a request listed by `--all` from its `cwd`.
 - `requests --json` prints the persisted store entries verbatim (snake_case, `acpx.pending_request.v1`). Bind scripts to that shape.
-- `respond` takes exactly one of `--option <optionId>`, `--decline`, or `--cancel`. Option ids come from the `options` array of the listed request.
+- `respond` takes exactly one answer: `--option <optionId>`, the `--field`/`--text` form group, `--decline`, or `--cancel`. Option ids come from the `options` array of the listed request.
+- Parked requests come in two kinds. `kind: "permission"` carries `tool_call` and `options` and is answered with `--option`. `kind: "elicitation"` carries `elicitation.requested_schema` (the agent's JSON Schema, verbatim) and is answered with `--field <key>=<value>` (repeatable) or `--text <answer>` for a one-field form. Using the wrong one is exit `2` with a message naming what the request does take.
+- Form elicitation is advertised to the agent **only** when the owner runs with `--defer`, because parking is the only way acpx can answer one. This is what re-enables `AskUserQuestion` in `claude-agent-acp`; without `--defer` the agent keeps its stock behaviour and never asks.
+- `--field` values are coerced by the schema's declared `type`: `boolean` takes exactly `true`/`false`, `number`/`integer` take numbers, `array` takes a comma-separated list (empty means `[]`), and `string`/untyped take the raw text. Anything else is exit `2` rather than a guess.
+- Declining an elicitation tells the agent the form was skipped and the turn carries on; expiry declines too and never accepts.
 - `respond` exits `2` when the answer cannot apply (unknown option, unknown or settled request) and `4` when the owner that parked the request is gone.
 - `status` reports the parked count (`parkedRequests` in JSON), counting `pending` requests only.
-- `respond` waits indefinitely by default. Pass the global `--timeout <seconds>` to bound it: exit `3` with `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`, and the answer may still be applied afterwards — re-read the request instead of assuming it failed.
+- `respond` waits indefinitely by default. Pass the global `--timeout <seconds>` to bound it: exit `3` with `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`. The bound covers reaching the owner as well as waiting for it. If the owner was reached the answer may still be applied afterwards — re-read the request instead of assuming it failed; if it was never reached, nothing was delivered.
 - Inspection never retires a queue owner. A live owner that is not answering shows as `status: unreachable`, distinct from `dead`.
 
 ### Sessions

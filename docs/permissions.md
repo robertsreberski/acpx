@@ -58,7 +58,30 @@ acpx codex respond <request-id> --option allow
 - A parked request expires after `--defer-max-age` (default `86400`, `0` never expires; a request parked indefinitely carries no `expires_at`). Expiry resolves like a rejection, never like an approval.
 - Cancelling the session or stopping the owner unwinds parked requests; requests a stopped owner left behind become `orphaned` and can no longer be answered.
 - [`acpx <agent> requests`](CLI.md#requests-command) lists them and [`acpx <agent> respond`](CLI.md#respond-command) answers them. `acpx <agent> status` reports how many are parked.
-- Every transition is also emitted into the session event stream as an `_acpx/pending_request` notification, so a `--no-wait` caller still sees park and answer events.
+- Every transition is also emitted into the session event stream as an `_acpx/pending_request` notification, so a `--no-wait` caller still sees park and answer events. The agent-authored bulk is left out of the notification — a permission request's raw tool input, an elicitation's requested schema — because the durable entry already holds it verbatim and it would otherwise repeat on every transition.
+
+## Form elicitations
+
+Some agents want to ask the operator a question rather than ask permission for a tool call. ACP models that as a **form elicitation**: the agent sends a JSON Schema describing the fields it wants filled in, and the client renders it.
+
+acpx advertises support for form elicitation **only when the session's queue owner runs with `--defer`**, because parking is the only way it can answer one. This is deliberate:
+
+- `claude-agent-acp` keeps `AskUserQuestion` in its `disallowedTools` unless the client advertises form elicitation, so advertising it is exactly what re-enables the tool.
+- Advertising it without an answerer would be worse than staying silent: the model would start asking questions that acpx could only auto-decline, turning a tool it never reaches for into one it reaches for and is always skipped on.
+- An owner started **without** `--defer` therefore does not advertise, and the agent keeps its stock behaviour. That is not a bug — it is the unchanged, working default.
+
+With `--defer`, an elicitation parks exactly like a permission request: same durable store, same `--defer-max-age` expiry, same unwinding on cancel and shutdown, same `_acpx/pending_request` events, same lease gates (elicitation parking rides the existing `parking` flag; the advertisement is a property of the owner process and is tied to the same `--defer`, so there is no separate capability to negotiate).
+
+```bash
+acpx --defer codex prompt --no-wait 'ask me whether to use greeting A or B, then write it to hello.txt'
+acpx codex requests --json    # elicitation.requested_schema shows the fields
+acpx codex respond <request-id> --field question_0='Greeting A'
+```
+
+- The store entry carries `kind: "elicitation"` and the agent's `requested_schema` **verbatim**, because that schema is what an answer is typed against.
+- Answers are `--field`/`--text` (accept), `--decline` (the form was skipped — the turn carries on) or `--cancel` (abandon it). See [`respond`](CLI.md#respond-command) for the coercion rules.
+- Expiry **declines**; it never accepts. Nobody filled the form in, and synthesizing content would put words in the operator's mouth.
+- A hook or client failure also declines rather than inventing content, and says so in the log.
 
 ## What counts as a "read"
 

@@ -339,7 +339,7 @@ acpx [global_options] <agent> requests --json
 acpx [global_options] requests   # defaults to codex
 ```
 
-Lists the permission requests this session has parked with [`--defer`](permissions.md).
+Lists the requests this session has parked with [`--defer`](permissions.md): permission requests, and the form elicitations an agent sends when it wants the operator to answer a question.
 
 Behavior:
 
@@ -349,11 +349,13 @@ Behavior:
 - Adds anything a live owner is holding that the store does not know about, waiting at most two seconds for it. When the owner cannot be reached the listing still prints, and the gap is reported on stderr — as an `_acpx/warning` JSON-RPC notification under `--format json` (including `--json-strict`, whose contract is that stderr carries no _non-JSON_ output) and as `[acpx] warning: …` otherwise.
 - `--all` lists every session's requests with the same live cross-check, bounded to sessions that still have a live owner. It needs no session in the current directory and cannot be combined with `-s`. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
 - States are `pending`, `answered`, `cancelled`, `expired`, and `orphaned`. The listing shows all of them; only `pending` requests can be answered.
+- `kind` is `permission` or `elicitation`. A permission request offers options to pick from; an elicitation carries a form to fill in. They park, expire and unwind identically — only the question and its answer differ.
 
 Output:
 
 - `--json` (or `--format json`) prints the persisted store entries verbatim: a JSON array of `acpx.pending_request.v1` objects with snake_case keys. This is the same shape as the files under `~/.acpx/requests/` and is the contract scripts should bind to. `expires_at` is absent when the owner runs with `--defer-max-age 0`, which parks indefinitely.
-- Text prints one tab-separated line per request: id, state, session id, tool title, offered option ids, creation time.
+- An elicitation entry carries `elicitation.message`, `elicitation.mode` (always `form`), `elicitation.tool_call_id` when the agent scoped it to a tool call, and `elicitation.requested_schema` — the agent's JSON Schema, verbatim, which is what an answer is typed against. Its `options` array is present and empty, so a reader that walks every entry's option list keeps working. A permission entry carries `tool_call` and a populated `options`.
+- Text prints one tab-separated line per request: id, state, session id, kind, subject, answerable-with, creation time. The subject is the tool title for a permission request and the agent's message for an elicitation (folded onto one line); the answerable-with column is the offered option ids or the form's field names.
 - Quiet prints one tab-separated `id session-id` line per request.
 - `-s` selects a session by **name**, while the JSON carries the session's record id as `session_id` and its directory as `cwd`. To answer a request listed by `--all`, run `respond` from that `cwd` (or pass the session's name with `-s`).
 - `--json` selects this command's result shape. Error envelopes follow the global `--format json`, as they do for `compare --json`.
@@ -362,18 +364,36 @@ Output:
 
 ```bash
 acpx [global_options] <agent> respond <request-id> --option <optionId> [-s <name>]
+acpx [global_options] <agent> respond <request-id> --field <key>=<value> [--field ...]
+acpx [global_options] <agent> respond <request-id> --text <answer>
 acpx [global_options] <agent> respond <request-id> --decline
 acpx [global_options] <agent> respond <request-id> --cancel
 acpx [global_options] respond <request-id> --option allow   # defaults to codex
 ```
 
-Answers one parked permission request. Exactly one of `--option`, `--decline`, or `--cancel` is required.
+Answers one parked request. Exactly one answer is required: `--option`, the `--field`/`--text` form group, `--decline`, or `--cancel`.
 
-- `--option <optionId>`: answer with one of the option ids the agent offered (see `requests`).
-- `--decline`: answer with the rejection option the agent offered. Refused when the agent offered none; pick an option or cancel instead.
-- `--cancel`: cancel the request without choosing an option. The turn continues; the agent sees a cancelled permission request.
+- `--option <optionId>`: answer a **permission request** with one of the option ids the agent offered (see `requests`). Refused for an elicitation, which has no options.
+- `--field <key>=<value>`: fill in one field of an **elicitation** form. Repeatable, one field per flag. Refused for a permission request.
+- `--text <answer>`: fill in an elicitation form that has **exactly one** field. Refused otherwise, naming the fields so you can pick one with `--field`. Note that `claude-agent-acp` pairs every AskUserQuestion question with its own free-text field, so even a one-question form has two fields and needs `--field`.
+- `--decline`: for a permission request, answer with the rejection option the agent offered — refused when the agent offered none, so pick an option or cancel instead. For an elicitation, decline the form; the agent is told it was skipped and the turn carries on.
+- `--cancel`: cancel the request without answering it. The turn continues; the agent sees a cancelled request.
 
-The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. `respond` waits indefinitely for the owner to confirm, because an answer already on the wire may be applied at any moment. A caller that cannot wait — a turn with a run budget, say — passes the global `--timeout <seconds>`: `respond` then gives up with exit `3` and `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`, and **the answer may still be applied afterwards**, so treat it as unknown rather than failed and re-read the request before retrying. The request is then terminal: `answered` for `--option` and `--decline`, `cancelled` for `--cancel`, both with `resolution.source: "cli"`.
+Field values are coerced by the `type` the agent declared for that field in `requested_schema`:
+
+| Schema type          | `--field` value                       | Sent as        |
+| -------------------- | ------------------------------------- | -------------- |
+| `string`, or untyped | anything                              | the string     |
+| `boolean`            | `true` or `false`, exactly            | `true`/`false` |
+| `number`             | any finite number                     | a JSON number  |
+| `integer`            | any whole number                      | a JSON number  |
+| `array`              | comma-separated (`a,b`); empty = `[]` | a string array |
+
+Anything that does not fit is a usage error rather than a guess: a value the schema cannot accept would otherwise reach the agent as a real answer. The same applies to a field the form does not have, the same field twice, a missing required field, and a schema type acpx cannot build from a command line — read the form with `requests --json`, or answer with `--decline` or `--cancel`. Only the first `=` splits, so a value may contain more.
+
+The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. `respond` waits indefinitely for the owner to confirm, because an answer already on the wire may be applied at any moment. A caller that cannot wait — a turn with a run budget, say — passes the global `--timeout <seconds>`: `respond` then gives up with exit `3` and `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`. The bound covers the whole operation, both reaching the owner and waiting for its confirmation, and the message says which ran out. If the owner was reached, **the answer may still be applied afterwards**, so treat it as unknown rather than failed and re-read the request before retrying; if the owner could never be reached, nothing was delivered and the request is still parked.
+
+Once answered the request is terminal, with `resolution.source: "cli"`: `answered` for `--option`, `--field`/`--text` and `--decline`, `cancelled` for `--cancel`. An elicitation also records `resolution.action` (`accept`, `decline` or `cancel`); the content of an accepted form is not persisted.
 
 Output is the resulting store entry: the persisted JSON object under `--json`, a one-line summary in text, and the resulting state in quiet.
 
