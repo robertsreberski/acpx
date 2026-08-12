@@ -137,12 +137,18 @@ class ConsoleApi {
     if (options.body !== undefined) {
       headers.set("Content-Type", "application/json");
     }
-    const response = await fetch(`${this.origin}${pathname}`, {
-      method: options.method ?? "GET",
-      headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
-    });
+    const method = options.method ?? "GET";
+    let response;
+    try {
+      response = await fetch(`${this.origin}${pathname}`, {
+        method,
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+      });
+    } catch (error) {
+      throw new Error(`${method} ${pathname} did not complete`, { cause: error });
+    }
     const text = await response.text();
     let body;
     try {
