@@ -220,6 +220,47 @@ function splitCommandLine(value: string): ParsedCommand {
   };
 }
 
+/**
+ * Split `<json-object> <rest>` where the JSON may contain spaces of its own.
+ *
+ * The object is found by balancing braces outside of string literals, so a
+ * schema with human-readable option labels parses the same as a compact one.
+ */
+function splitJsonPrefix(value: string): { json: string; remainder: string } | undefined {
+  if (!value.startsWith("{")) {
+    return undefined;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const ch = value[index];
+    if (escaping) {
+      escaping = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === "\\") {
+        escaping = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return { json: value.slice(0, index + 1), remainder: value.slice(index + 1).trim() };
+      }
+    }
+  }
+  return undefined;
+}
+
 function assertNotCancelled(signal: AbortSignal): void {
   if (signal.aborted) {
     throw new CancelledError();
@@ -742,12 +783,17 @@ class MockAgent implements Agent {
   private readonly sessions = new Map<SessionId, SessionState>();
   private readonly options: MockAgentOptions;
 
+  private clientCapabilities: unknown;
+
   constructor(connection: AgentConnection, options: MockAgentOptions) {
     this.connection = connection;
     this.options = options;
   }
 
-  async initialize(): Promise<InitializeResponse> {
+  async initialize(params?: { clientCapabilities?: unknown }): Promise<InitializeResponse> {
+    // Kept so a test can ask what acpx actually advertised, which is the only
+    // way to prove a capability is gated rather than always sent.
+    this.clientCapabilities = params?.clientCapabilities;
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
       ...(this.options.supportsListSessions ? { list: {} } : {}),
@@ -1305,6 +1351,41 @@ class MockAgent implements Agent {
       });
 
       return `wrote ${filePath}`;
+    }
+
+    // Reports what the client advertised at initialize, so a test can prove a
+    // capability is advertised only when acpx can actually honour it.
+    if (text === "client-capabilities") {
+      return `client capabilities:${JSON.stringify(this.clientCapabilities ?? null)}`;
+    }
+
+    // Drives a form elicitation. The schema comes first and is read by
+    // balancing braces rather than by splitting on whitespace, because a real
+    // AskUserQuestion schema carries option labels with spaces in them and a
+    // test is worth nothing if it can only use labels that have none.
+    //
+    // The answer is echoed back into the turn's result so an end-to-end test can
+    // assert on what the agent actually received, not just on what the store
+    // recorded.
+    if (text.startsWith("elicit ")) {
+      const split = splitJsonPrefix(text.slice("elicit ".length).trim());
+      if (!split || !split.remainder) {
+        throw new Error("Usage: elicit <requested-schema-json> <message>");
+      }
+
+      const requestedSchema = JSON.parse(split.json) as Record<string, unknown>;
+      const response = await this.connection.unstable_createElicitation({
+        mode: "form",
+        sessionId,
+        toolCallId: "ask-1",
+        message: split.remainder,
+        requestedSchema,
+      });
+
+      if (response.action === "accept") {
+        return `elicitation accepted:${JSON.stringify(response.content ?? {})}`;
+      }
+      return `elicitation ${response.action}`;
     }
 
     // Lets a test drive an agent whose option list is not the usual

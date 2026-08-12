@@ -5602,9 +5602,11 @@ test("runPromptTurn: existing agent reply still allows post-success drain", asyn
 
 type StoredPendingRequest = {
   request_id: string;
+  kind?: string;
   state: string;
   task_request_id: string;
-  resolution?: { source?: string; option_id?: string };
+  elicitation?: { message?: string; mode?: string; requested_schema?: unknown };
+  resolution?: { source?: string; option_id?: string; action?: string };
 };
 
 async function readStoredPendingRequests(homeDir: string): Promise<StoredPendingRequest[]> {
@@ -6518,6 +6520,342 @@ test("integration: requests --all lists parked requests without a session in cwd
       await waitForRequestState(homeDir, "cancelled");
     } finally {
       await fs.rm(otherCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * The AskUserQuestion form claude-agent-acp actually builds, in miniature: a
+ * titled `oneOf` enum whose `const` is the option label, plus the per-question
+ * free-text field it always pairs with it.
+ */
+const ASK_USER_QUESTION_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    question_0: {
+      type: "string",
+      title: "Greeting",
+      oneOf: [
+        { const: "Greeting A", title: "Greeting A" },
+        { const: "Greeting B", title: "Greeting B" },
+      ],
+    },
+    question_0_custom: { type: "string", title: "Other" },
+  },
+});
+
+function elicitPrompt(schemaJson = ASK_USER_QUESTION_SCHEMA, message = "Which greeting?"): string {
+  return `elicit ${schemaJson} ${message}`;
+}
+
+/** A session with one elicitation parked and nothing but a responder to settle it. */
+async function withParkedElicitation(
+  run: (fixture: ParkedRequestFixture) => Promise<void>,
+  parkPrompt = elicitPrompt(),
+): Promise<void> {
+  await withParkedRequest(run, parkPrompt);
+}
+
+test("integration: an elicitation parks, lists with its form, and --field answers it", async () => {
+  await withParkedElicitation(async ({ homeDir, deferArgs }) => {
+    const listed = await listRequestsJson(homeDir, deferArgs);
+    assert.equal(listed.length, 1, JSON.stringify(listed));
+    const parked = listed[0] ?? {};
+    assert.equal(parked.schema, "acpx.pending_request.v1");
+    assert.equal(parked.kind, "elicitation");
+    assert.equal(parked.state, "pending");
+    // Nothing to pick from, so the option list is empty rather than absent:
+    // one shape for both kinds on disk, on the wire and in this listing.
+    assert.deepEqual(parked.options, []);
+    const elicitation = parked.elicitation as {
+      message?: string;
+      mode?: string;
+      tool_call_id?: string;
+      requested_schema?: unknown;
+    };
+    assert.equal(elicitation.message, "Which greeting?");
+    assert.equal(elicitation.mode, "form");
+    assert.equal(elicitation.tool_call_id, "ask-1");
+    // The agent's schema, verbatim: it is what the answer is typed against.
+    assert.deepEqual(elicitation.requested_schema, JSON.parse(ASK_USER_QUESTION_SCHEMA));
+
+    const requestId = String(parked.request_id);
+    const answered = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--field", "question_0=Greeting A"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+    const payload = JSON.parse(answered.stdout.trim()) as {
+      state: string;
+      resolution?: { source?: string; action?: string };
+    };
+    assert.equal(payload.state, "answered");
+    assert.equal(payload.resolution?.source, "cli");
+    assert.equal(payload.resolution?.action, "accept");
+
+    // The turn resumes and the agent receives exactly the content that was
+    // typed — this is the end of the chain the milestone exists to close.
+    await waitFor(async () => {
+      const stream = await readSessionStream(homeDir);
+      return stream.includes('elicitation accepted:{\\"question_0\\":\\"Greeting A\\"}') ||
+        stream.includes('elicitation accepted:{"question_0":"Greeting A"}')
+        ? "done"
+        : null;
+    }, 25_000);
+
+    const events = await readPendingRequestEvents(homeDir);
+    assert.deepEqual(
+      events.map((entry) => `${entry.event}:${entry.state}`),
+      ["created:pending", "answered:answered"],
+    );
+  });
+});
+
+test("integration: --text answers a single-field form and refuses a multi-field one", async () => {
+  const singleFieldSchema = JSON.stringify({
+    type: "object",
+    properties: { answer: { type: "string" } },
+  });
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+      const answered = await runCli(
+        [...deferArgs, "--format", "json", "respond", requestId, "--text", "Greeting B"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+
+      await waitFor(async () => {
+        const stream = await readSessionStream(homeDir);
+        return stream.includes("Greeting B") ? "done" : null;
+      }, 25_000);
+    },
+    elicitPrompt(singleFieldSchema, "Say something"),
+  );
+
+  // The AskUserQuestion shape has two fields for one question — the enum and
+  // its free-text companion — so --text has to be told which one.
+  await withParkedElicitation(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+    const refused = await runCli(
+      [...deferArgs, "respond", requestId, "--text", "Greeting A"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(refused.code, 2, `${refused.stdout}${refused.stderr}`);
+    assert.match(
+      `${refused.stdout}${refused.stderr}`,
+      /--text answers a form with exactly one field/,
+    );
+    assert.match(`${refused.stdout}${refused.stderr}`, /fields: question_0, question_0_custom/);
+    // Refusing to answer leaves the request answerable.
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+  });
+});
+
+test("integration: --field coerces booleans, numbers and lists by the agent's schema", async () => {
+  // Spec-shaped: the SDK validates `elicitation/create` on the agent side, so a
+  // schema that is not a real ACP ElicitationSchema never reaches acpx at all.
+  const typedSchema = JSON.stringify({
+    type: "object",
+    properties: {
+      ready: { type: "boolean" },
+      count: { type: "integer" },
+      picks: { type: "array", items: { type: "string", enum: ["a", "b"] } },
+    },
+  });
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+      const answered = await runCli(
+        [
+          ...deferArgs,
+          "--format",
+          "json",
+          "respond",
+          requestId,
+          "--field",
+          "ready=true",
+          "--field",
+          "count=3",
+          "--field",
+          "picks=a,b",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+
+      // The agent echoes what it received, so this asserts the JSON types that
+      // crossed the wire, not just the strings that were typed.
+      await waitFor(async () => {
+        const stream = await readSessionStream(homeDir);
+        return stream.includes('ready\\":true') && stream.includes('count\\":3') ? "done" : null;
+      }, 25_000);
+      const stream = await readSessionStream(homeDir);
+      assert.match(stream, /picks\\":\[\\"a\\",\\"b\\"\]/);
+    },
+    elicitPrompt(typedSchema, "Typed form"),
+  );
+});
+
+test("integration: an elicitation can be declined and cancelled", async () => {
+  await withParkedElicitation(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+    const declined = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--decline"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(declined.code, 0, `${declined.stdout}${declined.stderr}`);
+    const payload = JSON.parse(declined.stdout.trim()) as {
+      state: string;
+      resolution?: { action?: string };
+    };
+    // Declining a form is an answer, not a cancellation: the agent is told the
+    // user skipped it, and the turn carries on.
+    assert.equal(payload.state, "answered");
+    assert.equal(payload.resolution?.action, "decline");
+
+    await waitFor(async () => {
+      const stream = await readSessionStream(homeDir);
+      return stream.includes("elicitation decline") ? "done" : null;
+    }, 25_000);
+  });
+
+  await withParkedElicitation(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+    const cancelled = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--cancel"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(cancelled.code, 0, `${cancelled.stdout}${cancelled.stderr}`);
+    const payload = JSON.parse(cancelled.stdout.trim()) as {
+      state: string;
+      resolution?: { action?: string };
+    };
+    assert.equal(payload.state, "cancelled");
+    assert.equal(payload.resolution?.action, "cancel");
+  });
+});
+
+test("integration: --option is refused for an elicitation, and --field for a permission", async () => {
+  await withParkedElicitation(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+    const refused = await runCli(
+      [...deferArgs, "respond", requestId, "--option", "allow"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(refused.code, 2, `${refused.stdout}${refused.stderr}`);
+    assert.match(
+      `${refused.stdout}${refused.stderr}`,
+      /is an elicitation and is answered by filling in its form/,
+    );
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+  });
+
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+    const refused = await runCli(
+      [...deferArgs, "respond", requestId, "--field", "question_0=x"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(refused.code, 2, `${refused.stdout}${refused.stderr}`);
+    assert.match(`${refused.stdout}${refused.stderr}`, /is a permission request, not a form/);
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+  });
+});
+
+test("integration: an expired elicitation declines and never accepts", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "new"], homeDir);
+
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--defer",
+          "--defer-max-age",
+          "1",
+          "--format",
+          "json",
+          "--ttl",
+          "20",
+          "prompt",
+          elicitPrompt(),
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(result.code, 0, result.stderr);
+      // Nobody filled the form in, so the agent is told it was skipped. It is
+      // never told a human accepted something a human never typed.
+      assert.match(result.stdout, /elicitation decline/);
+
+      const stored = await readStoredPendingRequests(homeDir);
+      assert.equal(stored.length, 1, JSON.stringify(stored));
+      assert.equal(stored[0]?.kind, "elicitation");
+      assert.equal(stored[0]?.state, "expired");
+      assert.equal(stored[0]?.resolution?.source, "expiry");
+      assert.equal(stored[0]?.resolution?.action, "decline");
+
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: form elicitation is advertised only when the owner can park", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "new"], homeDir);
+
+      // Without --defer nothing here can answer a form, so acpx stays silent
+      // and the agent keeps its own default behaviour (claude-agent-acp leaves
+      // AskUserQuestion in disallowedTools). Advertising with no answerer would
+      // re-enable the tool only to auto-decline it.
+      const stock = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "quiet",
+          "--ttl",
+          "20",
+          "prompt",
+          "client-capabilities",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(stock.code, 0, stock.stderr);
+      assert.match(stock.stdout, /client capabilities:/);
+      assert.equal(
+        stock.stdout.includes("elicitation"),
+        false,
+        `capability advertised without a parking owner: ${stock.stdout}`,
+      );
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+
+      const deferArgs = [...baseAgentArgs(cwd), "--defer", "--defer-max-age", "0"];
+      await runCli([...deferArgs, "--format", "json", "sessions", "new"], homeDir);
+      const parking = await runCli(
+        [...deferArgs, "--format", "quiet", "--ttl", "20", "prompt", "client-capabilities"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(parking.code, 0, parking.stderr);
+      assert.match(parking.stdout, /"elicitation":\{"form":\{\}\}/);
+      await runCli([...deferArgs, "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
     }
   });
 });
