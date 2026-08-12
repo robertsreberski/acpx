@@ -2667,8 +2667,11 @@ test("status reports dead when queue owner lease is present but unreachable", as
       const result = await runCli(["--cwd", cwd, "--format", "json", "codex", "status"], homeDir);
       assert.equal(result.code, 0, result.stderr);
       const payload = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
-      assert.equal(payload.status, "dead");
-      assert.equal(payload.summary, "queue owner unavailable");
+      // Live process, socket not answering: reported as unreachable, and the
+      // owner is left alone rather than retired out from under its session.
+      assert.equal(payload.status, "unreachable");
+      assert.equal(payload.summary, "queue owner is running but not answering");
+      assert.equal(keeper.exitCode, null, "status retired a live queue owner");
     } finally {
       await cleanupOwnerArtifacts({ socketPath, lockPath });
       stopProcess(keeper);

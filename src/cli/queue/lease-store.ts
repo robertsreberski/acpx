@@ -193,7 +193,13 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function isQueueOwnerHeartbeatStale(owner: QueueOwnerRecord): boolean {
+/**
+ * A heartbeat older than the window means the owner's event loop has not run
+ * recently: suspended, wedged, or gone. It is not proof of death — only a
+ * caller taking the session over may act on it — but it is the cheapest honest
+ * signal that the owner is not currently answering.
+ */
+export function isQueueOwnerHeartbeatStale(owner: QueueOwnerRecord): boolean {
   const heartbeatMs = Date.parse(owner.heartbeatAt);
   if (!Number.isFinite(heartbeatMs)) {
     return true;

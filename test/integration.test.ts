@@ -6277,10 +6277,27 @@ test("integration: inspecting a session never retires a live queue owner", async
         strict.stderr,
       );
 
+      // status is an inspection surface too, and it reports the parked count,
+      // so it must not retire the owner holding those requests either.
+      const status = await runCli([...deferArgs, "--format", "json", "status"], homeDir, {
+        timeoutMs: 30_000,
+      });
+      assert.equal(status.code, 0, `${status.stdout}${status.stderr}`);
+      const statusPayload = JSON.parse(status.stdout.trim()) as {
+        status: string;
+        summary: string;
+        parkedRequests: number;
+      };
+      // Honest about what it could not do: the process is alive, so this is
+      // neither "running" nor "dead".
+      assert.equal(statusPayload.status, "unreachable", status.stdout);
+      assert.equal(statusPayload.summary, "queue owner is running but not answering");
+      assert.equal(statusPayload.parkedRequests, 1);
+
       // The owner is still running and the park is still answerable: an
       // inspection command must not kill what it is inspecting, and must not
       // orphan requests whose answers are still coming.
-      assert.equal(isPidAlive(pid), true, "listing retired a live queue owner");
+      assert.equal(isPidAlive(pid), true, "inspection retired a live queue owner");
       assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
     } finally {
       process.kill(pid, "SIGCONT");

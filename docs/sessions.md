@@ -198,12 +198,13 @@ This makes long-running scripted sessions resilient to crashes, OS restarts, and
 
 `acpx codex status` reports local process state:
 
-| State        | Meaning                                                                          |
-| ------------ | -------------------------------------------------------------------------------- |
-| `running`    | Queue owner alive and processing a prompt                                        |
-| `idle`       | Saved session resumable, no queue owner running                                  |
-| `dead`       | Queue owner was expected but is unavailable, or the last agent exit was abnormal |
-| `no-session` | No saved record matches this scope                                               |
+| State         | Meaning                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `running`     | Queue owner alive and processing a prompt                                                        |
+| `idle`        | Saved session resumable, no queue owner running                                                  |
+| `unreachable` | Queue owner process is alive but not answering (suspended, wedged, or its heartbeat has stopped) |
+| `dead`        | No live queue owner and the last agent exit was abnormal                                         |
+| `no-session`  | No saved record matches this scope                                                               |
 
 Status checks are local (`kill(pid, 0)` semantics) — they do not touch the agent.
 `closed` describes the logical session lifecycle. A helper process can exit while the session remains open and resumable. Status reports a PID only when a live queue-owner lease ties that process to the session; queue owner liveness comes from `~/.acpx/queues/*.lock` plus its heartbeat and process probe.

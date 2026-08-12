@@ -1,7 +1,7 @@
 import path from "node:path";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
-import { probeQueueOwnerHealth } from "../queue/ipc.js";
+import { inspectQueueOwnerHealth } from "../queue/ipc.js";
 import { emitJsonResult } from "./json-output.js";
 
 function formatSessionLabel(record: SessionRecord): string {
@@ -31,7 +31,8 @@ export function classifySessionConnectionStatus(health: {
 async function resolveSessionConnectionStatus(
   record: SessionRecord,
 ): Promise<SessionConnectionStatus> {
-  const health = await probeQueueOwnerHealth(record.acpxRecordId);
+  // Printing a banner must never retire the owner it is describing.
+  const health = await inspectQueueOwnerHealth(record.acpxRecordId);
   return classifySessionConnectionStatus(health);
 }
 

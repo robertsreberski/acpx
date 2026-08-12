@@ -15,7 +15,11 @@ import type {
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
-import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
+import {
+  inspectQueueOwnerHealth,
+  probeQueueOwnerHealth,
+  type QueueOwnerHealth,
+} from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
@@ -93,7 +97,7 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 
   return true;
 }
-export { probeQueueOwnerHealth };
+export { inspectQueueOwnerHealth, probeQueueOwnerHealth };
 export type { QueueOwnerHealth };
 export type { QueueOwnerMessage, QueueSubmitRequest } from "./messages.js";
 export type { QueueOwnerControlHandlers, QueueTask } from "./ipc-server.js";

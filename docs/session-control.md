@@ -74,18 +74,20 @@ acpx status              # defaults to codex
 
 Reports local process status for the cwd-scoped session:
 
-| State        | Meaning                                                                          |
-| ------------ | -------------------------------------------------------------------------------- |
-| `running`    | Queue owner alive and processing a prompt                                        |
-| `idle`       | Saved session resumable, no queue owner running                                  |
-| `dead`       | Queue owner was expected but is unavailable, or the last agent exit was abnormal |
-| `no-session` | No saved record matches this scope                                               |
+| State         | Meaning                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `running`     | Queue owner alive and processing a prompt                                                        |
+| `idle`        | Saved session resumable, no queue owner running                                                  |
+| `unreachable` | Queue owner process is alive but not answering (suspended, wedged, or its heartbeat has stopped) |
+| `dead`        | No live queue owner and the last agent exit was abnormal                                         |
+| `no-session`  | No saved record matches this scope                                                               |
 
 Plus, when applicable: session id, agent command, live queue-owner pid, uptime,
 last prompt timestamp, and last known exit code or signal for `dead`.
 
 `status` is local — it uses `kill(pid, 0)` semantics and does not touch the
-agent. Cached session PIDs are not reported unless a live queue-owner lease ties
+agent, and it never retires a queue owner it cannot reach: an owner that is
+merely suspended or busy is reported as `unreachable` and left running. Cached session PIDs are not reported unless a live queue-owner lease ties
 them to the session. It is safe to run from automation that polls for queue
 readiness.
 
@@ -102,7 +104,7 @@ All four commands (`cancel`, `set-mode`, `set`, `status`) try the queue owner fi
 
 - `cancel` short-circuits with `nothing to cancel`.
 - `set-mode` and `set` reconnect to the saved adapter session and apply the change directly.
-- `status` simply reports `idle` or `dead`.
+- `status` simply reports `idle`, `unreachable`, or `dead`.
 
 This means it is always safe to call these from scripts without worrying about whether a queue owner happens to be running.
 

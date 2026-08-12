@@ -12,9 +12,15 @@ import {
 } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 import { agentSessionIdPayload } from "./output/render.js";
-import { probeQueueOwnerHealth } from "./queue/ipc.js";
+import { inspectQueueOwnerHealth } from "./queue/ipc.js";
 
-type SessionStatusState = "running" | "idle" | "dead";
+/**
+ * `unreachable` is a live queue-owner process that is not answering its socket
+ * — suspended, wedged, or busy enough not to accept a connection. It is
+ * deliberately distinct from `dead`: the process is still there, still holds
+ * whatever it parked, and must not be treated as gone.
+ */
+type SessionStatusState = "running" | "idle" | "unreachable" | "dead";
 
 function formatUptime(startedAt: string | undefined): string | undefined {
   if (!startedAt) {
@@ -38,14 +44,16 @@ function formatUptime(startedAt: string | undefined): string | undefined {
 
 function resolveStatusState(
   record: { lastAgentExitCode?: number | null; lastAgentExitSignal?: NodeJS.Signals | null },
-  health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>,
+  health: Awaited<ReturnType<typeof inspectQueueOwnerHealth>>,
 ): SessionStatusState {
   if (health.healthy) {
     return "running";
   }
 
+  // The inspecting probe only reports a lease when the owner process is alive,
+  // so a lease here means a live owner that did not answer.
   if (health.hasLease) {
-    return "dead";
+    return "unreachable";
   }
 
   if (record.lastAgentExitSignal || (record.lastAgentExitCode ?? 0) !== 0) {
@@ -61,6 +69,8 @@ function statusSummary(state: SessionStatusState): string {
       return "queue owner healthy";
     case "idle":
       return "session idle; queue owner will start on next prompt";
+    case "unreachable":
+      return "queue owner is running but not answering";
     case "dead":
       return "queue owner unavailable";
   }
@@ -119,7 +129,8 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
  * Parked requests are counted from the durable store rather than from the
  * owner, because the count matters most when the owner is unreachable — that is
  * exactly when an operator needs to know something is still waiting. Nothing is
- * reconciled here: `status` reports, `requests` decides.
+ * reconciled here, and nothing is retired: `status` reports, `requests`
+ * decides, and neither touches the owner process.
  *
  * Consequence, deliberate: `status` never opens the queue socket, so it cannot
  * see a park whose durable write failed, while `acpx <agent> requests` asks the
@@ -138,7 +149,7 @@ async function printSessionStatus(
   record: SessionRecord,
   format: ResolvedAcpxConfig["format"],
 ): Promise<void> {
-  const health = await probeQueueOwnerHealth(record.acpxRecordId);
+  const health = await inspectQueueOwnerHealth(record.acpxRecordId);
   const statusState = resolveStatusState(record, health);
   const payload = createStatusPayload(
     record,
@@ -168,7 +179,7 @@ async function printSessionStatus(
 
 function createStatusPayload(
   record: SessionRecord,
-  health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>,
+  health: Awaited<ReturnType<typeof inspectQueueOwnerHealth>>,
   statusState: SessionStatusState,
   parkedRequests: number,
 ): StatusPayload {
@@ -203,7 +214,7 @@ function statusAcpxFields(record: SessionRecord): {
   };
 }
 
-function statusPid(health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>): number | null {
+function statusPid(health: Awaited<ReturnType<typeof inspectQueueOwnerHealth>>): number | null {
   if (health.pidAlive) {
     return health.pid ?? null;
   }

@@ -454,7 +454,7 @@ acpx [global_options] status -s <name>
 
 Shows local process status for the cwd-scoped session:
 
-- `running`, `idle`, `dead`, or `no-session`
+- `running`, `idle`, `unreachable`, `dead`, or `no-session`
 - session id, agent command, live queue-owner pid when available
 - uptime when running
 - last prompt timestamp
@@ -464,6 +464,13 @@ Shows local process status for the cwd-scoped session:
 `idle` means the persistent session is saved and resumable, but no queue owner is
 currently running. The next prompt starts a queue owner and reconnects the
 session.
+
+`unreachable` means the queue-owner process is alive but not answering: it is
+suspended, wedged, or its heartbeat has stopped advancing. It is deliberately
+distinct from `dead` — the process still holds whatever it parked — and `status`
+leaves it running. No acpx command that only reports (`status`, `requests`, the
+prompt banner) ever retires a queue owner; only commands that take the session
+over (`prompt`, `cancel`, `set-mode`, `set`, `sessions close`) do.
 
 Status checks are local and PID-based (`kill(pid, 0)` semantics). Cached session
 PIDs are not reported unless a live queue-owner lease ties them to the session.
