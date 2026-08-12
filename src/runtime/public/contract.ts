@@ -17,7 +17,19 @@ export type {
   AcpPermissionDecision,
   AcpPermissionRequest,
   AcpPermissionRequestContext,
+  PermissionEscalationAction,
+  PermissionEscalationEvent,
+  PermissionMode,
+  PermissionPolicy,
+  PermissionPolicyAction,
+  PermissionPolicyRuleKey,
   ReadonlyPermissionPolicy,
+} from "../../types.js";
+export {
+  PERMISSION_ESCALATION_ACTIONS,
+  PERMISSION_MODES,
+  PERMISSION_POLICY_ACTIONS,
+  PERMISSION_POLICY_RULE_KEYS,
 } from "../../types.js";
 
 export type AcpRuntimePromptMode = "prompt" | "steer";

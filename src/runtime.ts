@@ -72,9 +72,24 @@ export type {
   AcpSessionRecord,
   AcpSessionStore,
   AcpSessionUpdateTag,
+  PermissionEscalationAction,
+  PermissionEscalationEvent,
+  PermissionMode,
+  PermissionPolicy,
+  PermissionPolicyAction,
+  PermissionPolicyRuleKey,
+  ReadonlyPermissionPolicy,
   SessionAgentOptions,
   SystemPromptOption,
 } from "./runtime/public/contract.js";
+export {
+  PERMISSION_ESCALATION_ACTIONS,
+  PERMISSION_MODES,
+  PERMISSION_POLICY_ACTIONS,
+  PERMISSION_POLICY_RULE_KEYS,
+} from "./runtime/public/contract.js";
+export { matchPermissionPolicy } from "./permissions.js";
+export type { PermissionPolicyMatch } from "./permissions.js";
 
 export const ACPX_BACKEND_ID = "acpx";
 
