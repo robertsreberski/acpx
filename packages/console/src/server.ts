@@ -21,7 +21,7 @@ import {
   readJsonBody,
   requiredString,
 } from "./security.js";
-import { writeSseFrame } from "./sse.js";
+import { writeSseFrameOrDisconnect } from "./sse.js";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const SSE_REPLAY_LIMIT = 512;
@@ -516,10 +516,10 @@ export async function startAcpxConsoleServer(
   };
 
   const sendSse = (client: ServerResponse, item: BufferedEvent): boolean => {
-    if (writeSseFrame(client, item)) {
+    if (writeSseFrameOrDisconnect(client, item)) {
       return true;
     }
-    disconnectSlowClient(client);
+    clients.delete(client);
     return false;
   };
 

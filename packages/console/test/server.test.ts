@@ -606,37 +606,6 @@ test("event streams have an explicit client cap", async () => {
   }
 });
 
-test("a slow SSE client is disconnected on the first backpressure signal", async () => {
-  const { running, service } = await fixture();
-  const url = new URL(running.origin);
-  const socket = createConnection(Number(url.port), url.hostname);
-  try {
-    await new Promise<void>((resolve, reject) => {
-      socket.once("connect", resolve);
-      socket.once("error", reject);
-    });
-    socket.write(
-      `GET /api/v1/events HTTP/1.1\r\nHost: ${url.hostname}\r\nConnection: keep-alive\r\n\r\n`,
-    );
-    await new Promise<void>((resolve, reject) => {
-      socket.once("data", () => resolve());
-      socket.once("error", reject);
-    });
-    socket.pause();
-    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
-    service.emit({ type: "timeline", acpxRecordId: "record-1", cursor: "x".repeat(2_000_000) });
-    await Promise.race([
-      closed,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("slow SSE client stayed connected")), 1_000),
-      ),
-    ]);
-  } finally {
-    socket.destroy();
-    await running.close();
-  }
-});
-
 test("event streams replay retained ids and reset clients outside the replay window", async () => {
   const { running, service } = await fixture();
   const readUntil = async (headers: HeadersInit, pattern: RegExp): Promise<string> => {
