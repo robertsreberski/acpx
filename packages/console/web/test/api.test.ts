@@ -105,7 +105,8 @@ test("projects the core item timeline and explicit legacy gap", async () => {
         message: "Earlier history retained elsewhere.",
       });
       assert.deepEqual(page.events[0], {
-        id: "event:7",
+        id: "event:epoch-1:7",
+        epoch: "epoch-1",
         sequence: 7,
         occurredAt: "2026-08-12T10:00:00.000Z",
         direction: "client_to_agent",

@@ -447,6 +447,11 @@ export function Transcript() {
               Load earlier
             </button>
           )}
+          {store.timeline?.continuityIssue && (
+            <div className="history-gap is-error" role="alert">
+              {store.timeline.continuityIssue.message}
+            </div>
+          )}
           {(store.timeline?.coverage === "incomplete" ||
             store.timeline?.gap?.reason === "corrupt") && (
             <div className="history-gap is-error" role="alert">

@@ -3,6 +3,7 @@ import type { TranscriptEvent } from "./types";
 export interface WireTimelineEvent {
   readonly schema: "acpx.session_event.v1";
   readonly kind?: never;
+  readonly epoch: string;
   readonly seq: number;
   readonly captured_at: string;
   readonly direction: "inbound" | "outbound" | "internal";
@@ -71,9 +72,10 @@ const baseEvent = (
   event: WireTimelineEvent,
 ): Pick<
   TranscriptEvent,
-  "id" | "sequence" | "occurredAt" | "direction" | "turnId" | "requestId" | "payload"
+  "id" | "epoch" | "sequence" | "occurredAt" | "direction" | "turnId" | "requestId" | "payload"
 > => ({
-  id: `event:${event.seq}`,
+  id: `event:${event.epoch}:${event.seq}`,
+  epoch: event.epoch,
   sequence: event.seq,
   occurredAt: event.captured_at,
   direction:
@@ -115,7 +117,7 @@ const projectSessionUpdate = (
     const toolCallId = asString(update.toolCallId) ?? event.request_id ?? `tool:${event.seq}`;
     return {
       ...base,
-      id: `tool:${toolCallId}:${event.seq}`,
+      id: `tool:${event.epoch}:${toolCallId}:${event.seq}`,
       requestId: toolCallId,
       kind: "tool_call",
       role: "assistant",
@@ -224,6 +226,7 @@ export const projectTimelineEvent = (event: WireTimelineEvent): TranscriptEvent 
 const sameTextStream = (left: TranscriptEvent, right: TranscriptEvent): boolean =>
   left.kind === right.kind &&
   (left.kind === "message" || left.kind === "reasoning") &&
+  left.epoch === right.epoch &&
   left.role === right.role &&
   left.turnId === right.turnId;
 
@@ -254,7 +257,8 @@ export const coalesceTranscriptEvents = (
       continue;
     }
     if (event.kind === "tool_call" && event.requestId) {
-      const index = toolIndex.get(event.requestId);
+      const toolKey = JSON.stringify([event.epoch, event.requestId]);
+      const index = toolIndex.get(toolKey);
       if (index !== undefined) {
         const original = result[index];
         result[index] = {
@@ -272,7 +276,7 @@ export const coalesceTranscriptEvents = (
         };
         continue;
       }
-      toolIndex.set(event.requestId, result.length);
+      toolIndex.set(toolKey, result.length);
     }
     result.push(event);
   }

@@ -16,6 +16,7 @@ const wire = (
   extra: Partial<WireTimelineEvent> = {},
 ): WireTimelineEvent => ({
   schema: "acpx.session_event.v1",
+  epoch: "epoch-1",
   seq,
   captured_at: `2026-08-12T10:00:0${seq}.000Z`,
   direction: "inbound",
@@ -113,6 +114,30 @@ test("projects prompt blocks and coalesces assistant message and thought chunks"
       ["message", "assistant", "Done."],
       ["reasoning", "assistant", "Check tests"],
     ],
+  );
+});
+
+test("binds event identity and stream coalescing to the timeline epoch", () => {
+  const first = projectTimelineEvent(
+    wire(
+      1,
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "old" } }),
+      { epoch: "epoch-old" },
+    ),
+  );
+  const reset = projectTimelineEvent(
+    wire(
+      1,
+      update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "new" } }),
+      { epoch: "epoch-new" },
+    ),
+  );
+
+  assert.equal(first.id, "event:epoch-old:1");
+  assert.equal(reset.id, "event:epoch-new:1");
+  assert.deepEqual(
+    coalesceTranscriptEvents([first, reset]).map((item) => item.text),
+    ["old", "new"],
   );
 });
 

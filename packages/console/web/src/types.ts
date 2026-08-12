@@ -63,6 +63,8 @@ export type EventRole = "user" | "assistant" | "system";
 
 export interface TranscriptEvent {
   readonly id: string;
+  /** Durable ledger generation; sequence numbers restart when this changes. */
+  readonly epoch?: string;
   readonly sequence: number;
   /** Raw events folded into this projected item, retained for lossless page merging. */
   readonly sourceEvents?: readonly TranscriptEvent[];
@@ -83,12 +85,17 @@ export interface TranscriptEvent {
 
 export interface TimelinePage {
   readonly events: readonly TranscriptEvent[];
+  readonly epoch?: string;
   readonly previousCursor?: string;
   readonly coverage: "complete" | "legacy_retained" | "incomplete";
   readonly gap?: {
     readonly reason: "legacy_retained" | "corrupt";
     readonly message: string;
     readonly earliestAvailableAt?: string;
+  };
+  readonly continuityIssue?: {
+    readonly reason: "refresh_gap" | "epoch_changed";
+    readonly message: string;
   };
   readonly writeError?: string;
 }
