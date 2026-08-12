@@ -122,6 +122,23 @@ The `ctx` argument carries:
 
 `mode` and `policy` are a snapshot taken when the request arrived, and the same snapshot settles the request if the hook returns `undefined` — so a decision is never judged against settings the hook was not shown. A field is present exactly when acpx has a value for it.
 
+### Observing escalations
+
+A host that does not answer requests itself still needs to know when a policy handed one back. `onPermissionEscalation` fires for every `escalate` or `defer` match that reaches the non-interactive path:
+
+```ts
+const runtime = createAcpRuntime({
+  // ...
+  permissionPolicy: { defer: ["execute"] },
+  onPermissionEscalation: (event) => {
+    // event.action is "escalate" or "defer"; event.matchedRule names the rule.
+    reviewQueue.push(event);
+  },
+});
+```
+
+Without it these requests are invisible: an escalation is not a turn event, does not fail the turn, and carries no separate stat, so the turn completes normally with the tool call denied.
+
 ## Exit code 5
 
 If, by the end of a prompt, every permission request was denied or cancelled and none were approved, `acpx` exits with code `5` (`PERMISSION_DENIED`). This makes the "agent could not do anything because permissions were locked down" case detectable from a wrapping script.
