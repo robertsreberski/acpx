@@ -17,7 +17,7 @@ import type {
   AcpRuntimeTurn,
   AcpRuntimeTurnResult,
 } from "../src/runtime/public/contract.js";
-import type { PermissionPolicy } from "../src/types.js";
+import type { PermissionEscalationEvent, PermissionPolicy } from "../src/types.js";
 import {
   createRuntimeOptions,
   InMemorySessionStore,
@@ -27,6 +27,7 @@ import {
 type FakeClientHandlers = {
   onSessionUpdate?: (notification: Record<string, unknown>) => void;
   onClientOperation?: (operation: Record<string, unknown>) => void;
+  onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
 };
 
 type FakeClient = {
@@ -3541,4 +3542,87 @@ test("AcpRuntimeManager forwards permissionPolicy and the hook to every client i
     assert.deepEqual(options.permissionPolicy, policy);
     assert.equal(options.onPermissionRequest, hook);
   }
+});
+
+const ESCALATION_EVENT: PermissionEscalationEvent = {
+  type: "permission_escalation",
+  sessionId: "escalation-sid",
+  toolCallId: "escalation-tool",
+  toolTitle: "Bash: pnpm test",
+  toolName: "Bash",
+  toolKind: "execute",
+  action: "defer",
+  matchedRule: "execute",
+  message: "Permission deferral required for Bash: pnpm test",
+  timestamp: "2026-08-12T00:00:00.000Z",
+};
+
+test("AcpRuntimeManager delivers permission escalations raised during a turn", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "escalation-session",
+    acpSessionId: "escalation-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([record]);
+  const received: PermissionEscalationEvent[] = [];
+  const constructedWithHandler: boolean[] = [];
+  let handlers: FakeClientHandlers = {};
+
+  const manager = new AcpRuntimeManager(
+    {
+      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      permissionPolicy: { defer: ["execute"] },
+      onPermissionEscalation: (event) => received.push(event),
+    },
+    {
+      clientFactory: (options) => {
+        constructedWithHandler.push(typeof options.onPermissionEscalation === "function");
+        return {
+          initializeResult: { protocolVersion: 1, agentCapabilities: { prompt: true } },
+          start: async () => {},
+          close: async () => {},
+          createSession: async () => ({ sessionId: "unused" }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: (sessionId: string) => sessionId === "escalation-sid",
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          // A real AcpClient raises escalations from inside the prompt, after
+          // the manager has installed its turn handlers.
+          prompt: async () => {
+            handlers.onPermissionEscalation?.(ESCALATION_EVENT);
+            return { stopReason: "end_turn" };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async () => {},
+          clearEventHandlers: () => {
+            handlers = {};
+          },
+          setEventHandlers: (nextHandlers: FakeClientHandlers) => {
+            handlers = nextHandlers;
+          },
+        } as never;
+      },
+    },
+  );
+
+  const { result } = await collectTurn(
+    manager.startTurn({
+      handle: createHandle("escalation-session"),
+      text: "run the tests",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "escalation-req-1",
+    }),
+  );
+
+  assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+  // The option must survive the turn's setEventHandlers call, which replaces
+  // the handler set wholesale rather than merging into it.
+  assert.deepEqual(received, [ESCALATION_EVENT]);
+  assert.deepEqual(constructedWithHandler, [true]);
 });

@@ -5,6 +5,7 @@ import type {
   AcpPermissionRequestContext,
   McpServer,
   NonInteractivePermissionPolicy,
+  PermissionEscalationEvent,
   PermissionMode,
   PermissionPolicy,
   SessionRecord,
@@ -330,6 +331,12 @@ export type AcpRuntimeOptions = {
     req: AcpPermissionRequest,
     ctx: AcpPermissionRequestContext,
   ) => Promise<AcpPermissionDecision | undefined>;
+  /**
+   * Fires when a policy `escalate` or `defer` rule hands a request back instead
+   * of settling it. Without this the request is denied for the turn and the
+   * host sees nothing: escalations are not turn events and do not fail the turn.
+   */
+  onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
 };
 
 export type AcpFileSessionStoreOptions = {

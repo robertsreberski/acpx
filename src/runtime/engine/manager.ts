@@ -685,6 +685,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       permissionPolicy: this.options.permissionPolicy,
+      onPermissionEscalation: this.options.onPermissionEscalation,
       onPermissionRequest: this.options.onPermissionRequest,
       verbose: this.options.verbose,
       timeoutMs: this.options.timeoutMs,
@@ -736,6 +737,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       permissionPolicy: this.options.permissionPolicy,
+      onPermissionEscalation: this.options.onPermissionEscalation,
       onPermissionRequest: this.options.onPermissionRequest,
       verbose: this.options.verbose,
       sessionOptions: input.sessionOptions,
@@ -1005,6 +1007,7 @@ export class AcpRuntimeManager {
       permissionMode: this.options.permissionMode,
       nonInteractivePermissions: this.options.nonInteractivePermissions,
       permissionPolicy: this.options.permissionPolicy,
+      onPermissionEscalation: this.options.onPermissionEscalation,
       onPermissionRequest: this.options.onPermissionRequest,
       verbose: this.options.verbose,
       sessionOptions: sessionOptionsFromRecord(record),
@@ -1146,6 +1149,10 @@ export class AcpRuntimeManager {
           ...operation,
         });
       },
+      // setEventHandlers replaces the handler set rather than merging, so the
+      // constructor-seeded escalation handler has to be re-supplied here or it
+      // is dead for exactly the window in which escalations happen.
+      onPermissionEscalation: this.options.onPermissionEscalation,
     });
   }
 
@@ -1474,6 +1481,7 @@ export class AcpRuntimeManager {
         permissionMode: this.options.permissionMode,
         nonInteractivePermissions: this.options.nonInteractivePermissions,
         permissionPolicy: this.options.permissionPolicy,
+        onPermissionEscalation: this.options.onPermissionEscalation,
         onPermissionRequest: this.options.onPermissionRequest,
         verbose: this.options.verbose,
       });

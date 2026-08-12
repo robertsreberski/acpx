@@ -11,6 +11,7 @@ import type {
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
+  PermissionEscalationEvent,
   PermissionMode,
   PermissionPolicy,
   SessionRecord,
@@ -46,6 +47,7 @@ export type WithConnectedSessionOptions<T> = {
   permissionMode?: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
+  onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
     ctx: AcpPermissionRequestContext,
@@ -108,6 +110,7 @@ export async function withConnectedSession<T>(
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
       permissionPolicy: options.permissionPolicy,
+      onPermissionEscalation: options.onPermissionEscalation,
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
@@ -124,6 +127,7 @@ export async function withConnectedSession<T>(
       permissionMode: options.permissionMode ?? "approve-reads",
       nonInteractivePermissions: options.nonInteractivePermissions,
       permissionPolicy: options.permissionPolicy,
+      onPermissionEscalation: options.onPermissionEscalation,
       onPermissionRequest: options.onPermissionRequest,
       authCredentials: options.authCredentials,
       authPolicy: options.authPolicy,
