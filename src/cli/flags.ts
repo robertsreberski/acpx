@@ -375,7 +375,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--defer",
-      "Park permission requests matched by a defer policy rule instead of denying them",
+      "Hold defer-matched permission requests open with a durable record and observable transitions (they still resolve by expiry or cancel until the respond verb ships)",
     )
     .option(
       "--defer-max-age <seconds>",

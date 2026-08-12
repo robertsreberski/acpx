@@ -89,6 +89,13 @@ function pickRejectOption(options: PendingRequestOption[]): PendingRequestOption
 export class PendingRequestManager {
   private readonly options: PendingRequestManagerOptions;
   private readonly parked = new Map<string, ParkedRequest>();
+  /**
+   * Waiters whose durable write has not landed yet. listPending() deliberately
+   * ignores these so "a visible waiter implies a durable entry" still holds,
+   * but cancelAll() drains them too — otherwise a SIGTERM inside the write
+   * window leaves a promise nothing ever settles.
+   */
+  private readonly parking = new Map<string, ParkedRequest>();
   private readonly deferMaxAgeMs: number;
   private readonly ownerPid: number;
 
@@ -109,20 +116,34 @@ export class PendingRequestManager {
     ctx: { signal: AbortSignal },
   ): Promise<AcpPermissionDecision> {
     const entry = this.buildEntry(input);
-    await writePendingRequest(entry);
-    this.emit("created", entry);
-
-    if (ctx.signal.aborted) {
-      await this.settleEntry(entry, "cancelled", "cancel", undefined);
-      return { outcome: "cancel" };
-    }
-
     return await new Promise<AcpPermissionDecision>((resolve) => {
       const parked: ParkedRequest = { entry, settle: resolve };
-      this.parked.set(entry.requestId, parked);
-      this.attachAbort(parked, ctx.signal);
-      this.attachExpiry(parked);
+      this.parking.set(entry.requestId, parked);
+      void this.completePark(parked, ctx.signal);
     });
+  }
+
+  private async completePark(parked: ParkedRequest, signal: AbortSignal): Promise<void> {
+    const { entry } = parked;
+    await writePendingRequest(entry).catch(() => {
+      // Recorded below as a settled request either way; a disk failure must not
+      // leave the agent blocked forever.
+    });
+    if (!this.parking.delete(entry.requestId)) {
+      // cancelAll took it while the write was in flight; it already settled.
+      return;
+    }
+    this.emit("created", entry);
+
+    if (signal.aborted) {
+      await this.settleEntry(entry, "cancelled", "cancel", undefined);
+      parked.settle({ outcome: "cancel" });
+      return;
+    }
+
+    this.parked.set(entry.requestId, parked);
+    this.attachAbort(parked, signal);
+    this.attachExpiry(parked);
   }
 
   /** Answer a parked request with one of the options the agent offered. */
@@ -162,8 +183,9 @@ export class PendingRequestManager {
    * inside the shutdown grace instead of being killed.
    */
   async cancelAll(reason: "shutdown" | "cancel"): Promise<void> {
-    const parked = [...this.parked.values()];
+    const parked = [...this.parked.values(), ...this.parking.values()];
     for (const entry of parked) {
+      this.parking.delete(entry.entry.requestId);
       this.release(entry);
     }
     for (const entry of parked) {
@@ -190,7 +212,9 @@ export class PendingRequestManager {
       schema: PENDING_REQUEST_SCHEMA,
       requestId: this.options.createRequestId?.() ?? randomUUID(),
       sessionId: this.options.sessionId,
-      acpSessionId: this.options.acpSessionId,
+      // The request's own sessionId is authoritative: the owner's boot-time
+      // record goes stale the moment a reconnect reassigns acpSessionId.
+      acpSessionId: input.request.sessionId || this.options.acpSessionId,
       agentCommand: this.options.agentCommand,
       cwd: this.options.cwd,
       kind: "permission",

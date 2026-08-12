@@ -335,3 +335,34 @@ test("a throwing onEvent consumer cannot strand the parked turn", async () => {
     );
   });
 });
+
+test("park records the ACP session id from the request, not the manager default", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager({ acpSessionId: "stale-boot-session" });
+    const controller = new AbortController();
+    const decision = park(
+      manager,
+      controller,
+      makeRequest({ sessionId: "acp-session-after-reconnect" }),
+    );
+    const [pending] = await waitForPending(manager, 1);
+    assert.equal(pending?.acpSessionId, "acp-session-after-reconnect");
+
+    controller.abort();
+    await decision;
+  });
+});
+
+test("cancelAll settles a park whose durable write is still in flight", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    // No await: cancelAll runs while park's write is still landing, which is
+    // exactly the SIGTERM window that previously stranded the promise.
+    const decision = park(manager, controller);
+    await manager.cancelAll("shutdown");
+
+    assert.deepEqual(await decision, { outcome: "cancel" });
+    assert.deepEqual(await manager.listPending(), []);
+  });
+});

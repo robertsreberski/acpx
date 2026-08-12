@@ -403,6 +403,8 @@ export const PENDING_REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 export type PendingRequestSweepResult = {
   orphaned: PendingRequest[];
   pruned: string[];
+  /** Files that could not be parsed and were removed. */
+  discarded: string[];
 };
 
 /**
@@ -426,7 +428,15 @@ export async function sweepPendingRequests(params: {
   const retentionMs = params.retentionMs ?? PENDING_REQUEST_RETENTION_MS;
   const cutoff = new Date(now.getTime() - retentionMs).toISOString();
 
-  const result: PendingRequestSweepResult = { orphaned: [], pruned: [] };
+  const result: PendingRequestSweepResult = { orphaned: [], pruned: [], discarded: [] };
+  // Unparseable files are invisible to listPendingRequests, so nothing else
+  // would ever clear them. They cannot be answered, so they are dropped.
+  for (const name of await listUnparseablePendingRequestFiles(params.sessionId, homeDir)) {
+    await fs
+      .rm(path.join(pendingRequestsSessionDir(params.sessionId, homeDir), name), { force: true })
+      .catch(() => undefined);
+    result.discarded.push(name);
+  }
   for (const entry of await listPendingRequests(params.sessionId, homeDir)) {
     await sweepPendingRequestEntry(entry, {
       ownerGeneration: params.ownerGeneration,
@@ -473,6 +483,35 @@ async function sweepPendingRequestEntry(
       .catch(() => undefined);
     params.result.pruned.push(entry.requestId);
   }
+}
+
+async function listUnparseablePendingRequestFiles(
+  sessionId: string,
+  homeDir: string,
+): Promise<string[]> {
+  const dir = pendingRequestsSessionDir(sessionId, homeDir);
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+
+  const unparseable: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) {
+      continue;
+    }
+    try {
+      const payload = await fs.readFile(path.join(dir, name), "utf8");
+      if (!parsePendingRequest(JSON.parse(payload))) {
+        unparseable.push(name);
+      }
+    } catch {
+      unparseable.push(name);
+    }
+  }
+  return unparseable;
 }
 
 export async function deletePendingRequestsForSession(

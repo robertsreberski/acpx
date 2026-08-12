@@ -249,3 +249,33 @@ test("sweep prunes terminal entries past the retention window and keeps fresh on
     assert.equal((await readPendingRequest("session-record-1", "recent"))?.state, "expired");
   });
 });
+
+test("sweep discards entries that can no longer be parsed", async () => {
+  await withTempHome(async () => {
+    await writePendingRequest(makeEntry({ requestId: "good" }));
+    const dir = pendingRequestsSessionDir("session-record-1");
+    await fs.writeFile(path.join(dir, "corrupt.json"), "{not json\n", "utf8");
+    await fs.writeFile(path.join(dir, "wrong-schema.json"), '{"schema":"nope"}\n', "utf8");
+
+    const result = await sweepPendingRequests({
+      sessionId: "session-record-1",
+      ownerGeneration: 99,
+    });
+
+    assert.deepEqual(result.discarded.toSorted(), ["corrupt.json", "wrong-schema.json"]);
+    assert.deepEqual(await fs.readdir(dir), ["good.json"]);
+  });
+});
+
+test("pending entries record the ACP session id the request arrived on", async () => {
+  await withTempHome(async () => {
+    // A reconnect reassigns record.acpSessionId, so a boot-time snapshot goes
+    // stale; the request itself is authoritative.
+    const entry = makeEntry({ acpSessionId: "acp-session-after-reconnect" });
+    await writePendingRequest(entry);
+    assert.equal(
+      (await readPendingRequest(entry.sessionId, entry.requestId))?.acpSessionId,
+      "acp-session-after-reconnect",
+    );
+  });
+});

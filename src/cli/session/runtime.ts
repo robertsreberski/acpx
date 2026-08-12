@@ -584,7 +584,13 @@ function registerPendingRequestSink(
   pendingMessages: AcpJsonRpcMessage[],
 ): void {
   options.onPendingRequestSink?.((event) => {
-    const notification = acpxExtensionNotification("_acpx/pending_request", event);
+    // rawInput can be large and is repeated on every transition; the durable
+    // store already holds it verbatim, so the event log carries only identity.
+    const { rawInput: _rawInput, ...toolCall } = event.request.toolCall;
+    const notification = acpxExtensionNotification("_acpx/pending_request", {
+      ...event,
+      request: { ...event.request, toolCall },
+    });
     pendingMessages.push(notification);
     // Attached --format json clients see park/answer transitions live.
     output.onAcpMessage(notification);

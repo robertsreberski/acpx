@@ -73,6 +73,10 @@ export type QueueOwnerRecord = {
   mcpConfigFingerprint?: string;
   queueProtocol?: number;
   acpxVersion?: string;
+  /** Owner was started with --defer and can park deferred requests. */
+  parking?: boolean;
+  /** The owner's effective --defer-max-age, in ms. Owner-level, like parking. */
+  parkingMaxAgeMs?: number;
 };
 
 export type QueueOwnerLease = {
@@ -83,6 +87,8 @@ export type QueueOwnerLease = {
   ownerGeneration: number;
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
+  parking?: boolean;
+  parkingMaxAgeMs?: number;
 };
 
 /** Protocol version an owner speaks, defaulting to the pre-field behavior. */
@@ -127,7 +133,12 @@ function parseQueueOwnerRecordMetadata(
   record: Record<string, unknown>,
 ): Pick<
   QueueOwnerRecord,
-  "mcpConfigPath" | "mcpConfigFingerprint" | "queueProtocol" | "acpxVersion"
+  | "mcpConfigPath"
+  | "mcpConfigFingerprint"
+  | "queueProtocol"
+  | "acpxVersion"
+  | "parking"
+  | "parkingMaxAgeMs"
 > {
   return {
     ...(typeof record.mcpConfigPath === "string" ? { mcpConfigPath: record.mcpConfigPath } : {}),
@@ -136,6 +147,10 @@ function parseQueueOwnerRecordMetadata(
       : {}),
     ...(isPositiveInteger(record.queueProtocol) ? { queueProtocol: record.queueProtocol } : {}),
     ...(typeof record.acpxVersion === "string" ? { acpxVersion: record.acpxVersion } : {}),
+    ...(record.parking === true ? { parking: true } : {}),
+    ...(typeof record.parkingMaxAgeMs === "number" && Number.isFinite(record.parkingMaxAgeMs)
+      ? { parkingMaxAgeMs: record.parkingMaxAgeMs }
+      : {}),
   };
 }
 
@@ -349,11 +364,14 @@ export async function tryAcquireQueueOwnerLease(
     | {
         path?: string;
         fingerprint?: string;
+        parking?: boolean;
+        parkingMaxAgeMs?: number;
       }
     | (() => string),
   nowIsoFactory: () => string = nowIso,
 ): Promise<QueueOwnerLease | undefined> {
   const { mcpConfigPath, clock } = resolveLeaseArguments(mcpConfigOrNowIsoFactory, nowIsoFactory);
+  const { parking, parkingMaxAgeMs } = readParkingMetadata(mcpConfigOrNowIsoFactory);
   const mcpConfigFingerprint = readMcpConfigFingerprint(mcpConfigOrNowIsoFactory);
   const mcpConfigMetadata = createMcpConfigMetadata(mcpConfigPath, mcpConfigFingerprint);
   await ensureQueueDir();
@@ -372,6 +390,8 @@ export async function tryAcquireQueueOwnerLease(
       queueDepth: 0,
       queueProtocol: QUEUE_PROTOCOL_VERSION,
       acpxVersion: getAcpxVersion(),
+      ...(parking ? { parking: true } : {}),
+      ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
     },
     null,
@@ -392,11 +412,27 @@ export async function tryAcquireQueueOwnerLease(
       socketPath,
       createdAt,
       ownerGeneration,
+      ...(parking ? { parking: true } : {}),
+      ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
     };
   } catch (error) {
     return await handleLeaseCollision(sessionId, error);
   }
+}
+
+function readParkingMetadata(value: unknown): {
+  parking: boolean;
+  parkingMaxAgeMs?: number;
+} {
+  if (!value || typeof value !== "object") {
+    return { parking: false };
+  }
+  const record = value as { parking?: boolean; parkingMaxAgeMs?: number };
+  return {
+    parking: record.parking === true,
+    ...(record.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: record.parkingMaxAgeMs }),
+  };
 }
 
 function readMcpConfigFingerprint(
@@ -482,6 +518,8 @@ export async function refreshQueueOwnerLease(
       queueDepth: Math.max(0, Math.round(options.queueDepth)),
       queueProtocol: QUEUE_PROTOCOL_VERSION,
       acpxVersion: getAcpxVersion(),
+      ...(lease.parking ? { parking: true } : {}),
+      ...(lease.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: lease.parkingMaxAgeMs }),
       ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
       ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
     },

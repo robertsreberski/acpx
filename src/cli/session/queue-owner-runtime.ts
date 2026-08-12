@@ -72,6 +72,8 @@ async function submitToRunningOwner(
     permissionMode: options.permissionMode,
     nonInteractivePermissions: options.nonInteractivePermissions,
     permissionPolicy: options.permissionPolicy,
+    ...(options.defer ? { defer: true } : {}),
+    ...(options.deferMaxAgeMs === undefined ? {} : { deferMaxAgeMs: options.deferMaxAgeMs }),
     outputFormatter: options.outputFormatter,
     errorEmissionPolicy: options.errorEmissionPolicy,
     timeoutMs: options.timeoutMs,
@@ -180,13 +182,18 @@ function createParkingBridge(params: {
     beginTask: (taskRequestId) => {
       currentTask = { taskRequestId };
     },
+    // Deliberately does NOT clear the slot. withTimeout races client.prompt but
+    // cannot cancel it, so a permission request can still arrive after the task
+    // "finished". Keeping the last context means such a straggler is attributed
+    // to the task that actually provoked it instead of "unknown" or, worse, the
+    // next task. It is replaced on the next beginTask, and turns are serialized.
     setTaskSink: (sink) => {
       if (currentTask) {
         currentTask.sink = sink;
       }
     },
     endTask: () => {
-      currentTask = undefined;
+      // no-op; see beginTask.
     },
   };
 }
@@ -361,9 +368,14 @@ function createQueueOwnerShutdownController(params: {
     });
 
     if (!(await settlesWithin(turn, QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS))) {
-      // A bridge that ignores session/cancel must still be terminated before
-      // the external queue-owner SIGKILL deadline. Closing it forces the active
-      // turn to unwind; the lease remains held until that unwind completes.
+      // NB this waits on the whole task promise (prompt + result send + event
+      // log close + perf checkpoint), not just the answered prompt. Measured:
+      // ~25 ms idle, ~1.0 s with an active turn, ~1.8 s with a parked one —
+      // so the grace is routinely exceeded and the close below is the normal
+      // path, not the exception. cancelAll settles parks at ~+2 ms, so parking
+      // is not what makes this slow; task teardown is. Left as is deliberately:
+      // the close is what bounds us against the external SIGKILL deadline, and
+      // tightening the wait to prompt-completion would let teardown race it.
       await params.sharedClient.close().catch(() => {
         // best effort while forcing active-turn cancellation
       });
@@ -447,11 +459,25 @@ function startQueueOwnerHeartbeat(params: {
   }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
 }
 
-export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
-  const lease = await tryAcquireQueueOwnerLease(options.sessionId, {
+function queueOwnerLeaseMetadata(options: QueueOwnerRuntimeOptions): {
+  path?: string;
+  fingerprint?: string;
+  parking: boolean;
+  parkingMaxAgeMs?: number;
+} {
+  return {
     path: options.mcpConfigPath,
     fingerprint: options.mcpConfigFingerprint,
-  });
+    parking: options.defer === true,
+    ...(options.deferMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: options.deferMaxAgeMs }),
+  };
+}
+
+export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
+  const lease = await tryAcquireQueueOwnerLease(
+    options.sessionId,
+    queueOwnerLeaseMetadata(options),
+  );
   if (!lease) {
     return;
   }

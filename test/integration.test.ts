@@ -5792,3 +5792,48 @@ test("integration: without --defer a defer policy still degrades to deny plus ev
     }
   });
 });
+
+test("integration: a warm non-parking owner refuses a --defer submit", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "new"], homeDir);
+      // Warm an owner WITHOUT --defer; it cannot park anything.
+      const warm = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "--ttl", "30", "prompt", "hello"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(warm.code, 0, warm.stderr);
+
+      const deferred = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--defer",
+          "--defer-max-age",
+          "1",
+          "--policy",
+          '{"defaultAction":"defer"}',
+          "--format",
+          "json",
+          "--ttl",
+          "30",
+          "prompt",
+          "permission execute Bash",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+
+      // Must be refused, not silently denied: a plain denial is
+      // indistinguishable from parked-then-expired.
+      assert.notEqual(deferred.code, 5, deferred.stdout);
+      assert.match(`${deferred.stdout}${deferred.stderr}`, /cannot park deferred requests/);
+      assert.deepEqual(await readStoredPendingRequests(homeDir), []);
+
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});

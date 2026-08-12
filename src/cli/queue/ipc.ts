@@ -316,6 +316,10 @@ export type SubmitToQueueOwnerOptions = {
   resumePolicy?: SessionResumePolicy;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
+  /** This invocation was started with --defer and expects parking support. */
+  defer?: boolean;
+  /** This invocation's --defer-max-age, if it named one explicitly. */
+  deferMaxAgeMs?: number;
   outputFormatter: OutputFormatter;
   errorEmissionPolicy?: OutputErrorEmissionPolicy;
   timeoutMs?: number;
@@ -731,6 +735,56 @@ function assertQueueOwnerUnderstandsPolicy(
   );
 }
 
+/**
+ * --defer is owner-level: it is fixed when the owner process starts, so a warm
+ * owner started without it cannot park anything. Submitting anyway produced a
+ * plain denial that is indistinguishable from parked-then-expired, which is the
+ * worst possible outcome — the caller believes a human will see the request.
+ */
+function assertQueueOwnerSupportsParking(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  if (!options.defer || owner.parking === true) {
+    return;
+  }
+  throw new QueueConnectionError(
+    "Session queue owner was started without --defer and cannot park deferred requests; " +
+      "close the session (or let its TTL lapse) so a defer-capable owner starts",
+    {
+      detailCode: "QUEUE_OWNER_PARKING_UNSUPPORTED",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
+/**
+ * --defer-max-age is owner-level for the same reason --defer is. Silently using
+ * the warm owner's value instead of the one just asked for is how a request
+ * meant to expire in a second parks for a day, hanging the caller.
+ */
+function assertQueueOwnerParkingMaxAgeMatches(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  if (!options.defer || options.deferMaxAgeMs === undefined) {
+    return;
+  }
+  if (owner.parkingMaxAgeMs === options.deferMaxAgeMs) {
+    return;
+  }
+  throw new QueueConnectionError(
+    `Session queue owner parks for ${owner.parkingMaxAgeMs ?? "its default"} ms and cannot honour ` +
+      `--defer-max-age ${options.deferMaxAgeMs}; close the session (or let its TTL lapse) so a new owner starts`,
+    {
+      detailCode: "QUEUE_OWNER_PARKING_UNSUPPORTED",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
 function assertQueueOwnerMcpConfigMatches(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
@@ -759,6 +813,8 @@ export async function trySubmitToRunningOwner(
     return undefined;
   }
   assertQueueOwnerUnderstandsPolicy(owner, options);
+  assertQueueOwnerSupportsParking(owner, options);
+  assertQueueOwnerParkingMaxAgeMatches(owner, options);
   assertQueueOwnerMcpConfigMatches(owner, options);
 
   let submitted: SessionSendOutcome | undefined;
