@@ -17,6 +17,9 @@ const MAP_OBJECT_PATHS = new Set(["request_token_usage", "messages.Agent.tool_re
 
 const OPAQUE_VALUE_PATHS = new Set([
   "agent_capabilities",
+  // Agent-authored tool input on a parked permission request. Its keys belong
+  // to the agent's tool schema, not to acpx's persistence contract.
+  "tool_call.raw_input",
   "messages.Agent.content.ToolUse.input",
   "acpx.desired_config_options",
   "acpx.config_options",
