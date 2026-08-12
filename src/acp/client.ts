@@ -304,6 +304,25 @@ function cancelledPermissionResponse(): RequestPermissionResponse {
   };
 }
 
+type AcpClientEventHandlerKey =
+  | "onAcpMessage"
+  | "onAcpOutputMessage"
+  | "onSessionUpdate"
+  | "onClientOperation"
+  | "onPermissionEscalation";
+
+/** Handler set held by the client; any subset may be present. */
+type AcpClientEventHandlerState = Pick<AcpClientOptions, AcpClientEventHandlerKey>;
+
+/**
+ * Handler set accepted by setEventHandlers. Keys are required so omitting one
+ * is a compile error rather than a silently dropped handler; the values stay
+ * nullable so a caller can clear a handler explicitly.
+ */
+type AcpClientEventHandlers = {
+  [K in AcpClientEventHandlerKey]: AcpClientOptions[K] | undefined;
+};
+
 /** Permission settings pinned for the lifetime of one permission request. */
 type PermissionSettingsSnapshot = {
   mode: PermissionMode;
@@ -443,14 +462,7 @@ export class AcpClient {
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
-  private eventHandlers: Pick<
-    AcpClientOptions,
-    | "onAcpMessage"
-    | "onAcpOutputMessage"
-    | "onSessionUpdate"
-    | "onClientOperation"
-    | "onPermissionEscalation"
-  >;
+  private eventHandlers: AcpClientEventHandlerState;
   private readonly permissionStats: PermissionStats = {
     requested: 0,
     approved: 0,
@@ -550,16 +562,12 @@ export class AcpClient {
     return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.list);
   }
 
-  setEventHandlers(
-    handlers: Pick<
-      AcpClientOptions,
-      | "onAcpMessage"
-      | "onAcpOutputMessage"
-      | "onSessionUpdate"
-      | "onClientOperation"
-      | "onPermissionEscalation"
-    >,
-  ): void {
+  /**
+   * Replaces the whole handler set. Every key must be supplied — pass
+   * `undefined` to clear one — because an omitted key silently drops a handler
+   * the constructor seeded, which is how runtime escalations went missing.
+   */
+  setEventHandlers(handlers: AcpClientEventHandlers): void {
     this.eventHandlers = { ...handlers };
   }
 

@@ -1130,6 +1130,8 @@ export class AcpRuntimeManager {
 
   private installRuntimeTurnEventHandlers(task: RuntimeTurnTask, turn: RunningRuntimeTurn): void {
     turn.client.setEventHandlers({
+      onAcpMessage: undefined,
+      onAcpOutputMessage: undefined,
       onSessionUpdate: (notification) => {
         turn.acpxState = recordSessionUpdate(turn.conversation, turn.acpxState, notification);
         trimConversationForRuntime(turn.conversation);
