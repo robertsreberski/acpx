@@ -30,7 +30,7 @@
     "typecheck:web": "tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@assistant-ui/react": "0.15.13",
+    "@assistant-ui/react": "0.15.14",
     "@assistant-ui/react-markdown": "0.14.10",
     "acpx": "workspace:0.13.0-fork.2",
     "react": "^19.2.8",
