@@ -6139,6 +6139,52 @@ test("integration: respond refuses exactly-one-answer violations before touching
   });
 });
 
+test("integration: status reports parked requests, and a dead owner orphans them", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
+    const parkedStatus = await runCli([...deferArgs, "--format", "json", "status"], homeDir);
+    assert.equal(parkedStatus.code, 0, parkedStatus.stderr);
+    assert.equal(
+      (JSON.parse(parkedStatus.stdout.trim()) as { parkedRequests?: number }).parkedRequests,
+      1,
+      parkedStatus.stdout,
+    );
+
+    const { pid } = await readQueueOwnerLock(homeDir, sessionId);
+    process.kill(pid, "SIGKILL");
+    assert.equal(await waitForPidExit(pid, 5_000), true);
+
+    // The count is read from the durable store, so it survives the owner that
+    // wrote it — which is exactly when an operator needs to see it.
+    const deadStatus = await runCli([...deferArgs, "--format", "json", "status"], homeDir);
+    assert.equal(
+      (JSON.parse(deadStatus.stdout.trim()) as { parkedRequests?: number }).parkedRequests,
+      1,
+      deadStatus.stdout,
+    );
+    const quietStatus = await runCli([...deferArgs, "--format", "quiet", "status"], homeDir);
+    assert.match(quietStatus.stdout, /parked:1/);
+
+    const requestId = (await readStoredPendingRequests(homeDir))[0]?.request_id ?? "";
+    const answered = await runCli(
+      [...deferArgs, "respond", requestId, "--option", "allow"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    // Nothing can answer a request whose waiter died with its owner.
+    assert.equal(answered.code, 4, `${answered.stdout}${answered.stderr}`);
+    assert.match(`${answered.stdout}${answered.stderr}`, /can no longer be answered/);
+
+    const listed = await listRequestsJson(homeDir, deferArgs);
+    assert.equal(listed[0]?.state, "orphaned", JSON.stringify(listed));
+    const afterOrphan = await runCli([...deferArgs, "--format", "json", "status"], homeDir);
+    assert.equal(
+      (JSON.parse(afterOrphan.stdout.trim()) as { parkedRequests?: number }).parkedRequests,
+      0,
+      afterOrphan.stdout,
+    );
+  });
+});
+
 test("integration: requests --all lists parked requests without a session in cwd", async () => {
   await withParkedRequest(async ({ homeDir, deferArgs }) => {
     const otherCwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-elsewhere-"));

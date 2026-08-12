@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { listPendingRequests } from "../session/pending-requests.js";
 import { findSession } from "../session/persistence.js";
 import type { SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -114,13 +115,29 @@ function printMissingStatus(format: ResolvedAcpxConfig["format"], agentCommand: 
   process.stdout.write("lastPromptTime: -\n");
 }
 
+/**
+ * Parked requests are counted from the durable store rather than from the
+ * owner, because the count matters most when the owner is unreachable — that is
+ * exactly when an operator needs to know something is still waiting. Nothing is
+ * reconciled here: `status` reports, `requests` decides.
+ */
+async function countParkedRequests(sessionId: string): Promise<number> {
+  const entries = await listPendingRequests(sessionId).catch(() => []);
+  return entries.filter((entry) => entry.state === "pending").length;
+}
+
 async function printSessionStatus(
   record: SessionRecord,
   format: ResolvedAcpxConfig["format"],
 ): Promise<void> {
   const health = await probeQueueOwnerHealth(record.acpxRecordId);
   const statusState = resolveStatusState(record, health);
-  const payload = createStatusPayload(record, health, statusState);
+  const payload = createStatusPayload(
+    record,
+    health,
+    statusState,
+    await countParkedRequests(record.acpxRecordId),
+  );
   const running = isRunningStatus(statusState);
   const dead = isDeadStatus(statusState);
 
@@ -130,6 +147,11 @@ async function printSessionStatus(
 
   if (format === "quiet") {
     process.stdout.write(`${payload.status}\n`);
+    // Only when there is something to say: an unconditional second line would
+    // change what every existing quiet-mode caller reads back.
+    if (payload.parkedRequests > 0) {
+      process.stdout.write(`parked:${payload.parkedRequests}\n`);
+    }
     return;
   }
 
@@ -140,6 +162,7 @@ function createStatusPayload(
   record: SessionRecord,
   health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>,
   statusState: SessionStatusState,
+  parkedRequests: number,
 ): StatusPayload {
   const running = isRunningStatus(statusState);
   const acpx = statusAcpxFields(record);
@@ -155,6 +178,7 @@ function createStatusPayload(
     lastPromptTime: optionalStatusString(record.lastPromptAt),
     exitCode: running ? null : optionalStatusNumber(record.lastAgentExitCode),
     signal: running ? null : optionalStatusSignal(record.lastAgentExitSignal),
+    parkedRequests,
     ...agentSessionIdPayload(record.agentSessionId),
   };
 }
@@ -211,6 +235,8 @@ type StatusPayload = {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   agentSessionId?: string;
+  /** Requests this session has parked and not yet settled. */
+  parkedRequests: number;
 };
 
 function emitStatusJson(
@@ -245,6 +271,7 @@ function statusJsonPayload(
   assignDefinedJsonField(result, "availableModels", payload.availableModels);
   assignDefinedJsonField(result, "uptime", payload.uptime);
   assignDefinedJsonField(result, "lastPromptTime", payload.lastPromptTime);
+  result.parkedRequests = payload.parkedRequests;
   if (dead) {
     assignDefinedJsonField(result, "exitCode", payload.exitCode);
     assignDefinedJsonField(result, "signal", payload.signal);
@@ -274,6 +301,7 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`mode: ${payload.mode ?? "-"}\n`);
   process.stdout.write(`uptime: ${payload.uptime ?? "-"}\n`);
   process.stdout.write(`lastPromptTime: ${payload.lastPromptTime ?? "-"}\n`);
+  process.stdout.write(`parked: ${payload.parkedRequests}\n`);
   if (dead) {
     printDeadStatusDetails(payload);
   }
