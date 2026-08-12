@@ -193,3 +193,22 @@ state is a disposable projection that can be rebuilt after a console restart.
 For applications that need the same backend contract without this UI, use the
 public [`acpx/sessions`](https://github.com/openclaw/acpx/blob/main/docs/2026-08-12-acpx-console-architecture.md#public-acpxsessions-service)
 service.
+
+## Product verification
+
+Two standalone smoke lanes exercise the shipped boundaries without a global
+install:
+
+```bash
+pnpm run smoke:console:package
+pnpm run smoke:console:product
+```
+
+The package smoke packs and installs both packages into an isolated prefix.
+The product smoke builds the workspace artifacts, starts the detached console
+against a temporary home, configuration, workspace, and state directory, then
+drives the HTTP and SSE contracts through session creation, live transcript
+updates, queued turns, cancellation, permission and elicitation answers, queue
+owner recovery, console restart, persisted history, and session close. Cleanup
+is bounded to the console, queue owner, and mock-agent processes created by the
+smoke.
