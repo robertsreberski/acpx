@@ -54,8 +54,8 @@ export function SessionSidebar({
 }) {
   const { bootstrap, connectionState, loading, selectedSessionId, selectSession } =
     useSessionStore();
-  const sidebarRef = useRef<HTMLElement>(null);
-  useDismissibleLayer(open, onClose, sidebarRef);
+  const sidebarLayerRef = useRef<HTMLDivElement>(null);
+  useDismissibleLayer(open, onClose, sidebarLayerRef);
   const [query, setQuery] = useState("");
   const groups = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -75,10 +75,8 @@ export function SessionSidebar({
   }, [bootstrap.sessions, query]);
 
   return (
-    <>
-      {open && <button className="sidebar-scrim" aria-label="Close sessions" onClick={onClose} />}
+    <div ref={sidebarLayerRef} className="sidebar-layer">
       <aside
-        ref={sidebarRef}
         className={`session-sidebar${open ? " is-open" : ""}`}
         role={open ? "dialog" : undefined}
         aria-modal={open ? "true" : undefined}
@@ -183,6 +181,7 @@ export function SessionSidebar({
               : `${bootstrap.sessions.length} local session${bootstrap.sessions.length === 1 ? "" : "s"}`}
         </footer>
       </aside>
-    </>
+      {open && <button className="sidebar-scrim" aria-label="Close sessions" onClick={onClose} />}
+    </div>
   );
 }

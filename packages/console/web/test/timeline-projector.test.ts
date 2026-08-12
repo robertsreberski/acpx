@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   coalesceTranscriptEvents,
   firstInteractionEventIds,
-  normalizeHistoricalStreamingEvent,
+  normalizeHistoricalRunningEvent,
   projectTimelineEvent,
   timelineActivityToolName,
   timelineEventIsRunning,
@@ -42,8 +42,14 @@ test("preserves tool identity and only streams activity from the active turn", (
   const chunk = projectTimelineEvent(
     wire(2, update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } })),
   );
-  assert.equal(normalizeHistoricalStreamingEvent(chunk, "turn-1").status, "streaming");
-  assert.equal(normalizeHistoricalStreamingEvent(chunk, "turn-2").status, "complete");
+  assert.equal(normalizeHistoricalRunningEvent(chunk, "turn-1").status, "streaming");
+  assert.equal(normalizeHistoricalRunningEvent(chunk, "turn-2").status, "complete");
+  assert.equal(normalizeHistoricalRunningEvent(tool, "turn-1").status, "in_progress");
+  assert.equal(normalizeHistoricalRunningEvent(tool, "turn-2").status, "complete");
+  assert.equal(
+    normalizeHistoricalRunningEvent({ ...tool, status: "pending" }, undefined).status,
+    "complete",
+  );
 });
 
 const update = (value: unknown): unknown => ({

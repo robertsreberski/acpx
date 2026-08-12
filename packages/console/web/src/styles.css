@@ -1075,6 +1075,10 @@ fieldset.elicitation-field {
   display: none;
 }
 
+.sidebar-layer {
+  display: contents;
+}
+
 @keyframes pulse {
   50% {
     opacity: 0.35;

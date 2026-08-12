@@ -125,7 +125,7 @@ const unsupportedFieldReason = (property: ElicitationProperty): string | undefin
   if (property.type === "array" && choicesFor(property).length === 0) {
     return "This multi-select has no supported ACP choices.";
   }
-  if (property.format !== undefined && !SUPPORTED_ELICITATION_FORMATS.has(property.format)) {
+  if (property.format != null && !SUPPORTED_ELICITATION_FORMATS.has(property.format)) {
     return `Unsupported field format “${property.format}”.`;
   }
   return undefined;
@@ -230,11 +230,11 @@ function ElicitationField({
           required={required}
           type={inputTypeFor(property)}
           step={property.type === "integer" ? "1" : undefined}
-          min={property.minimum}
-          max={property.maximum}
-          minLength={property.minLength}
-          maxLength={property.maxLength}
-          pattern={property.pattern}
+          min={property.minimum ?? undefined}
+          max={property.maximum ?? undefined}
+          minLength={property.minLength ?? undefined}
+          maxLength={property.maxLength ?? undefined}
+          pattern={property.pattern ?? undefined}
           defaultValue={
             typeof property.default === "string" || typeof property.default === "number"
               ? property.default

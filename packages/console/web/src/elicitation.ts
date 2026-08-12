@@ -32,10 +32,10 @@ export const validateElicitationValue = (
     if (value.some((item) => !choices.includes(item))) {
       throw new Error("The answer contains a value the agent did not offer.");
     }
-    if (property.minItems !== undefined && value.length < property.minItems) {
+    if (typeof property.minItems === "number" && value.length < property.minItems) {
       throw new Error(`Select at least ${property.minItems} option(s).`);
     }
-    if (property.maxItems !== undefined && value.length > property.maxItems) {
+    if (typeof property.maxItems === "number" && value.length > property.maxItems) {
       throw new Error(`Select at most ${property.maxItems} option(s).`);
     }
     return;
@@ -45,13 +45,13 @@ export const validateElicitationValue = (
     if (choices.length > 0 && !choices.includes(value)) {
       throw new Error("The answer is not one of the values the agent offered.");
     }
-    if (property.minLength !== undefined && value.length < property.minLength) {
+    if (typeof property.minLength === "number" && value.length < property.minLength) {
       throw new Error(`Enter at least ${property.minLength} character(s).`);
     }
-    if (property.maxLength !== undefined && value.length > property.maxLength) {
+    if (typeof property.maxLength === "number" && value.length > property.maxLength) {
       throw new Error(`Enter at most ${property.maxLength} character(s).`);
     }
-    if (property.pattern !== undefined) {
+    if (typeof property.pattern === "string") {
       let pattern: RegExp;
       try {
         pattern = new RegExp(property.pattern, "u");
@@ -85,10 +85,10 @@ export const validateElicitationValue = (
     return;
   }
   if (typeof value === "number") {
-    if (property.minimum !== undefined && value < property.minimum) {
+    if (typeof property.minimum === "number" && value < property.minimum) {
       throw new Error(`Enter a value of at least ${property.minimum}.`);
     }
-    if (property.maximum !== undefined && value > property.maximum) {
+    if (typeof property.maximum === "number" && value > property.maximum) {
       throw new Error(`Enter a value of at most ${property.maximum}.`);
     }
   }

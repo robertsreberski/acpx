@@ -24,3 +24,16 @@ export const reconcileQueuedPrompts = (
   );
   return prompts.filter((prompt) => !durableTurnIds.has(prompt.id));
 };
+
+/** Reconcile only the selected session without discarding receipts owned by other sessions. */
+export const reconcileSessionQueuedPrompts = (
+  prompts: readonly QueuedPrompt[],
+  sessionId: string,
+  events: readonly TranscriptEvent[],
+): readonly QueuedPrompt[] => {
+  const selected = reconcileQueuedPrompts(
+    prompts.filter((prompt) => prompt.sessionId === sessionId),
+    events,
+  );
+  return [...prompts.filter((prompt) => prompt.sessionId !== sessionId), ...selected];
+};

@@ -55,6 +55,29 @@ test("multi-select anyOf and scalar constraints fail closed", () => {
   );
 });
 
+test("nullable ACP constraints are treated as absent", () => {
+  assert.equal(coerceElicitationValue({ type: "number", minimum: null, maximum: null }, "12"), 12);
+  assert.equal(
+    coerceElicitationValue(
+      { type: "string", minLength: null, maxLength: null, pattern: null, format: null },
+      "value",
+    ),
+    "value",
+  );
+  assert.deepEqual(
+    coerceElicitationValue(
+      {
+        type: "array",
+        minItems: null,
+        maxItems: null,
+        items: { anyOf: [{ const: "one" }] },
+      },
+      ["one"],
+    ),
+    ["one"],
+  );
+});
+
 test("optional blank scalar fields are omitted instead of fabricating values", () => {
   assert.deepEqual(booleanElicitationChoices(false), [
     { value: "", label: "No answer", disabled: false },

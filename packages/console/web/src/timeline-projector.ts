@@ -312,10 +312,10 @@ export const timelineActivityToolName = (
 export const timelineEventIsRunning = (event: TranscriptEvent): boolean =>
   ["pending", "in_progress", "running", "streaming"].includes(event.status ?? "");
 
-export const normalizeHistoricalStreamingEvent = (
+export const normalizeHistoricalRunningEvent = (
   event: TranscriptEvent,
   activeTurnId: string | undefined,
 ): TranscriptEvent =>
-  event.status === "streaming" && (!activeTurnId || event.turnId !== activeTurnId)
+  timelineEventIsRunning(event) && (!activeTurnId || event.turnId !== activeTurnId)
     ? { ...event, status: "complete" }
     : event;

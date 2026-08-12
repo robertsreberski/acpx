@@ -10,7 +10,8 @@ import {
 } from "react";
 import { api, ApiError } from "./api";
 import { listenForLiveInvalidations } from "./live-events";
-import { reconcileQueuedPrompts, type QueuedPrompt } from "./queued-prompts";
+import { reconcileSessionQueuedPrompts, type QueuedPrompt } from "./queued-prompts";
+import { RequestGeneration } from "./request-generation";
 import {
   mergeRefreshedTimelinePage,
   normalizeTimelinePage,
@@ -77,6 +78,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   );
   const [queuedPrompts, setQueuedPrompts] = useState<readonly QueuedPrompt[]>([]);
   const noticeId = useRef(0);
+  const bootstrapGeneration = useRef(new RequestGeneration());
   const selectionGeneration = useRef(0);
   const selectedSessionIdRef = useRef(selectedSessionId);
   const refreshTimer = useRef<number | undefined>(undefined);
@@ -86,15 +88,25 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     setNotices((current) => [...current.slice(-3), { id, message, tone }]);
   }, []);
 
-  const refreshBootstrap = useCallback(async () => {
+  const refreshBootstrap = useCallback(async (): Promise<boolean> => {
+    const generation = bootstrapGeneration.current.begin();
     try {
       const snapshot = await api.bootstrap();
+      if (!bootstrapGeneration.current.isLatest(generation)) {
+        return false;
+      }
       api.setCsrfToken(snapshot.csrfToken);
       setBootstrap(snapshot);
+      return true;
     } catch (error) {
-      notice(errorMessage(error));
+      if (bootstrapGeneration.current.isLatest(generation)) {
+        notice(errorMessage(error));
+      }
+      return false;
     } finally {
-      setLoading(false);
+      if (bootstrapGeneration.current.isLatest(generation)) {
+        setLoading(false);
+      }
     }
   }, [notice]);
 
@@ -134,8 +146,13 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   const refresh = useCallback(async () => {
     const generation = selectionGeneration.current;
     const id = selectedSessionIdRef.current;
-    await refreshBootstrap();
-    if (generation === selectionGeneration.current && id && id === selectedSessionIdRef.current) {
+    const refreshed = await refreshBootstrap();
+    if (
+      refreshed &&
+      generation === selectionGeneration.current &&
+      id &&
+      id === selectedSessionIdRef.current
+    ) {
       await refreshSelection(id);
     }
   }, [refreshBootstrap, refreshSelection]);
@@ -150,17 +167,18 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     setSelectedSession(null);
     setTimeline(null);
     setPending([]);
-    setQueuedPrompts((current) => current.filter((item) => item.sessionId === selectedSessionId));
     if (selectedSessionId) {
       void refreshSelection(selectedSessionId, false);
     }
   }, [refreshSelection, selectedSessionId]);
 
   useEffect(() => {
-    if (timeline) {
-      setQueuedPrompts((current) => reconcileQueuedPrompts(current, timeline.events));
+    if (selectedSessionId && timeline) {
+      setQueuedPrompts((current) =>
+        reconcileSessionQueuedPrompts(current, selectedSessionId, timeline.events),
+      );
     }
-  }, [timeline]);
+  }, [selectedSessionId, timeline]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -357,7 +375,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       notices,
       actionBusy,
       connectionState,
-      queuedPrompts,
+      queuedPrompts: queuedPrompts.filter((prompt) => prompt.sessionId === selectedSessionId),
       selectSession,
       refresh,
       loadEarlier,

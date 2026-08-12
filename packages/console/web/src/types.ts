@@ -103,21 +103,21 @@ export interface PermissionOption {
 
 export type ElicitationProperty = {
   readonly type?: string;
-  readonly title?: string;
-  readonly description?: string;
-  readonly enum?: readonly string[];
-  readonly oneOf?: readonly { readonly const: string; readonly title?: string }[];
-  readonly items?: ElicitationProperty;
-  readonly anyOf?: readonly { readonly const: string; readonly title?: string }[];
-  readonly minItems?: number;
-  readonly maxItems?: number;
-  readonly minLength?: number;
-  readonly maxLength?: number;
-  readonly pattern?: string;
-  readonly format?: "email" | "uri" | "date" | "date-time";
-  readonly minimum?: number;
-  readonly maximum?: number;
-  readonly default?: string | number | boolean | readonly string[];
+  readonly title?: string | null;
+  readonly description?: string | null;
+  readonly enum?: readonly string[] | null;
+  readonly oneOf?: readonly { readonly const: string; readonly title?: string | null }[] | null;
+  readonly items?: ElicitationProperty | null;
+  readonly anyOf?: readonly { readonly const: string; readonly title?: string | null }[] | null;
+  readonly minItems?: number | null;
+  readonly maxItems?: number | null;
+  readonly minLength?: number | null;
+  readonly maxLength?: number | null;
+  readonly pattern?: string | null;
+  readonly format?: "email" | "uri" | "date" | "date-time" | null;
+  readonly minimum?: number | null;
+  readonly maximum?: number | null;
+  readonly default?: string | number | boolean | readonly string[] | null;
 };
 
 export interface PendingInteraction {

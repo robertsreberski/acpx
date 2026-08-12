@@ -22,6 +22,9 @@ interface FocusContainer {
   querySelectorAll<T extends FocusTarget>(selector: string): ArrayLike<T>;
 }
 
+export const layerOwnsTarget = (layer: FocusContainer, target: unknown): boolean =>
+  layer.contains(target);
+
 export const dismissOnEscape = (event: EscapeKeyEvent, dismiss: () => void): boolean => {
   if (event.key !== "Escape" || event.isComposing || event.defaultPrevented) {
     return false;
@@ -69,7 +72,7 @@ export const trapLayerTab = (
   }
   if (
     event.shiftKey
-      ? activeElement === first || !layer.contains(activeElement)
+      ? activeElement === first || !layerOwnsTarget(layer, activeElement)
       : activeElement === last
   ) {
     event.preventDefault();

@@ -9,7 +9,7 @@ import { type ReactNode, useCallback, useMemo } from "react";
 import { useSessionStore } from "./session-store";
 import {
   firstInteractionEventIds,
-  normalizeHistoricalStreamingEvent,
+  normalizeHistoricalRunningEvent,
   timelineActivityToolName,
   timelineEventIsRunning,
 } from "./timeline-projector";
@@ -161,10 +161,13 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
         event.requestId && firstByRequest.get(event.requestId) === event.id
           ? interactionById.get(event.requestId)
           : undefined;
-      let normalized = normalizeHistoricalStreamingEvent(
-        event,
-        isRunning ? store.selectedSession?.activeTurnId : undefined,
-      );
+      let normalized =
+        interaction?.state === "pending"
+          ? event
+          : normalizeHistoricalRunningEvent(
+              event,
+              isRunning ? store.selectedSession?.activeTurnId : undefined,
+            );
       if (
         (event.kind === "permission" || event.kind === "elicitation") &&
         (!interaction || interaction.state !== "pending") &&
