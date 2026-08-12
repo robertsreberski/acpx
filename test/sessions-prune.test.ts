@@ -324,3 +324,53 @@ test("pruneSessions without agentCommand prunes all closed sessions across all a
     assert.ok(await fileExists(sessionFilePath(homeDir, "all-open")));
   });
 });
+
+test("pruning a closed session takes its parked requests with it", async () => {
+  await withTempHome(async (homeDir) => {
+    const session = await loadSessionModule();
+    const requests = await import("../src/session/pending-requests.js");
+    const cwd = path.join(homeDir, "workspace");
+
+    await writeSessionRecord(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "closed-with-requests",
+        acpSessionId: "closed-with-requests",
+        agentCommand: "agent-a",
+        cwd,
+        closed: true,
+      }),
+    );
+    await requests.writePendingRequest({
+      schema: requests.PENDING_REQUEST_SCHEMA,
+      requestId: "req-1",
+      sessionId: "closed-with-requests",
+      acpSessionId: "closed-with-requests",
+      agentCommand: "agent-a",
+      cwd,
+      kind: "permission",
+      state: "answered",
+      createdAt: "2026-08-12T00:00:00.000Z",
+      updatedAt: "2026-08-12T00:00:00.000Z",
+      ownerPid: 1,
+      ownerGeneration: 1,
+      taskRequestId: "task-1",
+      toolCall: { toolCallId: "tool-1", title: "Bash" },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      resolution: { answeredAt: "2026-08-12T00:00:01.000Z", source: "cli", optionId: "allow" },
+    });
+    const requestsDir = requests.pendingRequestsSessionDir("closed-with-requests");
+    assert.equal(await fileExists(requestsDir), true);
+
+    const result = await session.pruneSessions({ agentCommand: "agent-a" });
+
+    assert.deepEqual(
+      result.pruned.map((entry) => entry.acpxRecordId),
+      ["closed-with-requests"],
+    );
+    // The requests belong to the record. Leaving them behind would strand
+    // entries whose session no longer exists and which nothing can answer.
+    assert.equal(await fileExists(requestsDir), false);
+    assert.equal(await fileExists(sessionFilePath(homeDir, "closed-with-requests")), false);
+  });
+});
