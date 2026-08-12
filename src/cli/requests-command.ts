@@ -212,7 +212,13 @@ export async function handleRequestsList(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const format = resolveRequestsFormat(flags.json, globalFlags.format);
+  const sessionName = resolveSessionNameFromFlags(flags, command);
   if (flags.all === true) {
+    if (sessionName !== undefined) {
+      // Naming a session and asking for every session are contradictory; doing
+      // one of them silently would hide which.
+      throw new InvalidArgumentError("--all cannot be combined with -s/--session");
+    }
     printRequestsByFormat(await listAllRequests(), format);
     return;
   }
@@ -222,7 +228,7 @@ export async function handleRequestsList(
     agent.agentCommand,
     agent.agentName,
     agent.cwd,
-    resolveSessionNameFromFlags(flags, command),
+    sessionName,
   );
   printRequestsByFormat(
     await listSessionRequests(record.acpxRecordId, createWarn(globalFlags.jsonStrict)),

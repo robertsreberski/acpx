@@ -6203,6 +6203,14 @@ test("integration: requests --all lists parked requests without a session in cwd
       assert.equal(entries.length, 1, all.stdout);
       assert.equal(entries[0]?.state, "pending");
 
+      const conflicting = await runCli(
+        [...baseAgentArgs(otherCwd), "requests", "--all", "-s", "somewhere"],
+        homeDir,
+      );
+      // Naming a session while asking for all of them is contradictory.
+      assert.equal(conflicting.code, 2, `${conflicting.stdout}${conflicting.stderr}`);
+      assert.match(`${conflicting.stdout}${conflicting.stderr}`, /--all cannot be combined/);
+
       await runCli([...deferArgs, "--format", "json", "cancel"], homeDir, { timeoutMs: 30_000 });
       await waitForRequestState(homeDir, "cancelled");
     } finally {

@@ -346,7 +346,7 @@ Behavior:
 - Reads the durable request store, so it keeps working when the queue owner is unreachable.
 - Reconciles first: requests left pending by an owner that is gone are marked `orphaned`, and terminal entries past the retention window are deleted.
 - Adds anything a live owner is holding that the store does not know about. When the owner cannot be reached, the listing still prints and a warning goes to stderr.
-- `--all` lists every session's parked requests and needs no session in the current directory. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
+- `--all` lists every session's parked requests and needs no session in the current directory. It cannot be combined with `-s`. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
 - States are `pending`, `answered`, `cancelled`, `expired`, and `orphaned`. Only `pending` requests can be answered.
 
 Output:
