@@ -400,7 +400,7 @@ export async function resolvePermissionRequestWithDetails(
 }
 
 const DECISION_FALLBACK_ORDER: Record<
-  Exclude<AcpPermissionDecision["outcome"], "cancel">,
+  Exclude<AcpPermissionDecision["outcome"], "cancel" | "select">,
   PermissionOption["kind"][]
 > = {
   allow_once: ["allow_once", "allow_always"],
@@ -415,6 +415,12 @@ export function decisionToResponse(
 ): RequestPermissionResponse {
   if (decision.outcome === "cancel") {
     return cancelled();
+  }
+  if (decision.outcome === "select") {
+    // Exact match only: a caller naming an option id means that option, so
+    // silently substituting a same-kind option would misreport the decision.
+    const exact = (params.options ?? []).find((option) => option.optionId === decision.optionId);
+    return exact ? selected(exact.optionId) : cancelled();
   }
   const matched = pickOption(params.options ?? [], DECISION_FALLBACK_ORDER[decision.outcome]);
   return matched ? selected(matched.optionId) : cancelled();

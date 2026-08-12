@@ -354,6 +354,66 @@ test("decisionToResponse cancel always returns cancelled", () => {
   });
 });
 
+test("decisionToResponse select picks the exact option id", () => {
+  const request = makeRequestWithTitle("tool", "edit", [
+    { optionId: "allow", kind: "allow_once" },
+    { optionId: "allow-forever", kind: "allow_always" },
+    { optionId: "reject", kind: "reject_once" },
+  ]);
+  assert.deepEqual(decisionToResponse(request, { outcome: "select", optionId: "allow-forever" }), {
+    outcome: { outcome: "selected", optionId: "allow-forever" },
+  });
+});
+
+test("decisionToResponse select honours agent-specific option ids", () => {
+  const request = makeRequestWithTitle("tool", "edit", [
+    { optionId: "allow", kind: "allow_once" },
+    { optionId: "acme-allow-with-audit", kind: "allow_always" },
+  ]);
+  assert.deepEqual(
+    decisionToResponse(request, { outcome: "select", optionId: "acme-allow-with-audit" }),
+    { outcome: { outcome: "selected", optionId: "acme-allow-with-audit" } },
+  );
+});
+
+test("decisionToResponse select cancels instead of falling back by option kind", () => {
+  const request = makeRequestWithTitle("tool", "edit", [
+    { optionId: "allow", kind: "allow_once" },
+    { optionId: "allow-forever", kind: "allow_always" },
+    { optionId: "reject", kind: "reject_once" },
+  ]);
+  assert.deepEqual(decisionToResponse(request, { outcome: "select", optionId: "not-offered" }), {
+    outcome: { outcome: "cancelled" },
+  });
+});
+
+test("decisionToResponse select cancels when the request offers no options", () => {
+  const request = makeRequestWithTitle("tool", "edit", []);
+  assert.deepEqual(decisionToResponse(request, { outcome: "select", optionId: "allow" }), {
+    outcome: { outcome: "cancelled" },
+  });
+});
+
+test("classifyPermissionDecision classifies arbitrary selected options by their kind", () => {
+  const request = makeRequestWithTitle("tool", "edit", [
+    { optionId: "acme-allow-with-audit", kind: "allow_always" },
+    { optionId: "acme-reject-and-explain", kind: "reject_always" },
+  ]);
+
+  assert.equal(
+    classifyPermissionDecision(request, {
+      outcome: { outcome: "selected", optionId: "acme-allow-with-audit" },
+    }),
+    "approved",
+  );
+  assert.equal(
+    classifyPermissionDecision(request, {
+      outcome: { outcome: "selected", optionId: "acme-reject-and-explain" },
+    }),
+    "denied",
+  );
+});
+
 test("inferToolKind classifies titles when toolCall.kind is missing", () => {
   assert.equal(inferToolKind(makeRequest("edit")), "edit");
   assert.equal(inferToolKind(makeRequestWithTitle("patch: foo.ts", undefined)), "edit");

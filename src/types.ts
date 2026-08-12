@@ -24,6 +24,7 @@ export type AcpPermissionDecision =
   | { outcome: "allow_always" }
   | { outcome: "reject_once" }
   | { outcome: "reject_always" }
+  | { outcome: "select"; optionId: string }
   | { outcome: "cancel" };
 
 export const EXIT_CODES = {
