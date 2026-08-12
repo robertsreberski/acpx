@@ -37,9 +37,12 @@ Policy keys:
 - `autoApprove`: tool kinds, tool title heads, titles, or raw input tool names to approve
 - `autoDeny`: matched tools to deny
 - `escalate`: matched tools that require user or orchestrator approval
-- `defaultAction`: optional fallback for unmatched requests: `approve`, `deny`, or `escalate`
+- `defer`: matched tools whose decision belongs to an out-of-band reviewer rather than the current turn
+- `defaultAction`: optional fallback for unmatched requests: `approve`, `deny`, `escalate`, or `defer`
 
-Rule precedence is `autoDeny`, then `autoApprove`, then `escalate`, then `defaultAction`, then the normal permission mode. Matches are case-insensitive. In non-interactive output, an escalated request is denied for the current turn. Text mode prints a `[permission]` notice; JSON mode keeps the raw ACP stream and includes structured escalation details, including tool input when supplied by the agent, in the `session/request_permission` response `_meta.acpx.permissionEscalation` object so an orchestrator can resume with a broader policy.
+Rule precedence is `autoDeny`, then `autoApprove`, then `escalate`, then `defer`, then `defaultAction`, then the normal permission mode. Matches are case-insensitive. In non-interactive output, an escalated request is denied for the current turn.
+
+`defer` currently resolves exactly like `escalate` and differs only in what it reports: the emitted event carries `"action": "defer"` and a deferral message, so a host can tell a request it should have parked from one it was asked to approve now. Until something parks deferred requests, a deferred tool call is denied for the current turn like any other escalation. Text mode prints a `[permission]` notice; JSON mode keeps the raw ACP stream and includes structured escalation details, including tool input when supplied by the agent, in the `session/request_permission` response `_meta.acpx.permissionEscalation` object so an orchestrator can resume with a broader policy.
 
 ## What counts as a "read"
 

@@ -258,7 +258,7 @@ Behavior:
 - `--approve-reads`: auto-approve reads/searches, prompt for writes (default mode)
 - `--deny-all`: deny all permission requests
 - `--non-interactive-permissions <policy>`: when prompting is unavailable, choose `deny` or `fail`
-- `--permission-policy <json-or-file>` / `--policy`: per-tool ACP permission rules (`autoApprove`, `autoDeny`, `escalate`, `defaultAction`)
+- `--permission-policy <json-or-file>` / `--policy`: per-tool ACP permission rules (`autoApprove`, `autoDeny`, `escalate`, `defer`, `defaultAction`)
 - `--format <fmt>`: output format (`text`, `json`, `quiet`)
 - `--json-strict`: strict JSON mode; requires `--format json` and suppresses non-JSON stderr output
 - `--suppress-reads`: suppress raw read-file contents while preserving the selected format
