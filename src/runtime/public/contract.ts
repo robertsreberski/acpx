@@ -6,6 +6,7 @@ import type {
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
+  PermissionPolicy,
   SessionRecord,
 } from "../../types.js";
 import type { SessionAgentOptions } from "../engine/session-options.js";
@@ -308,6 +309,7 @@ export type AcpRuntimeOptions = {
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
   timeoutMs?: number;
   probeAgent?: string;
   verbose?: boolean;

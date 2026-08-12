@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import type { AcpClient } from "../src/acp/client.js";
 import type { SessionModelState } from "../src/acp/model-support.js";
 import { AcpxOperationalError } from "../src/errors.js";
 import { AcpRuntimeManager } from "../src/runtime/engine/manager.js";
@@ -16,6 +17,7 @@ import type {
   AcpRuntimeTurn,
   AcpRuntimeTurnResult,
 } from "../src/runtime/public/contract.js";
+import type { PermissionPolicy } from "../src/types.js";
 import {
   createRuntimeOptions,
   InMemorySessionStore,
@@ -3471,4 +3473,72 @@ test("AcpRuntimeManager getStatus accepts legacy available command names", async
   const status = await manager.getStatus(createHandle("legacy-commands:1"));
 
   assert.deepEqual(status.availableCommands, [{ name: "/compact" }, { name: "/clear" }]);
+});
+
+test("AcpRuntimeManager forwards permissionPolicy and the hook to every client it builds", async () => {
+  const store = new InMemorySessionStore();
+  const policy: PermissionPolicy = { defer: ["execute"], defaultAction: "deny" };
+  const hook = async () => undefined;
+  const seen: ConstructorParameters<typeof AcpClient>[0][] = [];
+
+  const manager = new AcpRuntimeManager(
+    {
+      ...createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+      permissionPolicy: policy,
+      onPermissionRequest: hook,
+    },
+    {
+      clientFactory: (options) => {
+        seen.push(options);
+        return {
+          initializeResult: { protocolVersion: 1, agentCapabilities: {} },
+          start: async () => {},
+          close: async () => {},
+          createSession: async () => ({
+            sessionId: "policy-session",
+            agentSessionId: "policy-agent",
+          }),
+          loadSession: async () => ({ agentSessionId: "policy-agent" }),
+          hasReusableSession: () => false,
+          supportsLoadSession: () => true,
+          loadSessionWithOptions: async () => ({ agentSessionId: "policy-agent" }),
+          getAgentLifecycleSnapshot: () => ({ running: false }),
+          prompt: async () => ({ stopReason: "end_turn" }),
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async () => {},
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        } as never;
+      },
+    },
+  );
+
+  const record = await manager.ensureSession({
+    sessionKey: "policy-session-key",
+    agent: "codex",
+    mode: "persistent",
+    cwd: "/workspace",
+  });
+  const afterEnsure = seen.length;
+  assert.equal(afterEnsure > 0, true, "expected ensureSession to build a client");
+
+  // Drive a turn too: that path builds its client through withConnectedSession,
+  // which is a separate hop from the one ensureSession takes.
+  await collectTurn(
+    manager.startTurn({
+      handle: createHandle(record.acpxRecordId),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "policy-req-1",
+    }),
+  );
+  assert.equal(seen.length > afterEnsure, true, "expected the turn to build another client");
+
+  for (const options of seen) {
+    assert.deepEqual(options.permissionPolicy, policy);
+    assert.equal(options.onPermissionRequest, hook);
+  }
 });
