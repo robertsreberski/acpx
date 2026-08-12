@@ -16,6 +16,18 @@ remain authoritative; the browser is a disposable projection over the public
 commands below describe post-release usage; a source checkout is not evidence
 that the package has been published or deployed.
 
+Fork root releases use `vX.Y.Z-fork.N` and publish `acpx` under the non-default
+`fork` npm tag. After that exact dependency is registry-visible,
+`console-vX.Y.Z` independently publishes `acpx-console`; root releases never
+implicitly republish the console.
+
+Because npm requires a package to exist before trusted publishing can be
+configured, the first console release is an explicit bootstrap: dispatch the
+Release workflow for the existing console tag with `bootstrap_console` enabled
+and a one-time, granular `NPM_TOKEN`. Immediately configure `acpx-console` to
+trust `release.yml` in `robertsreberski/acpx`, then remove the secret. Later
+console releases reject bootstrap mode and use GitHub OIDC.
+
 ## Install and run
 
 After release:
@@ -63,9 +75,9 @@ arbitrary adapter commands, environment or MCP editing, attachments, or live
 mid-turn steering.
 
 For the complete operator guide, see
-[`docs/console.md`](https://github.com/openclaw/acpx/blob/main/docs/console.md).
+[`docs/console.md`](https://github.com/robertsreberski/acpx/blob/fork-main/docs/console.md).
 For architecture and the public session contract, see
-[`docs/2026-08-12-acpx-console-architecture.md`](https://github.com/openclaw/acpx/blob/main/docs/2026-08-12-acpx-console-architecture.md).
+[`docs/2026-08-12-acpx-console-architecture.md`](https://github.com/robertsreberski/acpx/blob/fork-main/docs/2026-08-12-acpx-console-architecture.md).
 
 ## Development
 

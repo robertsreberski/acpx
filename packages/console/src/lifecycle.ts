@@ -198,7 +198,14 @@ async function startControlServer(
         return;
       }
       socket.end(`${JSON.stringify({ ok: true })}\n`);
-      setImmediate(() => void stop());
+      setImmediate(() => {
+        void stop().catch((error: unknown) => {
+          console.error(
+            `ACPX Console shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          process.exitCode = 1;
+        });
+      });
     });
   });
   try {
@@ -257,14 +264,28 @@ export async function startForegroundConsole(
   });
   const stop = (): Promise<void> => {
     stopStarted ??= (async () => {
+      let failure: unknown;
       try {
         if (control) {
           await closeNetServer(control, controlSockets);
         }
+      } catch (error) {
+        failure = error;
+      }
+      try {
         await running.close();
-      } finally {
+      } catch (error) {
+        failure ??= error;
+      }
+      try {
         await cleanStaleLifecycle(config.stateDir);
+      } catch (error) {
+        failure ??= error;
+      } finally {
         resolveStopped();
+      }
+      if (failure !== undefined) {
+        throw failure;
       }
     })();
     return stopStarted;
@@ -477,7 +498,12 @@ export async function stopDetachedConsole(
 
 export function attachShutdownSignals(foreground: ForegroundConsole): () => void {
   const handler = (): void => {
-    void foreground.stop();
+    void foreground.stop().catch((error: unknown) => {
+      console.error(
+        `ACPX Console shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exitCode = 1;
+    });
   };
   process.once("SIGINT", handler);
   process.once("SIGTERM", handler);

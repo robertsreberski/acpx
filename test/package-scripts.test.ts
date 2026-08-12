@@ -95,3 +95,38 @@ test("the repository gate includes the independent console package", () => {
     "node scripts/smoke-acpx-console-package.mjs",
   );
 });
+
+test("release workflow delegates tag and package selection to the tested release plan", () => {
+  const workflow = readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "release.yml"),
+    "utf8",
+  );
+
+  assert.match(workflow, /console-v\*\.\*\.\*/);
+  assert.match(workflow, /pnpm exec tsx scripts\/release-plan\.ts/);
+  assert.match(workflow, /origin\/\$\{BASE_BRANCH\}/);
+  assert.match(workflow, /npm publish --access public --provenance --tag fork/);
+  assert.match(workflow, /Verify console's exact acpx dependency on npm/);
+  assert.match(workflow, /working-directory: packages\/console/);
+  assert.match(workflow, /bootstrap_console:/);
+  assert.match(workflow, /scripts\/release-plan\.ts \\\n+\s+--console-auth/);
+  assert.match(workflow, /steps\.console_auth\.outputs\.bootstrap == 'true'/);
+  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/);
+  assert.equal(
+    JSON.parse(readFileSync(path.join(process.cwd(), "package.json"), "utf8")).repository.url,
+    "https://github.com/robertsreberski/acpx",
+  );
+  assert.equal(
+    JSON.parse(
+      readFileSync(path.join(process.cwd(), "packages", "console", "package.json"), "utf8"),
+    ).repository.url,
+    "https://github.com/robertsreberski/acpx",
+  );
+});
+
+test("CI validates both the upstream and fork base branches", () => {
+  const workflow = readFileSync(path.join(process.cwd(), ".github", "workflows", "ci.yml"), "utf8");
+
+  assert.match(workflow, /push:\n\s+branches: \[main, fork-main\]/);
+  assert.match(workflow, /pull_request:\n\s+branches: \[main, fork-main\]/);
+});

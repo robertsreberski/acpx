@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "description": "Local web console for ACPX coding sessions",
   "license": "MIT",
+  "author": "OpenClaw Team <dev@openclaw.ai>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robertsreberski/acpx",
+    "directory": "packages/console"
+  },
   "bin": {
     "acpx-console": "dist/cli.js"
   },

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -267,5 +267,39 @@ test("opening the console rejects when the platform browser launcher cannot spaw
     await assert.rejects(openConsole("http://127.0.0.1:4174"), /ENOENT/);
   } finally {
     process.env.PATH = originalPath;
+  }
+});
+
+test("foreground stopped settles even when lifecycle metadata cleanup fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-stop-cleanup-failure-"));
+  const web = join(root, "web");
+  const stateDir = join(root, "state");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const foreground = await startForegroundConsole(
+    {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [root],
+      stateDir,
+      staticDir: web,
+    },
+    new MockSessionService(),
+  );
+  const runtimePath = lifecyclePaths(stateDir).runtime;
+  await rm(runtimePath);
+  await mkdir(runtimePath);
+  try {
+    const [stopResult, stoppedResult] = await Promise.allSettled([
+      foreground.stop(),
+      foreground.stopped,
+    ]);
+    assert.equal(stopResult.status, "rejected");
+    assert.match(String(stopResult.reason.code), /EISDIR|EPERM/);
+    assert.equal(stoppedResult.status, "fulfilled");
+  } finally {
+    await rm(runtimePath, { recursive: true, force: true });
   }
 });
