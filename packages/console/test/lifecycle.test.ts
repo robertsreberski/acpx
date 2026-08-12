@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { createConnection, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,7 @@ import {
   lifecyclePaths,
   readRuntimeRecord,
   startForegroundConsole,
+  stopDetachedConsole,
 } from "../src/lifecycle.js";
 import { MockSessionService } from "./helpers.js";
 
@@ -57,4 +58,76 @@ test("corrupt runtime metadata fails closed without deleting the control endpoin
   await writeFile(paths.control, "sentinel", "utf8");
   await assert.rejects(readRuntimeRecord(stateDir), /runtime metadata is corrupt/);
   assert.equal(await readFile(paths.control, "utf8"), "sentinel");
+});
+
+test("stop requires one bounded newline-delimited success response", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-control-"));
+  const stateDir = join(root, "state");
+  const paths = lifecyclePaths(stateDir);
+  await mkdir(stateDir);
+  const control = createNetServer((socket) => {
+    socket.once("data", () => {
+      socket.write('{"ok":false,"error":"refused"}');
+      socket.end("\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    control.once("error", reject);
+    control.listen(paths.control, resolve);
+  });
+  await writeFile(
+    paths.runtime,
+    JSON.stringify({
+      schema: "acpx.console.runtime.v1",
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 4174,
+      origin: "http://127.0.0.1:4174",
+      startedAt: new Date().toISOString(),
+      controlPath: paths.control,
+      healthHost: "127.0.0.1",
+    }),
+  );
+  try {
+    await assert.rejects(stopDetachedConsole(stateDir), /stop failed: refused/);
+    assert.ok(await readRuntimeRecord(stateDir));
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      control.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("stop rejects an oversized control response before waiting for process exit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-control-large-"));
+  const stateDir = join(root, "state");
+  const paths = lifecyclePaths(stateDir);
+  await mkdir(stateDir);
+  const control = createNetServer((socket) => {
+    socket.once("data", () => socket.end("x".repeat(5_000)));
+  });
+  await new Promise<void>((resolve, reject) => {
+    control.once("error", reject);
+    control.listen(paths.control, resolve);
+  });
+  await writeFile(
+    paths.runtime,
+    JSON.stringify({
+      schema: "acpx.console.runtime.v1",
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 4174,
+      origin: "http://127.0.0.1:4174",
+      startedAt: new Date().toISOString(),
+      controlPath: paths.control,
+      healthHost: "127.0.0.1",
+    }),
+  );
+  try {
+    await assert.rejects(stopDetachedConsole(stateDir), /exceeded its size limit/);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      control.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });

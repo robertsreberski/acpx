@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
 import { extname, join, normalize, sep } from "node:path";
 import { assertWorkspaceAllowed, ConsoleInputError, type ResolvedConsoleConfig } from "./config.js";
 import type {
@@ -19,6 +20,7 @@ import {
   readJsonBody,
   requiredString,
 } from "./security.js";
+import { writeSseFrame } from "./sse.js";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const SSE_REPLAY_LIMIT = 512;
@@ -145,7 +147,15 @@ async function serveStatic(
   response: ServerResponse,
   staticDir: string,
 ): Promise<void> {
-  const decoded = decodeURIComponent(requestPath);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(requestPath);
+  } catch (error) {
+    if (error instanceof URIError) {
+      throw new HttpError(400, "INVALID_PATH", "Static asset path is invalid");
+    }
+    throw error;
+  }
   const relative = normalize(decoded).replace(/^[/\\]+/, "");
   if (relative === ".." || relative.startsWith(`..${sep}`)) {
     throw new HttpError(400, "INVALID_PATH", "Static asset path is invalid");
@@ -188,12 +198,6 @@ function parseLimit(url: URL): number {
     );
   }
   return value;
-}
-
-function writeSse(response: ServerResponse, item: BufferedEvent): void {
-  response.write(`id: ${item.id}\n`);
-  response.write(`event: ${item.event.type}\n`);
-  response.write(`data: ${JSON.stringify(item.event)}\n\n`);
 }
 
 async function handleApi(
@@ -414,7 +418,21 @@ export async function startAcpxConsoleServer(
   );
   const events: BufferedEvent[] = [];
   const clients = new Set<ServerResponse>();
+  const sockets = new Set<Socket>();
   let nextEventId = 1;
+
+  const disconnectSlowClient = (client: ServerResponse): void => {
+    clients.delete(client);
+    client.destroy();
+  };
+
+  const sendSse = (client: ServerResponse, item: BufferedEvent): boolean => {
+    if (writeSseFrame(client, item)) {
+      return true;
+    }
+    disconnectSlowClient(client);
+    return false;
+  };
 
   const publish = (event: ServiceInvalidation): void => {
     const item = { id: nextEventId++, event };
@@ -423,7 +441,7 @@ export async function startAcpxConsoleServer(
       events.shift();
     }
     for (const client of clients) {
-      writeSse(client, item);
+      sendSse(client, item);
     }
   };
   const unsubscribe = options.service.subscribe?.(publish);
@@ -441,17 +459,24 @@ export async function startAcpxConsoleServer(
     response.flushHeaders();
     const parsed = lastEventId === undefined ? undefined : Number(lastEventId);
     if (parsed !== undefined && (!Number.isInteger(parsed) || parsed < 0)) {
-      writeSse(response, { id: nextEventId++, event: { type: "reset" } });
+      if (!sendSse(response, { id: nextEventId++, event: { type: "reset" } })) {
+        return;
+      }
     } else if (parsed !== undefined && events.length > 0 && parsed < events[0].id - 1) {
-      writeSse(response, { id: nextEventId++, event: { type: "reset" } });
+      if (!sendSse(response, { id: nextEventId++, event: { type: "reset" } })) {
+        return;
+      }
     } else if (parsed !== undefined) {
       for (const event of events) {
-        if (event.id > parsed) {
-          writeSse(response, event);
+        if (event.id > parsed && !sendSse(response, event)) {
+          return;
         }
       }
     }
-    response.write(": connected\n\n");
+    if (!response.write(": connected\n\n")) {
+      disconnectSlowClient(response);
+      return;
+    }
     clients.add(response);
     response.on("close", () => clients.delete(response));
   };
@@ -502,6 +527,10 @@ export async function startAcpxConsoleServer(
   server.headersTimeout = 15_000;
   server.keepAliveTimeout = 5_000;
   server.maxConnections = MAX_SERVER_CONNECTIONS;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.config.port, options.config.host, () => {
@@ -531,9 +560,17 @@ export async function startAcpxConsoleServer(
         client.end();
       }
       clients.clear();
-      await new Promise<void>((resolve, reject) =>
-        server.close((error) => (error ? reject(error) : resolve())),
-      );
+      const closed = new Promise<void>((resolve, reject) => {
+        server.once("close", resolve);
+        server.once("error", reject);
+      });
+      server.close();
+      server.closeAllConnections();
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      sockets.clear();
+      await closed;
       await options.service.dispose?.();
     },
   };

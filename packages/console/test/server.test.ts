@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -58,6 +59,31 @@ async function requestWithHost(
   return await new Promise((resolve, reject) => {
     const request = httpRequest(
       { hostname: url.hostname, port: url.port, path: "/healthz", headers: { Host: host } },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => (body += chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body }));
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+async function requestPath(
+  origin: string,
+  path: string,
+): Promise<{ status: number; body: string }> {
+  const url = new URL(origin);
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      {
+        hostname: url.hostname,
+        port: url.port,
+        path,
+        headers: { Host: url.hostname },
+      },
       (response) => {
         let body = "";
         response.setEncoding("utf8");
@@ -188,6 +214,20 @@ test("SPA routes fall back to installed web assets but API typos remain JSON 404
     const api = await fetch(`${running.origin}/api/v1/not-real`);
     assert.equal(api.status, 404);
     assert.equal(api.headers.get("content-type"), "application/json; charset=utf-8");
+  } finally {
+    await running.close();
+  }
+});
+
+test("malformed URI escapes are classified as invalid paths", async () => {
+  const { running } = await fixture();
+  try {
+    const response = await requestPath(running.origin, "/%E0%A4%A");
+    assert.equal(response.status, 400);
+    assert.equal(
+      (JSON.parse(response.body) as { error: { code: string } }).error.code,
+      "INVALID_PATH",
+    );
   } finally {
     await running.close();
   }
@@ -356,4 +396,54 @@ test("event streams have an explicit client cap", async () => {
     await Promise.all(streams.map(async (response) => await response.body?.cancel()));
     await running.close();
   }
+});
+
+test("a slow SSE client is disconnected on the first backpressure signal", async () => {
+  const { running, service } = await fixture();
+  const url = new URL(running.origin);
+  const socket = createConnection(Number(url.port), url.hostname);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    socket.write(
+      `GET /api/v1/events HTTP/1.1\r\nHost: ${url.hostname}\r\nConnection: keep-alive\r\n\r\n`,
+    );
+    await new Promise<void>((resolve, reject) => {
+      socket.once("data", () => resolve());
+      socket.once("error", reject);
+    });
+    socket.pause();
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    service.emit({ type: "timeline", acpxRecordId: "record-1", cursor: "x".repeat(2_000_000) });
+    await Promise.race([
+      closed,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("slow SSE client stayed connected")), 1_000),
+      ),
+    ]);
+  } finally {
+    socket.destroy();
+    await running.close();
+  }
+});
+
+test("server close destroys a lingering partial HTTP connection", async () => {
+  const { running } = await fixture();
+  const url = new URL(running.origin);
+  const socket = createConnection(Number(url.port), url.hostname);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(`GET /healthz HTTP/1.1\r\nHost: ${url.hostname}\r\n`);
+  const socketClosed = new Promise<void>((resolve) => socket.once("close", resolve));
+  await Promise.race([
+    Promise.all([running.close(), socketClosed]),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("console close hung on a partial HTTP request")), 1_000),
+    ),
+  ]);
+  assert.equal(socket.destroyed, true);
 });

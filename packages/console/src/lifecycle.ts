@@ -24,6 +24,7 @@ const RUNTIME_SCHEMA = "acpx.console.runtime.v1";
 const DETACH_WAIT_MS = 10_000;
 const STOP_WAIT_MS = 10_000;
 const LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+const CONTROL_RESPONSE_MAX_BYTES = 4_096;
 
 export interface ConsoleRuntimeRecord {
   schema: typeof RUNTIME_SCHEMA;
@@ -338,13 +339,55 @@ export async function stopDetachedConsole(
     const socket = createConnection(record.controlPath);
     socket.setEncoding("utf8");
     socket.setTimeout(2_000);
-    socket.once("connect", () => socket.write("stop\n"));
-    socket.once("data", () => {
+    let response = "";
+    let settled = false;
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       socket.destroy();
-      resolve();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    socket.once("connect", () => socket.write("stop\n"));
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+      if (Buffer.byteLength(response) > CONTROL_RESPONSE_MAX_BYTES) {
+        finish(new Error("ACPX Console control response exceeded its size limit"));
+        return;
+      }
+      const newline = response.indexOf("\n");
+      if (newline < 0) {
+        return;
+      }
+      try {
+        const value: unknown = JSON.parse(response.slice(0, newline));
+        if (typeof value !== "object" || value === null || !("ok" in value) || value.ok !== true) {
+          const message =
+            typeof value === "object" &&
+            value !== null &&
+            "error" in value &&
+            typeof value.error === "string"
+              ? value.error
+              : "control endpoint refused the stop request";
+          finish(new Error(`ACPX Console stop failed: ${message}`));
+          return;
+        }
+        finish();
+      } catch (error) {
+        finish(
+          new Error("ACPX Console control response was not valid JSON", {
+            cause: error,
+          }),
+        );
+      }
     });
-    socket.once("timeout", () => socket.destroy(new Error("Control socket timed out")));
-    socket.once("error", reject);
+    socket.once("timeout", () => finish(new Error("ACPX Console control socket timed out")));
+    socket.once("error", (error) => finish(error));
   });
   const deadline = Date.now() + STOP_WAIT_MS;
   while (Date.now() < deadline) {
