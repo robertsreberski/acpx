@@ -1,17 +1,16 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { useDismissibleLayer } from "../dismissible-layer";
+import { reconcileDialogOptions } from "../session-dialog-options";
 import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
-import type { AgentSummary, ProviderSession } from "../types";
+import type { ProviderSession } from "../types";
 import { Icon } from "./Icon";
 
 interface DialogProps {
   readonly mode: "create" | "adopt" | null;
   readonly onClose: () => void;
 }
-
-const firstAgent = (agents: readonly AgentSummary[]): string => agents[0]?.id ?? "";
 
 export function SessionDialog({ mode, onClose }: DialogProps) {
   const store = useSessionStore();
@@ -27,6 +26,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [loadingProviders, setLoadingProviders] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
+  const dialogModeRef = useRef<DialogProps["mode"]>(null);
   const providerGeneration = useRef(0);
   useDismissibleLayer(mode !== null, onClose, dialogRef);
 
@@ -38,19 +38,41 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
 
   useEffect(() => {
     if (!mode) {
+      dialogModeRef.current = null;
       return;
     }
-    setAgentId(firstAgent(store.bootstrap.agents));
-    setCwd(store.bootstrap.workspaceRoots[0]?.path ?? "");
-    setName("");
-    setSessionMode("");
-    setModel("");
-    setProviderSessionId("");
-    setProviderSessions([]);
-    setProviderCursor(undefined);
-    setProviderError(null);
-    setError(null);
-  }, [mode, store.bootstrap.agents, store.bootstrap.workspaceRoots]);
+    const opening = dialogModeRef.current !== mode;
+    dialogModeRef.current = mode;
+    const options = reconcileDialogOptions(
+      opening ? "" : agentId,
+      opening ? "" : cwd,
+      store.bootstrap.agents,
+      store.bootstrap.workspaceRoots,
+    );
+    if (opening) {
+      setAgentId(options.agentId);
+      setCwd(options.cwd);
+      setName("");
+      setSessionMode("");
+      setModel("");
+      setProviderSessionId("");
+      setProviderSessions([]);
+      setProviderCursor(undefined);
+      setProviderError(null);
+      setError(null);
+      return;
+    }
+    if (options.agentChanged) {
+      setAgentId(options.agentId);
+      setSessionMode("");
+      setModel("");
+      setProviderSessionId("");
+    }
+    if (options.workspaceChanged) {
+      setCwd(options.cwd);
+      setProviderSessionId("");
+    }
+  }, [agentId, cwd, mode, store.bootstrap.agents, store.bootstrap.workspaceRoots]);
 
   const loadProviderSessions = useCallback(
     async (cursor?: string) => {
