@@ -37,6 +37,7 @@ import {
   type SessionsPruneFlags,
   type StatusFlags,
 } from "./flags.js";
+import { registerRequestsCommands } from "./requests-command.js";
 import { registerStatusCommand } from "./status-command.js";
 
 type FlowRunFlags = {
@@ -52,6 +53,8 @@ type SharedSubcommandDescriptions = {
   setMode: string;
   setConfig: string;
   status: string;
+  requests: string;
+  respond: string;
 };
 
 class LocalAttributeOption extends Option {
@@ -276,6 +279,10 @@ export function registerSharedAgentSubcommands(
   });
 
   registerStatusCommand(parent, explicitAgentName, config, descriptions.status);
+  registerRequestsCommands(parent, explicitAgentName, config, {
+    requests: descriptions.requests,
+    respond: descriptions.respond,
+  });
 }
 
 export function registerAgentCommand(
@@ -304,6 +311,8 @@ export function registerAgentCommand(
     setMode: "Set session mode",
     setConfig: "Set session config option",
     status: "Show local status of current session agent process",
+    requests: "List permission requests parked by --defer",
+    respond: "Answer a parked permission request",
   });
 
   registerSessionsCommand(agentCommand, agentName, config);
@@ -339,6 +348,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     setMode: `Set session mode for ${config.defaultAgent} by default`,
     setConfig: `Set session config option for ${config.defaultAgent} by default`,
     status: `Show local status for ${config.defaultAgent} by default`,
+    requests: `List parked permission requests for ${config.defaultAgent} by default`,
+    respond: `Answer a parked permission request for ${config.defaultAgent} by default`,
   });
 
   registerSessionsCommand(program, undefined, config);

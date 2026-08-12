@@ -76,6 +76,8 @@ Examples:
   acpx codex sessions ensure --name backend
   acpx codex sessions close backend
   acpx codex status
+  acpx codex requests --json
+  acpx codex respond <request-id> --option allow
   acpx config show
   acpx config init
   acpx --ttl 30 codex "investigate flaky tests"

@@ -5592,19 +5592,16 @@ test("runPromptTurn: existing agent reply still allows post-success drain", asyn
   assert.deepEqual(calls, ["prompt", "drain"]);
 });
 
-async function readStoredPendingRequests(homeDir: string): Promise<
-  Array<{
-    state: string;
-    task_request_id: string;
-    resolution?: { source?: string; option_id?: string };
-  }>
-> {
+type StoredPendingRequest = {
+  request_id: string;
+  state: string;
+  task_request_id: string;
+  resolution?: { source?: string; option_id?: string };
+};
+
+async function readStoredPendingRequests(homeDir: string): Promise<StoredPendingRequest[]> {
   const base = path.join(homeDir, ".acpx", "requests");
-  const entries: Array<{
-    state: string;
-    task_request_id: string;
-    resolution?: { source?: string; option_id?: string };
-  }> = [];
+  const entries: StoredPendingRequest[] = [];
   let sessionDirs: string[];
   try {
     sessionDirs = await fs.readdir(base);
@@ -5888,6 +5885,282 @@ test("integration: cancelling a session unwinds a parked permission request", as
       await runCli([...deferArgs, "--format", "json", "sessions", "close"], homeDir);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+type ParkedRequestFixture = {
+  homeDir: string;
+  cwd: string;
+  deferArgs: string[];
+  sessionId: string;
+};
+
+/**
+ * A session with one permission request parked and nothing able to settle it
+ * but a responder: `--defer-max-age 0` never expires, and `--no-wait` returns
+ * while the turn stays blocked on the park.
+ */
+async function withParkedRequest(
+  run: (fixture: ParkedRequestFixture) => Promise<void>,
+): Promise<void> {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const deferArgs = [...baseAgentArgs(cwd), "--defer", "--defer-max-age", "0"];
+    try {
+      const created = await runCli([...deferArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      await parkPermissionRequest(homeDir, deferArgs);
+      await run({ homeDir, cwd, deferArgs, sessionId });
+    } finally {
+      await runCli([...deferArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+async function parkPermissionRequest(homeDir: string, deferArgs: string[]): Promise<void> {
+  const submitted = await runCli(
+    [
+      ...deferArgs,
+      "--policy",
+      '{"defaultAction":"defer"}',
+      "--format",
+      "json",
+      "--ttl",
+      "60",
+      "prompt",
+      "--no-wait",
+      "permission execute Bash",
+    ],
+    homeDir,
+    { timeoutMs: 30_000 },
+  );
+  assert.equal(submitted.code, 0, submitted.stderr);
+  await waitForParkedRequest(homeDir);
+}
+
+async function listRequestsJson(
+  homeDir: string,
+  args: string[],
+  extra: string[] = [],
+): Promise<Array<Record<string, unknown>>> {
+  const listed = await runCli([...args, "requests", "--json", ...extra], homeDir);
+  assert.equal(listed.code, 0, `${listed.stdout}${listed.stderr}`);
+  return JSON.parse(listed.stdout.trim()) as Array<Record<string, unknown>>;
+}
+
+async function waitForParkedRequest(homeDir: string): Promise<StoredPendingRequest> {
+  return await waitFor(async () => {
+    const stored = await readStoredPendingRequests(homeDir);
+    return stored.find((entry) => entry.state === "pending") ?? null;
+  }, 25_000);
+}
+
+async function waitForRequestState(homeDir: string, state: string): Promise<void> {
+  await waitFor(async () => {
+    const stored = await readStoredPendingRequests(homeDir);
+    return stored.some((entry) => entry.state === state) ? state : null;
+  }, 25_000);
+}
+
+async function readPendingRequestEvents(
+  homeDir: string,
+): Promise<Array<{ event: string; state: string }>> {
+  const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+  const events: Array<{ event: string; state: string }> = [];
+  for (const name of await fs.readdir(sessionsDir)) {
+    if (!name.endsWith(".stream.ndjson")) {
+      continue;
+    }
+    const contents = await fs.readFile(path.join(sessionsDir, name), "utf8");
+    for (const line of contents.split("\n")) {
+      if (!line.includes('"_acpx/pending_request"')) {
+        continue;
+      }
+      const parsed = JSON.parse(line) as {
+        params?: { event?: string; request?: { state?: string } };
+      };
+      events.push({
+        event: parsed.params?.event ?? "",
+        state: parsed.params?.request?.state ?? "",
+      });
+    }
+  }
+  return events;
+}
+
+async function readSessionStream(homeDir: string): Promise<string> {
+  const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+  let contents = "";
+  for (const name of await fs.readdir(sessionsDir)) {
+    if (name.endsWith(".stream.ndjson")) {
+      contents += await fs.readFile(path.join(sessionsDir, name), "utf8");
+    }
+  }
+  return contents;
+}
+
+test("integration: requests list shows a parked request and respond --option settles it", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const listed = await listRequestsJson(homeDir, deferArgs);
+    assert.equal(listed.length, 1, JSON.stringify(listed));
+    const parked = listed[0] ?? {};
+    // The listing is the persisted store shape, verbatim: snake_case, schema
+    // included, and the agent's full option list so a responder can echo an id.
+    assert.equal(parked.schema, "acpx.pending_request.v1");
+    assert.equal(parked.state, "pending");
+    assert.deepEqual(parked.options, [
+      { option_id: "allow", name: "Allow", kind: "allow_once" },
+      { option_id: "reject", name: "Reject", kind: "reject_once" },
+    ]);
+    const requestId = String(parked.request_id);
+
+    const answered = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--option", "allow"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+    const answeredPayload = JSON.parse(answered.stdout.trim()) as {
+      state: string;
+      resolution?: { source?: string; option_id?: string };
+    };
+    assert.equal(answeredPayload.state, "answered");
+    assert.equal(answeredPayload.resolution?.source, "cli");
+    assert.equal(answeredPayload.resolution?.option_id, "allow");
+
+    const stored = await readStoredPendingRequests(homeDir);
+    assert.equal(stored[0]?.state, "answered");
+    assert.equal(stored[0]?.resolution?.source, "cli");
+    assert.equal(stored[0]?.resolution?.option_id, "allow");
+
+    // The parked turn resumes with the selected option and runs to completion.
+    await waitFor(async () => {
+      const stream = await readSessionStream(homeDir);
+      return stream.includes("permission selected:allow") ? "done" : null;
+    }, 25_000);
+
+    const events = await readPendingRequestEvents(homeDir);
+    assert.deepEqual(
+      events.map((entry) => `${entry.event}:${entry.state}`),
+      ["created:pending", "answered:answered"],
+    );
+
+    // A settled request is a usage error, not a silent no-op.
+    const again = await runCli([...deferArgs, "respond", requestId, "--option", "allow"], homeDir, {
+      timeoutMs: 30_000,
+    });
+    assert.equal(again.code, 2, `${again.stdout}${again.stderr}`);
+    assert.match(`${again.stdout}${again.stderr}`, /No pending request/);
+  });
+});
+
+test("integration: respond --decline answers with the agent's rejection option", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+
+    const declined = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--decline"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(declined.code, 0, `${declined.stdout}${declined.stderr}`);
+    const payload = JSON.parse(declined.stdout.trim()) as {
+      state: string;
+      resolution?: { source?: string; option_id?: string };
+    };
+    assert.equal(payload.state, "answered");
+    assert.equal(payload.resolution?.option_id, "reject");
+    assert.equal(payload.resolution?.source, "cli");
+
+    await waitFor(async () => {
+      const stream = await readSessionStream(homeDir);
+      return stream.includes("permission selected:reject") ? "done" : null;
+    }, 25_000);
+  });
+});
+
+test("integration: respond --cancel unblocks the turn without choosing an option", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+
+    const cancelled = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--cancel"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(cancelled.code, 0, `${cancelled.stdout}${cancelled.stderr}`);
+    const payload = JSON.parse(cancelled.stdout.trim()) as {
+      state: string;
+      resolution?: { source?: string; option_id?: string };
+    };
+    // `cli` is what separates an operator cancel from a turn or shutdown one.
+    assert.equal(payload.state, "cancelled");
+    assert.equal(payload.resolution?.source, "cli");
+    assert.equal(payload.resolution?.option_id, undefined);
+
+    await waitFor(async () => {
+      const stream = await readSessionStream(homeDir);
+      return stream.includes("permission cancelled") ? "done" : null;
+    }, 25_000);
+  });
+});
+
+test("integration: respond refuses exactly-one-answer violations before touching the store", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+
+    for (const args of [
+      ["respond", requestId],
+      ["respond", requestId, "--decline", "--cancel"],
+      ["respond", requestId, "--option", "allow", "--decline"],
+    ]) {
+      const result = await runCli([...deferArgs, ...args], homeDir, { timeoutMs: 30_000 });
+      assert.equal(result.code, 2, `${args.join(" ")}: ${result.stdout}${result.stderr}`);
+    }
+
+    const unknownOption = await runCli(
+      [...deferArgs, "respond", requestId, "--option", "not-offered"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(unknownOption.code, 2, `${unknownOption.stdout}${unknownOption.stderr}`);
+    // The message has to name what the agent actually offered.
+    assert.match(`${unknownOption.stdout}${unknownOption.stderr}`, /offered: allow, reject/);
+
+    // Every refusal above left the request answerable.
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+  });
+});
+
+test("integration: requests --all lists parked requests without a session in cwd", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const otherCwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-elsewhere-"));
+    try {
+      const scoped = await runCli([...baseAgentArgs(otherCwd), "requests", "--json"], homeDir);
+      // No session here: the cwd-scoped listing says so instead of reporting an
+      // empty list that looks like "nothing is parked".
+      assert.equal(scoped.code, 4, `${scoped.stdout}${scoped.stderr}`);
+
+      const all = await runCli(
+        [...baseAgentArgs(otherCwd), "requests", "--json", "--all"],
+        homeDir,
+      );
+      assert.equal(all.code, 0, `${all.stdout}${all.stderr}`);
+      const entries = JSON.parse(all.stdout.trim()) as Array<{ state: string }>;
+      assert.equal(entries.length, 1, all.stdout);
+      assert.equal(entries[0]?.state, "pending");
+
+      await runCli([...deferArgs, "--format", "json", "cancel"], homeDir, { timeoutMs: 30_000 });
+      await waitForRequestState(homeDir, "cancelled");
+    } finally {
+      await fs.rm(otherCwd, { recursive: true, force: true });
     }
   });
 });

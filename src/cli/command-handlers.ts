@@ -284,7 +284,7 @@ async function findScopedSessionOrThrow(
   return record;
 }
 
-async function findRoutedSessionOrThrow(
+export async function findRoutedSessionOrThrow(
   agentCommand: string,
   agentName: string,
   cwd: string,

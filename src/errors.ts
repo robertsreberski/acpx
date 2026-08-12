@@ -222,6 +222,22 @@ export class PendingRequestNotAnswerableError extends AcpxOperationalError {
   }
 }
 
+/**
+ * The queue owner that parked a request is gone, so nothing can answer it any
+ * more. Reported as NO_SESSION because the thing that held the request — the
+ * live owner for that session — is what is missing.
+ */
+export class PendingRequestOwnerGoneError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "NO_SESSION",
+      detailCode: "PENDING_REQUEST_OWNER_GONE",
+      origin: "cli",
+      ...options,
+    });
+  }
+}
+
 export class QueueConnectionError extends AcpxOperationalError {}
 
 export class QueueProtocolError extends AcpxOperationalError {}
