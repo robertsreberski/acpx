@@ -190,10 +190,21 @@ function createParkingBridge(params: {
     // to the task that actually provoked it instead of "unknown" or, worse, the
     // next task. It is replaced on the next beginTask, and turns are serialized.
     //
-    // Residual, deferred to M3: a straggler arriving after the NEXT task has
-    // begun is still attributed to that next task, and a straggler's events go
-    // to a sink whose event writer has already closed, so they are dropped. The
-    // durable store entry is unaffected in both cases.
+    // Residual, assessed and kept: a straggler arriving after the NEXT task has
+    // begun is attributed to that next task. Keeping a bounded map of recent
+    // turn contexts does not fix it — a late session/request_permission carries
+    // nothing that identifies the turn that provoked it (ACP has no turn id, and
+    // ctx.signal is per ACP session, not per turn), so there is no key to look
+    // the right context up by.
+    //
+    // Routing each request's later transitions by its own taskRequestId — the
+    // one thing such a map would buy — would make delivery worse, not better.
+    // Turns are serialized, so a retired task's sink writes into a batch nobody
+    // drains and an event writer that is already closed. Today those events land
+    // in the live turn's sink instead, which appends to the same per-session
+    // .stream.ndjson, and every notification carries the owning task id in its
+    // payload, so a reader still attributes them correctly. The durable store
+    // entry is unaffected either way.
     setTaskSink: (sink) => {
       if (currentTask) {
         currentTask.sink = sink;
