@@ -100,7 +100,10 @@ test("projects the core item timeline and explicit legacy gap", async () => {
     async () => {
       const page = await client.timeline("record-1");
       assert.equal(page.previousCursor, "cursor-1");
-      assert.equal(page.gap?.reason, "Earlier history retained elsewhere.");
+      assert.deepEqual(page.gap, {
+        reason: "legacy_retained",
+        message: "Earlier history retained elsewhere.",
+      });
       assert.deepEqual(page.events[0], {
         id: "event:7",
         sequence: 7,
@@ -116,6 +119,33 @@ test("projects the core item timeline and explicit legacy gap", async () => {
           kind: "acp",
           message: { jsonrpc: "2.0", method: "session/prompt", params: { text: "Fix it" } },
         },
+      });
+    },
+  );
+});
+
+test("projects corrupt timeline coverage without claiming complete history", async () => {
+  const client = new ConsoleApi();
+  await withFetch(
+    async () =>
+      response({
+        items: [
+          {
+            schema: "acpx.session_history_gap.v1",
+            kind: "history_gap",
+            reason: "corrupt",
+            message: "A corrupt timeline epoch was isolated.",
+          },
+        ],
+        hasMore: false,
+        coverage: "incomplete",
+      }),
+    async () => {
+      const page = await client.timeline("record-1");
+      assert.equal(page.coverage, "incomplete");
+      assert.deepEqual(page.gap, {
+        reason: "corrupt",
+        message: "A corrupt timeline epoch was isolated.",
       });
     },
   );

@@ -1,7 +1,11 @@
 import type { AgentCapabilities } from "@agentclientprotocol/sdk";
 import { AGENT_REGISTRY } from "../agent-registry.js";
 import { inspectQueueOwnerHealth } from "../cli/queue/ipc-health.js";
-import { getDesiredModelId } from "../session/mode-preference.js";
+import {
+  getDesiredModeId,
+  getDesiredModelId,
+  normalizeModeId,
+} from "../session/mode-preference.js";
 import { listPendingRequests, type PendingRequest } from "../session/pending-requests.js";
 import {
   getActiveSessionTimelineTurn,
@@ -10,12 +14,21 @@ import {
 import type { SessionRecord } from "../types.js";
 import type {
   AcpxOwnerState,
+  AcpxModeState,
   AcpxPendingRequest,
   AcpxRegisteredAgent,
   AcpxSessionDetail,
   AcpxSessionSummary,
   AcpxTurnState,
 } from "./contract.js";
+
+const WARM_OWNER_MODE_REMEDIATION =
+  "A retained queue owner may still be using an older mode. Answer or cancel pending requests, " +
+  "then close and reopen the session before relying on the saved mode.";
+
+const MODE_CONFLICT_REMEDIATION =
+  "The saved mode differs from the last adapter report. Answer or cancel pending requests, " +
+  "then close and reopen the session before sending another prompt.";
 
 type CapabilitySupport = "supported" | "unsupported" | "unknown";
 
@@ -123,6 +136,40 @@ function capabilityProjection(
   };
 }
 
+function projectMode(
+  record: SessionRecord,
+  projectedOwnerState: AcpxOwnerState,
+): Pick<
+  AcpxSessionSummary,
+  "mode" | "desiredMode" | "effectiveMode" | "modeState" | "modeRemediation"
+> {
+  const desiredMode = getDesiredModeId(record.acpx);
+  const effectiveMode = normalizeModeId(record.acpx?.current_mode_id);
+  let modeState: AcpxModeState;
+  let modeRemediation: string | undefined;
+  if (!desiredMode) {
+    modeState = "unmanaged";
+  } else if (effectiveMode && effectiveMode !== desiredMode) {
+    modeState = "conflict";
+    modeRemediation = MODE_CONFLICT_REMEDIATION;
+  } else if (projectedOwnerState === "online" || projectedOwnerState === "unreachable") {
+    // A stored current_mode_id can have come from the throwaway connection used
+    // by an idle warm owner's control fallback. It therefore cannot prove what
+    // the retained adapter session will use for the next prompt.
+    modeState = "unverified";
+    modeRemediation = WARM_OWNER_MODE_REMEDIATION;
+  } else {
+    modeState = "stored";
+  }
+  return {
+    mode: effectiveMode ?? desiredMode,
+    desiredMode,
+    effectiveMode,
+    modeState,
+    modeRemediation,
+  };
+}
+
 export async function projectSession(
   record: SessionRecord,
   detail: true,
@@ -147,6 +194,7 @@ export async function projectSession(
   ]);
   const waiting = pendingTurnState(pending);
   const lifecycleState = lifecycleTurnState(lifecycle);
+  const projectedOwnerState = ownerState(health);
   const projectedLifecycleState =
     activeTurn && !health.healthy ? "unknown" : activeTurn ? "running" : lifecycleState;
   const summary: AcpxSessionSummary = {
@@ -158,13 +206,13 @@ export async function projectSession(
     cwd: record.cwd,
     title: normalizedTitle(record),
     sessionState: record.closed === true ? "closed" : "open",
-    ownerState: ownerState(health),
+    ownerState: projectedOwnerState,
     turnState: waiting ?? projectedLifecycleState,
     queue: { depth: health.queueDepth ?? 0 },
     createdAt: record.createdAt,
     updatedAt: record.lastUsedAt,
     model: record.acpx?.current_model_id ?? getDesiredModelId(record.acpx),
-    mode: record.acpx?.current_mode_id ?? record.acpx?.desired_mode_id,
+    ...projectMode(record, projectedOwnerState),
     activeTurnId: health.healthy ? activeTurn?.turn_id : undefined,
     pendingCount: pending.filter((entry) => entry.state === "pending").length,
   };

@@ -447,9 +447,18 @@ export function Transcript() {
               Load earlier
             </button>
           )}
-          {(store.timeline?.coverage === "legacy_retained" || store.timeline?.gap) && (
+          {(store.timeline?.coverage === "incomplete" ||
+            store.timeline?.gap?.reason === "corrupt") && (
+            <div className="history-gap is-error" role="alert">
+              {store.timeline.gap?.message ??
+                "Part of the durable transcript could not be read. The visible history is incomplete."}
+            </div>
+          )}
+          {(store.timeline?.coverage === "legacy_retained" ||
+            store.timeline?.gap?.reason === "legacy_retained") && (
             <div className="history-gap" role="note">
-              Some earlier history predates lossless capture. The retained transcript begins here.
+              {store.timeline.gap?.message ??
+                "Some earlier history predates lossless capture. The retained transcript begins here."}
             </div>
           )}
           {store.timeline?.writeError && (

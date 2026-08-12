@@ -1,11 +1,15 @@
 import { coalesceTranscriptEvents } from "./timeline-projector";
 import type { TimelinePage } from "./types";
 
-const legacyCoverage = (
+const mergedCoverage = (
   left: TimelinePage["coverage"],
   right: TimelinePage["coverage"],
-): TimelinePage["coverage"] =>
-  left === "legacy_retained" || right === "legacy_retained" ? "legacy_retained" : "complete";
+): TimelinePage["coverage"] => {
+  if (left === "incomplete" || right === "incomplete") {
+    return "incomplete";
+  }
+  return left === "legacy_retained" || right === "legacy_retained" ? "legacy_retained" : "complete";
+};
 
 export const normalizeTimelinePage = (page: TimelinePage): TimelinePage => ({
   ...page,
@@ -28,7 +32,7 @@ export const mergeRefreshedTimelinePage = (
     ...latest,
     events: coalesceTranscriptEvents([...current.events, ...latest.events]),
     previousCursor: current.previousCursor,
-    coverage: legacyCoverage(current.coverage, latest.coverage),
+    coverage: mergedCoverage(current.coverage, latest.coverage),
     gap: current.gap ?? latest.gap,
     writeError: latest.writeError ?? current.writeError,
   };
@@ -40,7 +44,7 @@ export const prependEarlierTimelinePage = (
 ): TimelinePage => ({
   ...earlier,
   events: coalesceTranscriptEvents([...earlier.events, ...current.events]),
-  coverage: legacyCoverage(current.coverage, earlier.coverage),
+  coverage: mergedCoverage(current.coverage, earlier.coverage),
   gap: earlier.gap ?? current.gap,
   writeError: current.writeError ?? earlier.writeError,
 });

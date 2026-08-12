@@ -14,7 +14,7 @@ export interface WireTimelineEvent {
 export interface WireTimelineGap {
   readonly schema: "acpx.session_history_gap.v1";
   readonly kind: "history_gap";
-  readonly reason: "legacy_retained";
+  readonly reason: "legacy_retained" | "corrupt";
   readonly message: string;
 }
 

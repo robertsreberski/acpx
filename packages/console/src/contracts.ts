@@ -13,6 +13,7 @@ export type TurnState =
   | "cancelled"
   | "interrupted"
   | "unknown";
+export type ModeState = "unmanaged" | "stored" | "unverified" | "conflict";
 
 export interface ConsoleAgent {
   agentId: string;
@@ -33,6 +34,11 @@ export interface ConsoleSession {
   createdAt?: string;
   model?: string;
   mode?: string;
+  desiredMode?: string;
+  effectiveMode?: string;
+  /** Optional only for compatibility with older installed acpx session services. */
+  modeState?: ModeState;
+  modeRemediation?: string;
   activeTurnId?: string;
   pendingCount?: number;
 }
@@ -48,7 +54,7 @@ export type TimelineItem =
   | {
       schema: "acpx.session_history_gap.v1";
       kind: "history_gap";
-      reason: "legacy_retained";
+      reason: "legacy_retained" | "corrupt";
       message: string;
     }
   | {
@@ -67,7 +73,7 @@ export interface TimelinePage {
   items: TimelineItem[];
   previousCursor?: string;
   hasMore: boolean;
-  coverage: "complete" | "legacy_retained";
+  coverage: "complete" | "legacy_retained" | "incomplete";
   writeError?: string;
 }
 

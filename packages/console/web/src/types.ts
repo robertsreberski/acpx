@@ -13,6 +13,7 @@ export type TurnState =
   | "cancelled"
   | "interrupted"
   | "unknown";
+export type ModeState = "unmanaged" | "stored" | "unverified" | "conflict";
 
 export interface AgentSummary {
   readonly id: string;
@@ -45,12 +46,16 @@ export interface SessionSummary {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastActivityAt: string;
-  readonly historyCoverage?: "complete" | "legacy_retained";
+  readonly historyCoverage?: "complete" | "legacy_retained" | "incomplete";
 }
 
 export interface SessionDetail extends SessionSummary {
   readonly providerSessionId?: string;
   readonly mode?: string;
+  readonly desiredMode?: string;
+  readonly effectiveMode?: string;
+  readonly modeState: ModeState;
+  readonly modeRemediation?: string;
   readonly model?: string;
   readonly permissionPolicy?: unknown;
   readonly closeReason?: string;
@@ -81,8 +86,12 @@ export interface TranscriptEvent {
 export interface TimelinePage {
   readonly events: readonly TranscriptEvent[];
   readonly previousCursor?: string;
-  readonly coverage: "complete" | "legacy_retained";
-  readonly gap?: { readonly reason: string; readonly earliestAvailableAt?: string };
+  readonly coverage: "complete" | "legacy_retained" | "incomplete";
+  readonly gap?: {
+    readonly reason: "legacy_retained" | "corrupt";
+    readonly message: string;
+    readonly earliestAvailableAt?: string;
+  };
   readonly writeError?: string;
 }
 

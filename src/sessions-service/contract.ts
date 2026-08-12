@@ -36,6 +36,14 @@ export type AcpxQueueState = {
   depth: number;
 };
 
+/**
+ * Stored mode state deliberately does not overstate what a retained queue owner
+ * is running. A matching last adapter report is still unverified while that
+ * owner remains warm because an out-of-turn mode change can target a throwaway
+ * adapter connection.
+ */
+export type AcpxModeState = "unmanaged" | "stored" | "unverified" | "conflict";
+
 /** A registered invocation safe to expose to a browser-facing backend. */
 export type AcpxRegisteredAgent = {
   agentId: string;
@@ -65,7 +73,13 @@ export type AcpxSessionSummary = {
   createdAt: string;
   updatedAt: string;
   model?: string;
+  /** Backwards-compatible display value; prefer the qualified fields below. */
   mode?: string;
+  desiredMode?: string;
+  /** Last mode reported by an adapter connection, not unqualified live-owner proof. */
+  effectiveMode?: string;
+  modeState: AcpxModeState;
+  modeRemediation?: string;
   activeTurnId?: string;
   pendingCount: number;
 };

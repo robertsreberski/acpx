@@ -12,6 +12,13 @@ const Fact = ({ label, value }: { readonly label: string; readonly value?: strin
     </div>
   );
 
+const modeStateLabel = {
+  unmanaged: "No saved preference",
+  stored: "Saved for the next owner",
+  unverified: "Unverified on retained owner",
+  conflict: "Conflict",
+} as const;
+
 export function SessionFacts({
   open,
   onClose,
@@ -51,7 +58,9 @@ export function SessionFacts({
         <Fact label="Agent" value={session.agentLabel} />
         <Fact label="Workspace" value={session.cwd} />
         <Fact label="Branch" value={session.branch} />
-        <Fact label="Mode" value={session.mode} />
+        <Fact label="Desired mode" value={session.desiredMode} />
+        <Fact label="Last adapter report" value={session.effectiveMode} />
+        <Fact label="Mode assurance" value={modeStateLabel[session.modeState]} />
         <Fact label="Model" value={session.model} />
         <Fact label="Session" value={session.sessionState} />
         <Fact label="Owner" value={session.ownerState} />
@@ -61,6 +70,20 @@ export function SessionFacts({
         <Fact label="ACPX record" value={session.id} />
         <Fact label="Provider session" value={session.providerSessionId} />
       </dl>
+      {session.modeRemediation && (
+        <div
+          className={`mode-warning${session.modeState === "conflict" ? " is-error" : ""}`}
+          role={session.modeState === "conflict" ? "alert" : "note"}
+        >
+          <strong>
+            {session.modeState === "conflict"
+              ? "Saved mode is not in force"
+              : "Warm-owner mode is not verified"}
+          </strong>
+          <p>{session.modeRemediation}</p>
+          <small>Stored preferences alone do not prove the retained adapter session's mode.</small>
+        </div>
+      )}
       {session.permissionPolicy !== undefined && (
         <details className="raw-disclosure">
           <summary>Permission policy</summary>

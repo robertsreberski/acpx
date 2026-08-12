@@ -142,7 +142,7 @@ export class ConsoleApi {
           .map(projectTimelineEvent),
         previousCursor: page.previousCursor,
         coverage: page.coverage,
-        gap: gap ? { reason: gap.message } : undefined,
+        gap: gap ? { reason: gap.reason, message: gap.message } : undefined,
         writeError: page.writeError,
       };
     });
@@ -267,6 +267,10 @@ interface WireSession {
   readonly createdAt?: string;
   readonly model?: string;
   readonly mode?: string;
+  readonly desiredMode?: string;
+  readonly effectiveMode?: string;
+  readonly modeState?: SessionDetail["modeState"];
+  readonly modeRemediation?: string;
   readonly activeTurnId?: string;
   readonly pendingCount?: number;
   readonly providerSessionId?: string;
@@ -279,7 +283,7 @@ interface WireTimelinePage {
   readonly items: readonly (WireTimelineEvent | WireTimelineGap)[];
   readonly previousCursor?: string;
   readonly hasMore: boolean;
-  readonly coverage: "complete" | "legacy_retained";
+  readonly coverage: "complete" | "legacy_retained" | "incomplete";
   readonly writeError?: string;
 }
 
@@ -327,6 +331,10 @@ const sessionDetail = (session: WireSession): SessionDetail => ({
   ...sessionSummary(session),
   providerSessionId: session.providerSessionId ?? session.acpSessionId,
   mode: session.mode,
+  desiredMode: session.desiredMode,
+  effectiveMode: session.effectiveMode,
+  modeState: session.modeState ?? "unmanaged",
+  modeRemediation: session.modeRemediation,
   model: session.model,
   permissionPolicy: session.permissionPolicy,
   closeReason: session.closeReason,

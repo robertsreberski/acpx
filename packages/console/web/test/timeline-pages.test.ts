@@ -58,3 +58,17 @@ test("a live refresh replaces its window but preserves loaded history and its ol
     ],
   );
 });
+
+test("page merging never erases incomplete durable-history coverage", () => {
+  const corrupt: TimelinePage = {
+    events: [],
+    coverage: "incomplete",
+    gap: { reason: "corrupt", message: "A corrupt epoch was isolated." },
+  };
+  const refreshed = mergeRefreshedTimelinePage(corrupt, {
+    events: [],
+    coverage: "complete",
+  });
+  assert.equal(refreshed.coverage, "incomplete");
+  assert.equal(refreshed.gap?.reason, "corrupt");
+});

@@ -86,6 +86,59 @@ test("a live owner with a stale heartbeat is unreachable, never starting", async
   });
 });
 
+test("mode projection distinguishes stored preference, warm-owner uncertainty, and conflict", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-mode-assurance",
+      acpSessionId: "provider-mode-assurance",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      acpx: { desired_mode_id: "read-only", current_mode_id: "read-only" },
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const service = createAcpxSessionService({ cwd });
+
+    const cold = await service.getSession({ acpxRecordId: initial.acpxRecordId });
+    assert.equal(cold?.desiredMode, "read-only");
+    assert.equal(cold?.effectiveMode, "read-only");
+    assert.equal(cold?.modeState, "stored");
+    assert.equal(cold?.modeRemediation, undefined);
+
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    try {
+      await writeQueueOwnerLock({
+        ...paths,
+        pid: keeper.pid,
+        sessionId: initial.acpxRecordId,
+      });
+      const warm = await service.getSession({ acpxRecordId: initial.acpxRecordId });
+      assert.equal(warm?.modeState, "unverified");
+      assert.match(warm?.modeRemediation ?? "", /retained queue owner/u);
+
+      const conflicted = await resolveSessionRecord(initial.acpxRecordId);
+      conflicted.acpx = {
+        ...conflicted.acpx,
+        desired_mode_id: "read-only",
+        current_mode_id: "agent",
+      };
+      await writeSessionRecordFile(homeDir, conflicted);
+      const conflict = await service.getSession({ acpxRecordId: initial.acpxRecordId });
+      assert.equal(conflict?.mode, "agent");
+      assert.equal(conflict?.desiredMode, "read-only");
+      assert.equal(conflict?.effectiveMode, "agent");
+      assert.equal(conflict?.modeState, "conflict");
+      assert.match(conflict?.modeRemediation ?? "", /differs from the last adapter report/u);
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("owner loss after dispatch never projects a turn as still running", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
