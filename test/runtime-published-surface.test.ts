@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -8,7 +11,6 @@ import { fileURLToPath } from "node:url";
 // package — which is exactly how matchPermissionPolicy shipped "exported" while
 // dist/runtime.js never listed it.
 const DIST_RUNTIME_URL = new URL("../../dist/runtime.js", import.meta.url);
-const DIST_RUNTIME_TYPES_PATH = fileURLToPath(new URL("../../dist/runtime.d.ts", import.meta.url));
 
 const PUBLISHED_VALUES = [
   "matchPermissionPolicy",
@@ -74,14 +76,57 @@ test("dist/runtime.js matchPermissionPolicy classifies a deferred request", asyn
   assert.equal(runtime.matchPermissionPolicy(request, {}), undefined);
 });
 
-test("dist/runtime.d.ts names the permission policy types consumers need", () => {
-  const declarations = readFileSync(DIST_RUNTIME_TYPES_PATH, "utf8");
+test("dist/runtime.d.ts types are importable by a consumer", () => {
+  // Searching the whole .d.ts proves nothing: rolldown-dts emits an internal
+  // `type X = {…}` for anything an exported signature references, so a name is
+  // present in the file even when its re-export was dropped. Only compiling an
+  // import against the emitted declarations shows what a consumer can name.
+  const fixtureDir = mkdtempSync(path.join(tmpdir(), "acpx-dts-check-"));
+  const fixturePath = path.join(fixtureDir, "fixture.ts");
+  const specifier = path
+    .relative(fixtureDir, fileURLToPath(DIST_RUNTIME_URL))
+    .split(path.sep)
+    .join("/");
 
-  for (const name of PUBLISHED_TYPES) {
-    assert.match(
-      declarations,
-      new RegExp(`\\btype ${name}\\b`),
-      `dist/runtime.d.ts does not name type ${name}`,
+  try {
+    writeFileSync(
+      fixturePath,
+      [
+        `import type { ${PUBLISHED_TYPES.join(", ")} } from "${specifier}";`,
+        // Bind every name so nothing is elided as an unused import.
+        ...PUBLISHED_TYPES.map((name, index) => `declare const probe${index}: ${name};`),
+        `export type Probe = [${PUBLISHED_TYPES.map((_, index) => `typeof probe${index}`).join(", ")}];`,
+        "",
+      ].join("\n"),
+      "utf8",
     );
+
+    const tsc = fileURLToPath(new URL("../../node_modules/.bin/tsc", import.meta.url));
+    const compiled = spawnSync(
+      tsc,
+      [
+        "--noEmit",
+        "--strict",
+        "--skipLibCheck",
+        "--target",
+        "es2023",
+        "--module",
+        "esnext",
+        "--moduleResolution",
+        "bundler",
+        fixturePath,
+      ],
+      // Run from the fixture directory so the repo tsconfig is not picked up;
+      // tsc refuses to combine a discovered config with explicit file args.
+      { cwd: fixtureDir, encoding: "utf8" },
+    );
+
+    assert.equal(
+      compiled.status,
+      0,
+      `consumer import of dist/runtime.js failed to compile:\n${compiled.stdout}${compiled.stderr}`,
+    );
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
   }
 });
