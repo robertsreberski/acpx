@@ -376,9 +376,23 @@ export async function handleRespond(
   printRespondResultByFormat(answered, format);
 }
 
+/**
+ * Let commander's own usage errors (an empty option value, a missing argument)
+ * propagate instead of exiting the process itself.
+ *
+ * Commander's default exit code for those is 1, which acpx assigns to runtime
+ * and delivery failures — so a typo and an undelivered answer were
+ * indistinguishable to a caller. Rethrowing routes them through the CLI's error
+ * handler, which maps a usage error to exit 2 and renders it in the requested
+ * output format.
+ */
+function rethrowUsageErrors(command: Command): Command {
+  return command.exitOverride();
+}
+
 function addRequestsListOptions(command: Command): Command {
   addSessionNameOption(command);
-  return command
+  return rethrowUsageErrors(command)
     .option("--all", "List parked requests for every session, not just this one")
     .option("--json", "Alias for --format json");
 }
@@ -401,8 +415,7 @@ export function registerRequestsCommands(
       await handleRequestsList(explicitAgentName, flags, this, config);
     });
 
-  const respondCommand = parent
-    .command("respond")
+  const respondCommand = rethrowUsageErrors(parent.command("respond"))
     .description(descriptions.respond)
     .argument("<request-id>", "Parked request id", (value: string) =>
       parseNonEmptyValue("Request id", value),

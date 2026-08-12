@@ -63,6 +63,7 @@ const TOP_LEVEL_VERSION_VALUE_FLAG_VALUES = [
   "--prompt-retries",
   "--timeout",
   "--ttl",
+  "--defer-max-age",
   "--mcp-config",
 ] as const;
 
@@ -76,6 +77,7 @@ const TOP_LEVEL_VERSION_BOOLEAN_FLAGS = new Set([
   "--json-strict",
   "--no-fs",
   "--no-terminal",
+  "--defer",
   "--verbose",
 ]);
 

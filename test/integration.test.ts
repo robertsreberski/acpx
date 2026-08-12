@@ -6132,6 +6132,33 @@ test("integration: respond refuses exactly-one-answer violations before touching
       assert.equal(result.code, 2, `${args.join(" ")}: ${result.stdout}${result.stderr}`);
     }
 
+    // Commander rejects these before the handler runs; they are still usage
+    // errors, not the exit code acpx reserves for delivery failures.
+    for (const args of [
+      ["respond", "", "--option", "allow"],
+      ["respond", requestId, "--option", ""],
+      ["requests", "--nope"],
+    ]) {
+      const result = await runCli([...deferArgs, ...args], homeDir, { timeoutMs: 30_000 });
+      assert.equal(result.code, 2, `${args.join(" ")}: ${result.stdout}${result.stderr}`);
+    }
+
+    const jsonUsage = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--option", ""],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(jsonUsage.code, 2, `${jsonUsage.stdout}${jsonUsage.stderr}`);
+    assert.equal(
+      (
+        JSON.parse(jsonUsage.stdout.trim()) as {
+          error: { data: { acpxCode: string } };
+        }
+      ).error.data.acpxCode,
+      "USAGE",
+      jsonUsage.stdout,
+    );
+
     const unknownOption = await runCli(
       [...deferArgs, "respond", requestId, "--option", "not-offered"],
       homeDir,
