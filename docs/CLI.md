@@ -364,6 +364,7 @@ Output:
 
 ```bash
 acpx [global_options] <agent> respond <request-id> --option <optionId> [-s <name>]
+acpx [global_options] <agent> respond <request-id> --accept [--field <key>=<value> ...]
 acpx [global_options] <agent> respond <request-id> --field <key>=<value> [--field ...]
 acpx [global_options] <agent> respond <request-id> --text <answer>
 acpx [global_options] <agent> respond <request-id> --decline
@@ -371,10 +372,11 @@ acpx [global_options] <agent> respond <request-id> --cancel
 acpx [global_options] respond <request-id> --option allow   # defaults to codex
 ```
 
-Answers one parked request. Exactly one answer is required: `--option`, the `--field`/`--text` form group, `--decline`, or `--cancel`.
+Answers one parked request. Exactly one answer is required: `--option`, the `--accept`/`--field`/`--text` form group, `--decline`, or `--cancel`.
 
 - `--option <optionId>`: answer a **permission request** with one of the option ids the agent offered (see `requests`). Refused for an elicitation, which has no options.
-- `--field <key>=<value>`: fill in one field of an **elicitation** form. Repeatable, one field per flag. Refused for a permission request.
+- `--accept`: accept an **elicitation** form, carrying whatever `--field` values are given alongside it. On its own it accepts with empty content, which is the only way to answer a form that declares no properties at all — a shape ACP allows. It still cannot skip a required field. `--accept` and `--text` cannot be combined, because `--text` already accepts.
+- `--field <key>=<value>`: fill in one field of an **elicitation** form. Repeatable. Refused for a permission request.
 - `--text <answer>`: fill in an elicitation form that has **exactly one** field. Refused otherwise, naming the fields so you can pick one with `--field`. Note that `claude-agent-acp` pairs every AskUserQuestion question with its own free-text field, so even a one-question form has two fields and needs `--field`.
 - `--decline`: for a permission request, answer with the rejection option the agent offered — refused when the agent offered none, so pick an option or cancel instead. For an elicitation, decline the form; the agent is told it was skipped and the turn carries on.
 - `--cancel`: cancel the request without answering it. The turn continues; the agent sees a cancelled request.
@@ -393,7 +395,7 @@ Anything that does not fit is a usage error rather than a guess: a value the sch
 
 The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. `respond` waits indefinitely for the owner to confirm, because an answer already on the wire may be applied at any moment. A caller that cannot wait — a turn with a run budget, say — passes the global `--timeout <seconds>`: `respond` then gives up with exit `3` and `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`. The bound covers the whole operation, both reaching the owner and waiting for its confirmation, and the message says which ran out. If the owner was reached, **the answer may still be applied afterwards**, so treat it as unknown rather than failed and re-read the request before retrying; if the owner could never be reached, nothing was delivered and the request is still parked.
 
-Once answered the request is terminal, with `resolution.source: "cli"`: `answered` for `--option`, `--field`/`--text` and `--decline`, `cancelled` for `--cancel`. An elicitation also records `resolution.action` (`accept`, `decline` or `cancel`); the content of an accepted form is not persisted.
+Once answered the request is terminal, with `resolution.source: "cli"`: `answered` for `--option`, the form group and `--decline`, `cancelled` for `--cancel`. An elicitation also records `resolution.action` (`accept`, `decline` or `cancel`); the content of an accepted form is not persisted.
 
 Output is the resulting store entry: the persisted JSON object under `--json`, a one-line summary in text, and the resulting state in quiet.
 

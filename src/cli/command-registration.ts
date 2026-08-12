@@ -311,8 +311,8 @@ export function registerAgentCommand(
     setMode: "Set session mode",
     setConfig: "Set session config option",
     status: "Show local status of current session agent process",
-    requests: "List permission requests parked by --defer",
-    respond: "Answer a parked permission request",
+    requests: "List permission requests and elicitations parked by --defer",
+    respond: "Answer a parked permission request or elicitation",
   });
 
   registerSessionsCommand(agentCommand, agentName, config);
@@ -348,8 +348,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
     setMode: `Set session mode for ${config.defaultAgent} by default`,
     setConfig: `Set session config option for ${config.defaultAgent} by default`,
     status: `Show local status for ${config.defaultAgent} by default`,
-    requests: `List parked permission requests for ${config.defaultAgent} by default`,
-    respond: `Answer a parked permission request for ${config.defaultAgent} by default`,
+    requests: `List parked permission requests and elicitations for ${config.defaultAgent} by default`,
+    respond: `Answer a parked permission request or elicitation for ${config.defaultAgent} by default`,
   });
 
   registerSessionsCommand(program, undefined, config);

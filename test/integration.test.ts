@@ -6859,3 +6859,85 @@ test("integration: form elicitation is advertised only when the owner can park",
     }
   });
 });
+
+test("integration: --accept answers a form that has nothing to fill in", async () => {
+  // A zero-property schema is valid ACP. Without --accept the only answers
+  // acpx could give were decline and cancel, so "accepted, with nothing to
+  // say" was unreachable.
+  const emptySchema = JSON.stringify({ type: "object", properties: {} });
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+      const accepted = await runCli(
+        [...deferArgs, "--format", "json", "respond", requestId, "--accept"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(accepted.code, 0, `${accepted.stdout}${accepted.stderr}`);
+      const payload = JSON.parse(accepted.stdout.trim()) as {
+        state: string;
+        resolution?: { action?: string };
+      };
+      assert.equal(payload.state, "answered");
+      assert.equal(payload.resolution?.action, "accept");
+
+      await waitFor(async () => {
+        const stream = await readSessionStream(homeDir);
+        return stream.includes("elicitation accepted:{}") ? "done" : null;
+      }, 25_000);
+    },
+    elicitPrompt(emptySchema, "Nothing to fill in"),
+  );
+});
+
+test("integration: a comma-bearing option is refused as a list and reachable when repeated", async () => {
+  // The hazard the multi-select sugar carries: an offered value may itself
+  // contain a comma, and then no escaping makes a comma-separated list
+  // readable. Repeating --field is what reaches it.
+  const commaSchema = JSON.stringify({
+    type: "object",
+    properties: {
+      picks: { type: "array", items: { type: "string", enum: ["x,y", "z"] } },
+    },
+  });
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+
+      const refused = await runCli(
+        [...deferArgs, "respond", requestId, "--field", "picks=x,y"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(refused.code, 2, `${refused.stdout}${refused.stderr}`);
+      assert.match(`${refused.stdout}${refused.stderr}`, /cannot be read unambiguously/);
+      // Refusing to answer leaves the request answerable.
+      assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+
+      const accepted = await runCli(
+        [
+          ...deferArgs,
+          "--format",
+          "json",
+          "respond",
+          requestId,
+          "--field",
+          "picks=z",
+          "--field",
+          "picks=x,y",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(accepted.code, 0, `${accepted.stdout}${accepted.stderr}`);
+
+      // The agent echoes what it received: the two values, one of which contains
+      // the comma that could never have survived a split.
+      await waitFor(async () => {
+        const stream = await readSessionStream(homeDir);
+        return stream.includes('picks\\":[\\"z\\",\\"x,y\\"]') ? "done" : null;
+      }, 25_000);
+    },
+    elicitPrompt(commaSchema, "Pick some"),
+  );
+});

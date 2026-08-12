@@ -33,6 +33,7 @@ export type RequestsListFlags = {
 
 export type RespondFlags = {
   option?: string;
+  accept?: boolean;
   field?: string[];
   text?: string;
   decline?: boolean;
@@ -78,26 +79,44 @@ type RespondArm = "option" | "form" | "decline" | "cancel";
 function namedRespondArms(flags: RespondFlags): RespondArm[] {
   const named: Array<[RespondArm, boolean]> = [
     ["option", flags.option !== undefined],
-    ["form", (flags.field?.length ?? 0) > 0 || flags.text !== undefined],
+    // One arm, three ways to name it: --accept says "accepted" outright, and
+    // --field/--text imply it by filling something in.
+    ["form", flags.accept === true || (flags.field?.length ?? 0) > 0 || flags.text !== undefined],
     ["decline", flags.decline === true],
     ["cancel", flags.cancel === true],
   ];
   return named.filter(([, chosen]) => chosen).map(([arm]) => arm);
 }
 
-function resolveRespondArm(flags: RespondFlags): RespondArm {
-  const [arm, ...rest] = namedRespondArms(flags);
-  if (arm === undefined || rest.length > 0) {
-    throw new InvalidArgumentError(
-      "Answer a request with exactly one of --option <optionId>, --field <key>=<value> " +
-        "(repeatable), --text <answer>, --decline, or --cancel",
-    );
+/**
+ * `--text` already says both "accept" and "this is the value", so pairing it
+ * with either of the other two form flags asks for the same thing twice.
+ */
+function assertFormFlagsAgree(flags: RespondFlags): void {
+  if (flags.text === undefined) {
+    return;
   }
-  if ((flags.field?.length ?? 0) > 0 && flags.text !== undefined) {
+  if ((flags.field?.length ?? 0) > 0) {
     throw new InvalidArgumentError(
       "--text and --field both name the field being answered; use one or the other",
     );
   }
+  if (flags.accept === true) {
+    throw new InvalidArgumentError(
+      "--text already accepts the form; pass --accept with --field, or --text on its own",
+    );
+  }
+}
+
+function resolveRespondArm(flags: RespondFlags): RespondArm {
+  const [arm, ...rest] = namedRespondArms(flags);
+  if (arm === undefined || rest.length > 0) {
+    throw new InvalidArgumentError(
+      "Answer a request with exactly one of --option <optionId>, --accept, --field <key>=<value> " +
+        "(repeatable), --text <answer>, --decline, or --cancel",
+    );
+  }
+  assertFormFlagsAgree(flags);
   return arm;
 }
 
@@ -539,8 +558,12 @@ export function registerRequestsCommands(
       parseNonEmptyValue("Option id", value),
     )
     .option(
+      "--accept",
+      "Accept an elicitation form, with whatever --field values are given (none is valid when the form requires nothing)",
+    )
+    .option(
       "--field <key=value>",
-      "Fill in one field of an elicitation form; repeat for more",
+      "Fill in one field of an elicitation form; repeat for a multi-select, or for more fields",
       collectFieldFlag,
     )
     .option("--text <answer>", "Fill in an elicitation form that has exactly one field")
