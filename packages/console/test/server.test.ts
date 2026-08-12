@@ -1,0 +1,359 @@
+import assert from "node:assert/strict";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import type { ResolvedConsoleConfig } from "../src/config.js";
+import { startAcpxConsoleServer } from "../src/server.js";
+import { MockSessionService } from "./helpers.js";
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-server-"));
+  const web = join(root, "web");
+  const workspace = join(root, "workspace");
+  await Promise.all([mkdir(web), mkdir(workspace)]);
+  await writeFile(join(web, "index.html"), "<!doctype html><title>ACPX Console</title>");
+  const config: ResolvedConsoleConfig = {
+    host: "127.0.0.1",
+    port: 0,
+    trustNetwork: false,
+    allowedHosts: ["127.0.0.1", "localhost"],
+    workspaceRoots: [workspace],
+    stateDir: join(root, "state"),
+    staticDir: web,
+  };
+  const service = new MockSessionService();
+  const running = await startAcpxConsoleServer({
+    config,
+    service,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  return { root, workspace, service, running };
+}
+
+async function bootstrap(origin: string) {
+  const response = await fetch(`${origin}/api/v1/bootstrap`);
+  assert.equal(response.status, 200);
+  const cookie = response.headers.get("set-cookie")?.split(";", 1)[0];
+  const body = (await response.json()) as { csrfToken: string };
+  assert.ok(cookie);
+  return { cookie: cookie, csrfToken: body.csrfToken };
+}
+
+function mutationHeaders(auth: { cookie: string; csrfToken: string }, key = "request-12345") {
+  return {
+    "Content-Type": "application/json",
+    Cookie: auth.cookie,
+    "X-CSRF-Token": auth.csrfToken,
+    "Idempotency-Key": key,
+  };
+}
+
+async function requestWithHost(
+  origin: string,
+  host: string,
+): Promise<{ status: number; body: string }> {
+  const url = new URL(origin);
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      { hostname: url.hostname, port: url.port, path: "/healthz", headers: { Host: host } },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk: string) => (body += chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body }));
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
+}
+
+test("bootstrap returns the source snapshot and hardened response headers", async () => {
+  const { running } = await fixture();
+  try {
+    const response = await fetch(`${running.origin}/api/v1/bootstrap`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-security-policy") ?? "", /default-src 'self'/);
+    assert.equal(response.headers.get("access-control-allow-origin"), null);
+    const body = (await response.json()) as {
+      version: number;
+      sessions: unknown[];
+      agents: unknown[];
+    };
+    assert.equal(body.version, 1);
+    assert.equal(body.sessions.length, 1);
+    assert.equal(body.agents.length, 1);
+  } finally {
+    await running.close();
+  }
+});
+
+test("mutations require CSRF and idempotency, then forward exact session ids", async () => {
+  const { running, service } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    const unauthenticated = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "hello" }),
+    });
+    assert.equal(unauthenticated.status, 403);
+
+    const missingKeyHeaders = mutationHeaders(auth);
+    delete (missingKeyHeaders as Partial<typeof missingKeyHeaders>)["Idempotency-Key"];
+    const missingKey = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: missingKeyHeaders,
+      body: JSON.stringify({ text: "hello" }),
+    });
+    assert.equal(missingKey.status, 428);
+
+    const accepted = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: mutationHeaders(auth),
+      body: JSON.stringify({ text: "hello" }),
+    });
+    assert.equal(accepted.status, 202);
+    assert.deepEqual(await accepted.json(), { turnId: "turn-1", admission: "started" });
+    assert.deepEqual(service.calls.at(-1), {
+      method: "enqueuePrompt",
+      input: { acpxRecordId: "record-1", text: "hello", idempotencyKey: "request-12345" },
+    });
+  } finally {
+    await running.close();
+  }
+});
+
+test("session creation enforces the configured real workspace boundary", async () => {
+  const { running, workspace } = await fixture();
+  const outside = await mkdtemp(join(tmpdir(), "acpx-console-denied-"));
+  try {
+    const auth = await bootstrap(running.origin);
+    const denied = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth),
+      body: JSON.stringify({ agentId: "codex", cwd: outside }),
+    });
+    assert.equal(denied.status, 400);
+    const allowed = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "request-67890"),
+      body: JSON.stringify({ agentId: "codex", cwd: workspace }),
+    });
+    assert.equal(allowed.status, 201);
+    const unsafe = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "request-policy-unsafe"),
+      body: JSON.stringify({
+        agentId: "codex",
+        cwd: workspace,
+        policy: { defaultAction: "approve" },
+      }),
+    });
+    assert.equal(unsafe.status, 400);
+    assert.equal(
+      ((await unsafe.json()) as { error: { code: string } }).error.code,
+      "INVALID_PERMISSION_POLICY",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
+test("an unapproved Host header is rejected", async () => {
+  const { running } = await fixture();
+  try {
+    const response = await requestWithHost(running.origin, "evil.example");
+    assert.equal(response.status, 403);
+    assert.equal(
+      (JSON.parse(response.body) as { error: { code: string } }).error.code,
+      "HOST_NOT_ALLOWED",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
+test("SPA routes fall back to installed web assets but API typos remain JSON 404s", async () => {
+  const { running } = await fixture();
+  try {
+    const page = await fetch(`${running.origin}/sessions/record-1`);
+    assert.equal(page.status, 200);
+    assert.match(await page.text(), /ACPX Console/);
+    const head = await fetch(`${running.origin}/sessions/record-1`, { method: "HEAD" });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), "");
+    const api = await fetch(`${running.origin}/api/v1/not-real`);
+    assert.equal(api.status, 404);
+    assert.equal(api.headers.get("content-type"), "application/json; charset=utf-8");
+  } finally {
+    await running.close();
+  }
+});
+
+test("mutation rate limits are bounded per direct client", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-rate-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const running = await startAcpxConsoleServer({
+    config: {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [root],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service: new MockSessionService(),
+    mutationRateLimit: { maxRequests: 1, windowMs: 60_000 },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  try {
+    const auth = await bootstrap(running.origin);
+    const rejected = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: auth.cookie,
+        "X-CSRF-Token": "wrong-token",
+        "Idempotency-Key": "invalid-auth-key",
+      },
+      body: JSON.stringify({ text: "not authorized" }),
+    });
+    assert.equal(rejected.status, 403);
+    const first = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "rate-key-111"),
+      body: JSON.stringify({ text: "one" }),
+    });
+    assert.equal(first.status, 202);
+    const limited = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "rate-key-222"),
+      body: JSON.stringify({ text: "two" }),
+    });
+    assert.equal(limited.status, 429);
+  } finally {
+    await running.close();
+  }
+});
+
+test("untyped service failures do not expose adapter details or local paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-error-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const service = new MockSessionService();
+  service.listSessions = async () => {
+    throw new Error("provider token SECRET from /Users/operator/private.json");
+  };
+  const logged: unknown[] = [];
+  const running = await startAcpxConsoleServer({
+    config: {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [root],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service,
+    logger: {
+      info() {},
+      warn() {},
+      error(value) {
+        logged.push(value);
+      },
+    },
+  });
+  try {
+    const response = await fetch(`${running.origin}/api/v1/sessions`);
+    assert.equal(response.status, 500);
+    const text = await response.text();
+    assert.doesNotMatch(text, /SECRET|operator|private\.json/);
+    assert.match(text, /INTERNAL_ERROR/);
+    assert.equal(logged.length, 1);
+  } finally {
+    await running.close();
+  }
+});
+
+test("session detail, provider inventory, timeline, pending, cancellation, response and close routes keep exact ids", async () => {
+  const { running, service } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    const detail = await fetch(`${running.origin}/api/v1/sessions/record-1`);
+    assert.equal(detail.status, 200);
+    assert.equal(
+      ((await detail.json()) as { session: { acpxRecordId: string } }).session.acpxRecordId,
+      "record-1",
+    );
+    const provider = await fetch(`${running.origin}/api/v1/agents/codex/sessions?cursor=next`);
+    assert.equal(provider.status, 200);
+    assert.equal(((await provider.json()) as { sessions: unknown[] }).sessions.length, 1);
+    assert.equal(service.calls.at(-1)?.method, "listProviderSessions");
+
+    const timeline = await fetch(`${running.origin}/api/v1/sessions/record-1/timeline?limit=20`);
+    assert.deepEqual(await timeline.json(), { items: [], hasMore: false, coverage: "complete" });
+    const pending = await fetch(`${running.origin}/api/v1/sessions/record-1/pending`);
+    assert.equal(((await pending.json()) as { pending: unknown[] }).pending.length, 1);
+
+    const answered = await fetch(
+      `${running.origin}/api/v1/sessions/record-1/pending/request-1/responses`,
+      {
+        method: "POST",
+        headers: mutationHeaders(auth, "answer-key-123"),
+        body: JSON.stringify({ response: { type: "select", option_id: "allow" } }),
+      },
+    );
+    assert.equal(answered.status, 200);
+    assert.equal(service.calls.at(-1)?.method, "respondToPendingRequest");
+
+    const cancelled = await fetch(
+      `${running.origin}/api/v1/sessions/record-1/turns/turn-1/cancel`,
+      {
+        method: "POST",
+        headers: mutationHeaders(auth, "cancel-key-123"),
+        body: "{}",
+      },
+    );
+    assert.equal(cancelled.status, 202);
+    assert.equal(service.calls.at(-1)?.method, "cancelTurn");
+
+    const closed = await fetch(`${running.origin}/api/v1/sessions/record-1/close`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "close-key-1234"),
+      body: "{}",
+    });
+    assert.equal(closed.status, 200);
+    assert.equal(service.calls.at(-1)?.method, "closeSession");
+  } finally {
+    await running.close();
+  }
+});
+
+test("event streams have an explicit client cap", async () => {
+  const { running } = await fixture();
+  const streams: Response[] = [];
+  try {
+    for (let index = 0; index < 64; index++) {
+      const response = await fetch(`${running.origin}/api/v1/events`);
+      assert.equal(response.status, 200);
+      streams.push(response);
+    }
+    const refused = await fetch(`${running.origin}/api/v1/events`);
+    assert.equal(refused.status, 503);
+    assert.equal(
+      ((await refused.json()) as { error: { code: string } }).error.code,
+      "SSE_CAPACITY",
+    );
+  } finally {
+    await Promise.all(streams.map(async (response) => await response.body?.cancel()));
+    await running.close();
+  }
+});
