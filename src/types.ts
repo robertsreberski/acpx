@@ -1,6 +1,8 @@
 import type {
   AgentCapabilities,
   AnyMessage,
+  CreateElicitationRequest,
+  ElicitationContentValue,
   McpServer,
   RequestPermissionRequest,
   SessionNotification,
@@ -46,6 +48,52 @@ export type AcpPermissionDecision =
   | { outcome: "reject_once" }
   | { outcome: "reject_always" }
   | { outcome: "select"; optionId: string }
+  | { outcome: "cancel" };
+
+/**
+ * A form elicitation, already narrowed out of ACP's request union.
+ *
+ * `CreateElicitationRequest` spans form mode, url mode and future modes, and
+ * only some arms carry a session or a tool call. acpx advertises form mode
+ * only, so the narrowing happens once at the ACP boundary and every consumer
+ * downstream gets the fields it can actually rely on. `raw` is kept for hosts
+ * that need something acpx did not model.
+ */
+export type AcpElicitationRequest = {
+  /**
+   * The session the elicitation belongs to. Absent for a request-scoped
+   * elicitation, which ACP allows outside any session (during authentication,
+   * say) and which therefore cannot be cancelled by cancelling a session.
+   */
+  sessionId?: string;
+  /** Human-readable description of what the agent is asking for. */
+  message: string;
+  /** The agent's JSON Schema for the form, verbatim. */
+  requestedSchema: Record<string, unknown>;
+  /** Set when the agent scoped the elicitation to one of its tool calls. */
+  toolCallId?: string;
+  raw: CreateElicitationRequest;
+};
+
+/**
+ * Context handed to a host elicitation hook.
+ *
+ * Deliberately thinner than the permission one: an elicitation is a form the
+ * agent wants filled in, not a decision acpx has a policy about, so there is no
+ * "what acpx would have done" to describe. `signal` is the session's, so a
+ * cancelled turn or a closed client unwinds a hook that is still waiting.
+ */
+export type AcpElicitationRequestContext = {
+  signal: AbortSignal;
+};
+
+/**
+ * How a host answers an elicitation. Mirrors ACP's three response actions, in
+ * the `outcome` vocabulary the permission decision already uses.
+ */
+export type AcpElicitationDecision =
+  | { outcome: "accept"; content?: Record<string, ElicitationContentValue> }
+  | { outcome: "decline" }
   | { outcome: "cancel" };
 
 export const EXIT_CODES = {
@@ -292,6 +340,18 @@ export type AcpClientOptions = {
     req: AcpPermissionRequest,
     ctx: AcpPermissionRequestContext,
   ) => Promise<AcpPermissionDecision | undefined>;
+  /**
+   * Answer an agent's form elicitation.
+   *
+   * Installing this hook is also what makes acpx advertise form elicitation to
+   * the agent: the capability says "someone here can answer a form", and
+   * nothing else in acpx can. A hook that returns `undefined` declines, because
+   * an unanswered elicitation would block the agent's turn indefinitely.
+   */
+  onElicitationRequest?: (
+    req: AcpElicitationRequest,
+    ctx: AcpElicitationRequestContext,
+  ) => Promise<AcpElicitationDecision | undefined>;
 };
 
 export const SESSION_RECORD_SCHEMA = "acpx.session.v1" as const;

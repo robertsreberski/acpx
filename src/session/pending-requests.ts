@@ -24,8 +24,12 @@ export const PENDING_REQUEST_STATES = [
 ] as const;
 export type PendingRequestState = (typeof PENDING_REQUEST_STATES)[number];
 
-/** `elicitation` is reserved for a later milestone and is not accepted yet. */
-export const PENDING_REQUEST_KINDS = ["permission"] as const;
+/**
+ * What the agent is waiting on. A `permission` request offers options to pick
+ * from; an `elicitation` asks for a form to be filled in. They park, expire and
+ * unwind identically — only the shape of the question and of its answer differ.
+ */
+export const PENDING_REQUEST_KINDS = ["permission", "elicitation"] as const;
 export type PendingRequestKind = (typeof PENDING_REQUEST_KINDS)[number];
 
 export const PENDING_REQUEST_RESOLUTION_SOURCES = ["cli", "expiry", "cancel", "shutdown"] as const;
@@ -47,11 +51,35 @@ export type PendingRequestToolCall = {
 export type PendingRequestResolution = {
   answeredAt: string;
   source: PendingRequestResolutionSource;
+  /** Which option a permission request was settled with. */
   optionId?: string;
+  /**
+   * Which ACP action an elicitation was settled with (`accept`, `decline` or
+   * `cancel`). The content of an accepted form is deliberately not recorded:
+   * the store is a ledger of what was asked and how it was closed, and the
+   * answer itself is user-authored text whose only destination is the turn.
+   */
   action?: string;
 };
 
-export type PendingRequest = {
+/**
+ * The agent's form request, kept verbatim.
+ *
+ * `requestedSchema` is the agent's own JSON Schema, stored exactly as it
+ * arrived. A responder types its answer against it, so normalizing it here
+ * would make adapter-specific forms unanswerable — claude-agent-acp renders
+ * AskUserQuestion as a titled `oneOf` enum paired with a free-text field, and
+ * both halves matter.
+ */
+export type PendingRequestElicitation = {
+  message: string;
+  mode: "form";
+  requestedSchema: Record<string, unknown>;
+  /** Set when the agent scoped the elicitation to one of its tool calls. */
+  toolCallId?: string;
+};
+
+type PendingRequestCommon = {
   schema: typeof PENDING_REQUEST_SCHEMA;
   requestId: string;
   /** acpx session record id; also the on-disk directory for this session. */
@@ -59,7 +87,6 @@ export type PendingRequest = {
   acpSessionId: string;
   agentCommand: string;
   cwd: string;
-  kind: PendingRequestKind;
   state: PendingRequestState;
   createdAt: string;
   updatedAt: string;
@@ -67,6 +94,11 @@ export type PendingRequest = {
   ownerPid: number;
   ownerGeneration: number;
   taskRequestId: string;
+  resolution?: PendingRequestResolution;
+};
+
+export type PendingPermissionRequest = PendingRequestCommon & {
+  kind: "permission";
   toolCall: PendingRequestToolCall;
   /**
    * The agent's full option list, verbatim. A responder echoes one of these ids
@@ -74,25 +106,57 @@ export type PendingRequest = {
    * (plan mode, for example) unanswerable.
    */
   options: PendingRequestOption[];
-  resolution?: PendingRequestResolution;
 };
+
+export type PendingElicitationRequest = PendingRequestCommon & {
+  kind: "elicitation";
+  elicitation: PendingRequestElicitation;
+};
+
+export type PendingRequest = PendingPermissionRequest | PendingElicitationRequest;
+
+/** Values a form field can carry. Mirrors ACP's `ElicitationContentValue`. */
+export type PendingRequestContentValue = string | number | boolean | string[];
 
 /**
  * How a responder answers a parked request.
  *
- * The union is explicitly tagged. A later arm (an `accept` carrying content,
- * say) must be a new tag rather than a new key on an existing shape, because
- * key-sniffing would silently read the new arm as an old one. `option_id` is
- * spelled the way the stored entry spells it, so a responder can echo back an
- * id it read straight out of a listed entry.
+ * The union is explicitly tagged: `accept` is its own arm rather than a new key
+ * on an existing shape, because key-sniffing would silently read one arm as
+ * another. `option_id` is spelled the way the stored entry spells it, so a
+ * responder can echo back an id it read straight out of a listed entry.
+ *
+ * `select` answers a permission request and `accept` an elicitation; `decline`
+ * and `cancel` answer either, and mean the same thing to both.
  */
 export type PendingRequestAnswer =
   | { type: "select"; option_id: string }
+  | { type: "accept"; content: Record<string, PendingRequestContentValue> }
   | { type: "decline" }
   | { type: "cancel" };
 
 export function isTerminalPendingRequestState(state: PendingRequestState): boolean {
   return state !== "pending";
+}
+
+/**
+ * The form's property definitions, or an empty map when the agent sent a schema
+ * with none. Reading them is how both the listing and the responder learn what
+ * an elicitation can be answered with.
+ */
+export function elicitationSchemaProperties(
+  entry: PendingElicitationRequest,
+): Record<string, unknown> {
+  const properties = entry.elicitation.requestedSchema.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    return {};
+  }
+  return properties as Record<string, unknown>;
+}
+
+/** The form's field names, in the order the agent declared them. */
+export function elicitationFieldNames(entry: PendingElicitationRequest): string[] {
+  return Object.keys(elicitationSchemaProperties(entry));
 }
 
 export function pendingRequestsBaseDir(homeDir: string = os.homedir()): string {
@@ -123,6 +187,40 @@ export function pendingRequestFilePath(
   );
 }
 
+/**
+ * The question half of an entry, in its persisted spelling.
+ *
+ * Both kinds always carry `options`, empty for an elicitation. A reader that
+ * already walks the option list of every entry keeps working, and an empty list
+ * says plainly that there is nothing here to pick from.
+ */
+function serializePendingRequestSubject(entry: PendingRequest): Record<string, unknown> {
+  if (entry.kind === "elicitation") {
+    return {
+      options: [],
+      elicitation: {
+        message: entry.elicitation.message,
+        mode: entry.elicitation.mode,
+        ...(entry.elicitation.toolCallId ? { tool_call_id: entry.elicitation.toolCallId } : {}),
+        requested_schema: entry.elicitation.requestedSchema,
+      },
+    };
+  }
+  return {
+    tool_call: {
+      tool_call_id: entry.toolCall.toolCallId,
+      title: entry.toolCall.title,
+      ...(entry.toolCall.kind ? { kind: entry.toolCall.kind } : {}),
+      ...(entry.toolCall.rawInput !== undefined ? { raw_input: entry.toolCall.rawInput } : {}),
+    },
+    options: entry.options.map((option) => ({
+      option_id: option.optionId,
+      name: option.name,
+      kind: option.kind,
+    })),
+  };
+}
+
 export function serializePendingRequestForDisk(entry: PendingRequest): Record<string, unknown> {
   return {
     schema: PENDING_REQUEST_SCHEMA,
@@ -139,17 +237,7 @@ export function serializePendingRequestForDisk(entry: PendingRequest): Record<st
     owner_pid: entry.ownerPid,
     owner_generation: entry.ownerGeneration,
     task_request_id: entry.taskRequestId,
-    tool_call: {
-      tool_call_id: entry.toolCall.toolCallId,
-      title: entry.toolCall.title,
-      ...(entry.toolCall.kind ? { kind: entry.toolCall.kind } : {}),
-      ...(entry.toolCall.rawInput !== undefined ? { raw_input: entry.toolCall.rawInput } : {}),
-    },
-    options: entry.options.map((option) => ({
-      option_id: option.optionId,
-      name: option.name,
-      kind: option.kind,
-    })),
+    ...serializePendingRequestSubject(entry),
     ...(entry.resolution
       ? {
           resolution: {
@@ -285,6 +373,30 @@ function parseRequiredScalars(record: Record<string, unknown>): RequiredScalars 
   return scalars as RequiredScalars;
 }
 
+/**
+ * The agent's form request. `message` and a `form` mode are required, and the
+ * schema must be an object — an entry without them describes no answerable
+ * question, and a responder would have nothing to type against.
+ *
+ * Only `form` is accepted: it is the only mode acpx advertises, so a stored
+ * entry in any other mode was never one this client could have answered.
+ */
+function parseElicitation(value: unknown): PendingRequestElicitation | undefined {
+  const record = asRecord(value);
+  const message = asNonEmptyString(record?.message);
+  const requestedSchema = asRecord(record?.requested_schema);
+  if (!record || !message || !requestedSchema || record.mode !== "form") {
+    return undefined;
+  }
+  const toolCallId = asNonEmptyString(record.tool_call_id);
+  return {
+    message,
+    mode: "form",
+    requestedSchema,
+    ...(toolCallId ? { toolCallId } : {}),
+  };
+}
+
 type PendingRequestEnums = { kind: PendingRequestKind; state: PendingRequestState };
 
 function parseEnums(record: Record<string, unknown>): PendingRequestEnums | undefined {
@@ -310,23 +422,44 @@ function parseOwner(record: Record<string, unknown>): PendingRequestOwner | unde
   return { ownerPid: ownerPid as number, ownerGeneration: ownerGeneration as number };
 }
 
-type PendingRequestParts = RequiredScalars &
-  PendingRequestEnums &
-  PendingRequestOwner &
-  Pick<PendingRequest, "toolCall" | "options">;
+type PendingRequestParts = RequiredScalars & PendingRequestEnums & PendingRequestOwner;
+
+type PendingRequestSubject =
+  | Pick<PendingPermissionRequest, "kind" | "toolCall" | "options">
+  | Pick<PendingElicitationRequest, "kind" | "elicitation">;
+
+/**
+ * The half of an entry that its kind decides.
+ *
+ * Each kind is parsed against its own requirements rather than a union of
+ * everything: a permission entry with no options and an elicitation entry with
+ * no form are both unanswerable, and reading either as the other kind would
+ * hand a responder a request it cannot possibly settle.
+ */
+function parsePendingRequestSubject(
+  kind: PendingRequestKind,
+  record: Record<string, unknown>,
+): PendingRequestSubject | undefined {
+  if (kind === "elicitation") {
+    const elicitation = parseElicitation(record.elicitation);
+    return elicitation ? { kind, elicitation } : undefined;
+  }
+  const toolCall = parseToolCall(record.tool_call);
+  const options = parseOptions(record.options);
+  return toolCall && options ? { kind, toolCall, options } : undefined;
+}
 
 function parsePendingRequestParts(
   record: Record<string, unknown>,
-): PendingRequestParts | undefined {
+): (PendingRequestParts & { subject: PendingRequestSubject }) | undefined {
   const scalars = parseRequiredScalars(record);
   const enums = parseEnums(record);
   const owner = parseOwner(record);
-  const toolCall = parseToolCall(record.tool_call);
-  const options = parseOptions(record.options);
-  if (!scalars || !enums || !owner || !toolCall || !options) {
+  if (!scalars || !enums || !owner) {
     return undefined;
   }
-  return { ...scalars, ...enums, ...owner, toolCall, options };
+  const subject = parsePendingRequestSubject(enums.kind, record);
+  return subject ? { ...scalars, ...enums, ...owner, subject } : undefined;
 }
 
 export function parsePendingRequest(value: unknown): PendingRequest | undefined {
@@ -341,26 +474,79 @@ export function parsePendingRequest(value: unknown): PendingRequest | undefined 
     return undefined;
   }
 
+  const { subject, kind: _kind, ...rest } = parts;
   const expiresAt = asNonEmptyString(record.expires_at);
   return {
     schema: PENDING_REQUEST_SCHEMA,
-    ...parts,
+    ...rest,
+    ...subject,
     ...(expiresAt ? { expiresAt } : {}),
     ...(resolution.resolution ? { resolution: resolution.resolution } : {}),
   };
 }
 
+function parseAnswerContentValue(value: unknown): PendingRequestContentValue | undefined {
+  if (typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * Form content, validated field by field.
+ *
+ * A field whose value is not one of ACP's content types rejects the whole
+ * answer rather than being dropped: a silently pruned field is an answer the
+ * responder never gave, and the agent cannot tell the two apart.
+ */
+function parseAnswerContent(
+  value: unknown,
+): Record<string, PendingRequestContentValue> | undefined {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  const content: Record<string, PendingRequestContentValue> = {};
+  for (const [field, raw] of Object.entries(record)) {
+    const parsed = parseAnswerContentValue(raw);
+    if (parsed === undefined) {
+      return undefined;
+    }
+    content[field] = parsed;
+  }
+  return content;
+}
+
+function parseSelectAnswer(record: Record<string, unknown>): PendingRequestAnswer | undefined {
+  const optionId = asNonEmptyString(record.option_id);
+  return optionId ? { type: "select", option_id: optionId } : undefined;
+}
+
+function parseAcceptAnswer(record: Record<string, unknown>): PendingRequestAnswer | undefined {
+  const content = parseAnswerContent(record.content);
+  return content ? { type: "accept", content } : undefined;
+}
+
 /** Parse an answer that crossed a process boundary. Unknown tags are rejected. */
 export function parsePendingRequestAnswer(value: unknown): PendingRequestAnswer | undefined {
   const record = asRecord(value);
-  if (record?.type === "decline" || record?.type === "cancel") {
-    return { type: record.type };
+  switch (record?.type) {
+    case "decline":
+    case "cancel":
+      return { type: record.type };
+    case "select":
+      return parseSelectAnswer(record);
+    case "accept":
+      return parseAcceptAnswer(record);
+    default:
+      return undefined;
   }
-  if (record?.type !== "select") {
-    return undefined;
-  }
-  const optionId = asNonEmptyString(record.option_id);
-  return optionId ? { type: "select", option_id: optionId } : undefined;
 }
 
 export async function writePendingRequest(

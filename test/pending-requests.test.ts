@@ -16,11 +16,70 @@ import {
   serializePendingRequestForDisk,
   sweepPendingRequests,
   writePendingRequest,
-  type PendingRequest,
+  type PendingElicitationRequest,
+  type PendingPermissionRequest,
 } from "../src/session/pending-requests.js";
 import { withTempHome } from "./queue-test-helpers.js";
 
-function makeEntry(overrides: Partial<PendingRequest> = {}): PendingRequest {
+/** The AskUserQuestion shape claude-agent-acp actually sends, in miniature. */
+function askUserQuestionSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      question_0: {
+        type: "string",
+        title: "Greeting",
+        oneOf: [
+          { const: "Greeting A", title: "Greeting A" },
+          { const: "Greeting B", title: "Greeting B", description: "The other one" },
+        ],
+      },
+      question_0_custom: {
+        type: "string",
+        title: "Other",
+        _meta: { _askUserQuestionCustomAnswer: { questionId: "question_0" } },
+      },
+    },
+  };
+}
+
+function makeElicitation(): Record<string, unknown> {
+  return {
+    message: "Which greeting should I use?",
+    mode: "form",
+    tool_call_id: "tool-ask",
+    requested_schema: askUserQuestionSchema(),
+  };
+}
+
+function makeElicitationEntry(
+  overrides: Partial<PendingElicitationRequest> = {},
+): PendingElicitationRequest {
+  return {
+    schema: PENDING_REQUEST_SCHEMA,
+    requestId: "req-elicit-1",
+    sessionId: "session-record-1",
+    acpSessionId: "acp-session-1",
+    agentCommand: "node ./test/mock-agent.js",
+    cwd: "/workspace",
+    kind: "elicitation",
+    state: "pending",
+    createdAt: "2026-08-12T00:00:00.000Z",
+    updatedAt: "2026-08-12T00:00:00.000Z",
+    ownerPid: 4242,
+    ownerGeneration: 99,
+    taskRequestId: "task-1",
+    elicitation: {
+      message: "Which greeting should I use?",
+      mode: "form",
+      toolCallId: "tool-ask",
+      requestedSchema: askUserQuestionSchema(),
+    },
+    ...overrides,
+  };
+}
+
+function makeEntry(overrides: Partial<PendingPermissionRequest> = {}): PendingPermissionRequest {
   return {
     schema: PENDING_REQUEST_SCHEMA,
     requestId: "req-1",
@@ -63,7 +122,7 @@ test("pending request persists the full option list verbatim", async () => {
   await withTempHome(async () => {
     // Plan-mode option sets carry adapter-specific ids and names that a
     // responder must be able to echo back exactly.
-    const options: PendingRequest["options"] = [
+    const options: PendingPermissionRequest["options"] = [
       { optionId: "plan-accept-edits", name: "Accept edits", kind: "allow_always" },
       { optionId: "plan-once", name: "Allow once", kind: "allow_once" },
       { optionId: "plan-reject", name: "Keep planning", kind: "reject_once" },
@@ -73,7 +132,8 @@ test("pending request persists the full option list verbatim", async () => {
     await writePendingRequest(entry);
 
     const loaded = await readPendingRequest(entry.sessionId, entry.requestId);
-    assert.deepEqual(loaded?.options, options);
+    assert.equal(loaded?.kind, "permission");
+    assert.deepEqual(loaded?.kind === "permission" ? loaded.options : undefined, options);
   });
 });
 
@@ -309,7 +369,7 @@ test("an answer is only accepted when it carries its own tag", () => {
   assert.deepEqual(parsePendingRequestAnswer({ type: "decline" }), { type: "decline" });
   assert.deepEqual(parsePendingRequestAnswer({ type: "cancel" }), { type: "cancel" });
 
-  // An untagged payload must never be inferred from its keys: a later arm can
+  // An untagged payload must never be inferred from its keys: another arm can
   // carry the same key and would then be silently misread as this one.
   assert.equal(parsePendingRequestAnswer({ option_id: "allow" }), undefined);
   assert.equal(parsePendingRequestAnswer({ type: "select" }), undefined);
@@ -318,6 +378,97 @@ test("an answer is only accepted when it carries its own tag", () => {
   assert.equal(parsePendingRequestAnswer({ type: "accept", content: "later" }), undefined);
   assert.equal(parsePendingRequestAnswer("cancel"), undefined);
   assert.equal(parsePendingRequestAnswer(undefined), undefined);
+});
+
+test("an accept answer carries content typed the way ACP types form values", () => {
+  assert.deepEqual(
+    parsePendingRequestAnswer({
+      type: "accept",
+      content: { question_0: "Greeting A", count: 2, ready: true, picks: ["a", "b"] },
+    }),
+    {
+      type: "accept",
+      content: { question_0: "Greeting A", count: 2, ready: true, picks: ["a", "b"] },
+    },
+  );
+  // An empty form is a real answer: every field of an AskUserQuestion form is
+  // optional, so accepting without filling any in means "skip".
+  assert.deepEqual(parsePendingRequestAnswer({ type: "accept", content: {} }), {
+    type: "accept",
+    content: {},
+  });
+
+  // A field acpx cannot represent rejects the whole answer rather than being
+  // dropped: a pruned field is an answer the responder never gave, and the
+  // agent cannot tell that apart from one they deliberately left blank.
+  assert.equal(parsePendingRequestAnswer({ type: "accept" }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "accept", content: null }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "accept", content: [] }), undefined);
+  assert.equal(
+    parsePendingRequestAnswer({ type: "accept", content: { nested: { a: 1 } } }),
+    undefined,
+  );
+  assert.equal(
+    parsePendingRequestAnswer({ type: "accept", content: { mixed: ["a", 1] } }),
+    undefined,
+  );
+  assert.equal(
+    parsePendingRequestAnswer({ type: "accept", content: { count: Number.NaN } }),
+    undefined,
+  );
+});
+
+test("an elicitation entry round-trips with its schema verbatim", async () => {
+  await withTempHome(async () => {
+    const entry = makeElicitationEntry();
+    await writePendingRequest(entry);
+
+    const loaded = await readPendingRequest(entry.sessionId, entry.requestId);
+    assert.deepEqual(loaded, entry);
+
+    const persisted = serializePendingRequestForDisk(entry);
+    // The agent's schema is what a responder types against, so it is stored
+    // exactly as it arrived — camelCase JSON Schema keywords and `_meta` and
+    // all — under the same opaque-value exemption raw tool input gets.
+    assert.deepEqual(findPersistedKeyPolicyViolations(persisted), []);
+    assert.deepEqual(
+      (persisted.elicitation as { requested_schema?: unknown }).requested_schema,
+      entry.elicitation.requestedSchema,
+    );
+    // Both kinds carry `options`, so a reader that walks every entry's option
+    // list keeps working; empty says there is nothing here to pick from.
+    assert.deepEqual(persisted.options, []);
+    assert.equal("tool_call" in persisted, false);
+    assert.equal((persisted.elicitation as { tool_call_id?: string }).tool_call_id, "tool-ask");
+  });
+});
+
+test("parsePendingRequest holds each kind to its own requirements", () => {
+  const permission = serializePendingRequestForDisk(makeEntry());
+  const elicitation = serializePendingRequestForDisk(makeElicitationEntry());
+
+  assert.notEqual(parsePendingRequest(elicitation), undefined);
+
+  // Relabelling a permission entry does not make it an elicitation: it carries
+  // no form, so nothing could be typed against it. This is the same payload the
+  // store rejected before elicitations existed, still rejected — now because
+  // the kind's own requirements are unmet rather than because the kind is.
+  assert.equal(parsePendingRequest({ ...permission, kind: "elicitation" }), undefined);
+  // And the reverse: an elicitation payload relabelled as a permission request
+  // has no options to answer with.
+  assert.equal(parsePendingRequest({ ...elicitation, kind: "permission" }), undefined);
+
+  for (const broken of [
+    { ...elicitation, elicitation: undefined },
+    { ...elicitation, elicitation: { ...makeElicitation(), message: "" } },
+    { ...elicitation, elicitation: { ...makeElicitation(), requested_schema: undefined } },
+    { ...elicitation, elicitation: { ...makeElicitation(), requested_schema: "{}" } },
+    // Only `form` is advertised, so an entry in any other mode was never one
+    // this client could have answered.
+    { ...elicitation, elicitation: { ...makeElicitation(), mode: "url" } },
+  ]) {
+    assert.equal(parsePendingRequest(broken), undefined, JSON.stringify(broken.elicitation));
+  }
 });
 
 test("session ids are recoverable from the request store alone", async () => {

@@ -7,6 +7,8 @@ import {
   type AnyMessage,
   type AuthMethod,
   type ClientCapabilities,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type CreateTerminalRequest,
   type CreateTerminalResponse,
   type InitializeResponse,
@@ -59,6 +61,8 @@ import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-comma
 import { PERMISSION_POLICY_RULE_KEYS } from "../types.js";
 import type {
   AcpClientOptions,
+  AcpElicitationDecision,
+  AcpElicitationRequest,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PermissionPolicy,
@@ -156,6 +160,7 @@ function resolveClientCapabilities(params: {
   devinAcp: boolean;
   fs: boolean;
   terminal: boolean;
+  elicitation: boolean;
 }): ClientCapabilities {
   const baseCapabilities: ClientCapabilities = {
     fs: {
@@ -163,6 +168,19 @@ function resolveClientCapabilities(params: {
       writeTextFile: params.fs,
     },
     terminal: params.terminal,
+    // Advertised only when something here can actually answer a form — which
+    // in acpx means a queue owner running with --defer, whose parking hook is
+    // the answerer.
+    //
+    // This is a capability worth withholding. claude-agent-acp keeps
+    // AskUserQuestion in disallowedTools unless a client advertises form
+    // elicitation, so advertising it is precisely what re-enables the tool.
+    // Advertising it with nothing behind it would be worse than staying
+    // silent: the model would start asking questions that acpx could only
+    // auto-decline, turning a tool it never reaches for into one it reaches
+    // for and is always skipped on. An agent talking to an owner without
+    // --defer therefore keeps its stock behaviour, and nothing is degraded.
+    ...(params.elicitation ? { elicitation: { form: {} } } : {}),
   };
 
   if (!params.devinAcp) {
@@ -177,6 +195,44 @@ function resolveClientCapabilities(params: {
 
 function isDevinRequestDiagnosticsMethod(method: string): boolean {
   return method === "_cognition.ai/request_diagnostics";
+}
+
+/**
+ * Narrow ACP's elicitation request union down to the one shape acpx handles.
+ *
+ * `CreateElicitationRequest` spans form mode, url mode and future modes, and
+ * only some arms carry a session or a tool call, so the fields are read off the
+ * record rather than destructured off the union. Returns undefined for anything
+ * that is not a well-formed form request — the caller declines those, which is
+ * the truthful answer for a mode this client never advertised.
+ */
+function elicitationFormSchema(
+  record: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const requestedSchema = record.requestedSchema;
+  if (!requestedSchema || typeof requestedSchema !== "object" || Array.isArray(requestedSchema)) {
+    return undefined;
+  }
+  return requestedSchema as Record<string, unknown>;
+}
+
+function toAcpElicitationRequest(
+  params: CreateElicitationRequest,
+): AcpElicitationRequest | undefined {
+  const record = params as Record<string, unknown>;
+  const requestedSchema = elicitationFormSchema(record);
+  if (params.mode !== "form" || typeof params.message !== "string" || !requestedSchema) {
+    return undefined;
+  }
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined;
+  const toolCallId = typeof record.toolCallId === "string" ? record.toolCallId : undefined;
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    message: params.message,
+    requestedSchema,
+    ...(toolCallId ? { toolCallId } : {}),
+    raw: params,
+  };
 }
 
 type LoadSessionOptions = {
@@ -482,6 +538,12 @@ export class AcpClient {
   };
   private readonly cancellingSessionIds = new Set<string>();
   private readonly permissionAbortControllers = new Map<string, AbortController>();
+  /**
+   * Unwinds work that belongs to the connection rather than to any session —
+   * today, request-scoped elicitations. Replaced on close() so a client that is
+   * connected again starts with a signal that has not already fired.
+   */
+  private connectionAbortController = new AbortController();
   private closing = false;
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
@@ -796,6 +858,18 @@ export class AcpClient {
         ): Promise<RequestPermissionResponse> => {
           return this.handlePermissionRequest(params);
         },
+        // Registered unconditionally, and deliberately so. `elicitation/create`
+        // is a first-class client method in the SDK's router, and the legacy
+        // extension catch-all below explicitly skips it — so without this
+        // member the request reaches no handler at all. Registration is not
+        // advertisement: whether the agent is told acpx can render a form is
+        // decided by resolveClientCapabilities, and an unadvertised request
+        // that arrives anyway gets an honest decline rather than silence.
+        unstable_createElicitation: async (
+          params: CreateElicitationRequest,
+        ): Promise<CreateElicitationResponse> => {
+          return this.handleElicitationRequest(params);
+        },
         extMethod: async (method: string): Promise<Record<string, unknown>> => {
           if (launch.devinAcp && isDevinRequestDiagnosticsMethod(method)) {
             return {};
@@ -869,6 +943,7 @@ export class AcpClient {
         devinAcp: launch.devinAcp,
         fs: this.options.fs !== false,
         terminal: this.options.terminal !== false,
+        elicitation: this.options.onElicitationRequest !== undefined,
       }),
       clientInfo: resolveClientInfo(launch.devinAcp),
     });
@@ -1422,6 +1497,8 @@ export class AcpClient {
       controller.abort();
     }
     this.permissionAbortControllers.clear();
+    this.connectionAbortController.abort();
+    this.connectionAbortController = new AbortController();
     this.promptPermissionFailures.clear();
     this.loadedSessionId = undefined;
     this.modelConfigIds.clear();
@@ -1747,6 +1824,96 @@ export class AcpClient {
     }
 
     return response;
+  }
+
+  /**
+   * Answer an agent's form elicitation.
+   *
+   * Every path returns one of ACP's three actions rather than a JSON-RPC
+   * error: the agent's turn is blocked on this response, and only `accept` is
+   * a claim that a human supplied something. Nothing here ever invents that.
+   */
+  private async handleElicitationRequest(
+    params: CreateElicitationRequest,
+  ): Promise<CreateElicitationResponse> {
+    const request = toAcpElicitationRequest(params);
+    if (!request) {
+      // acpx advertises form mode only, so any other mode is one it never said
+      // it could render. Declining says so without failing the turn.
+      this.log(`declining elicitation in unsupported mode ${params.mode}`);
+      return { action: "decline" };
+    }
+    if (request.sessionId && this.cancellingSessionIds.has(request.sessionId)) {
+      return { action: "cancel" };
+    }
+
+    const hook = this.options.onElicitationRequest;
+    if (!hook) {
+      // Unreachable while the capability is gated on this hook's presence, but
+      // stated rather than assumed: an elicitation nothing can answer must not
+      // leave the agent blocked forever.
+      return { action: "decline" };
+    }
+
+    const signal = this.elicitationSignal(request);
+    try {
+      return this.elicitationDecisionResponse(request, signal, await hook(request, { signal }));
+    } catch (error) {
+      // No mode-based resolver stands behind this hook the way one stands
+      // behind the permission hook, so a failure resolves to the conservative
+      // answer — the form was not filled in — and is reported, never dressed
+      // up as content somebody supplied.
+      this.log(
+        `onElicitationRequest threw, declining the elicitation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return this.elicitationCancelledMeanwhile(request, signal)
+        ? { action: "cancel" }
+        : { action: "decline" };
+    }
+  }
+
+  /**
+   * A session-scoped elicitation shares the session's permission signal, so a
+   * cancelled turn or a closed client unwinds a parked form exactly as it
+   * unwinds a parked permission request. A request-scoped one belongs to no
+   * session — ACP allows those during authentication, before any session
+   * exists — so it hangs off the connection instead and is unwound by close()
+   * alone.
+   */
+  private elicitationSignal(request: AcpElicitationRequest): AbortSignal {
+    return request.sessionId
+      ? this.cancellationSignalForSession(request.sessionId)
+      : this.connectionAbortController.signal;
+  }
+
+  private elicitationCancelledMeanwhile(
+    request: AcpElicitationRequest,
+    signal: AbortSignal,
+  ): boolean {
+    return (
+      signal.aborted ||
+      (request.sessionId !== undefined && this.cancellingSessionIds.has(request.sessionId))
+    );
+  }
+
+  private elicitationDecisionResponse(
+    request: AcpElicitationRequest,
+    signal: AbortSignal,
+    decision: AcpElicitationDecision | undefined,
+  ): CreateElicitationResponse {
+    if (this.elicitationCancelledMeanwhile(request, signal)) {
+      return { action: "cancel" };
+    }
+    if (!decision) {
+      // A host that declines to answer is not an answer: declining is.
+      return { action: "decline" };
+    }
+    if (decision.outcome === "accept") {
+      return { action: "accept", ...(decision.content ? { content: decision.content } : {}) };
+    }
+    return { action: decision.outcome };
   }
 
   private async tryHandlePermissionRequestWithHost(

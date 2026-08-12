@@ -7,6 +7,7 @@ import {
 } from "../src/cli/queue/pending-request-manager.js";
 import { PendingRequestNotAnswerableError } from "../src/errors.js";
 import { listPendingRequests, readPendingRequest } from "../src/session/pending-requests.js";
+import type { AcpElicitationRequest } from "../src/types.js";
 import { withTempHome } from "./queue-test-helpers.js";
 
 const SESSION_ID = "manager-session";
@@ -87,7 +88,8 @@ test("park writes the entry before returning control to the caller", async () =>
     assert.equal(stored.length, 1);
     assert.equal(stored[0]?.state, "pending");
     assert.equal(stored[0]?.taskRequestId, "task-1");
-    assert.deepEqual(stored[0]?.options, [
+    const first = stored[0];
+    assert.deepEqual(first?.kind === "permission" ? first.options : undefined, [
       { optionId: "allow", name: "Allow", kind: "allow_once" },
       { optionId: "reject", name: "Reject", kind: "reject_once" },
     ]);
@@ -507,5 +509,211 @@ test("every answer arm is refused once the request has settled", async () => {
         PendingRequestNotAnswerableError,
       );
     }
+  });
+});
+
+const ASK_SCHEMA = {
+  type: "object",
+  properties: {
+    question_0: {
+      type: "string",
+      oneOf: [
+        { const: "Greeting A", title: "Greeting A" },
+        { const: "Greeting B", title: "Greeting B" },
+      ],
+    },
+    question_0_custom: { type: "string", title: "Other" },
+  },
+};
+
+function makeElicitationRequest(
+  overrides: Partial<AcpElicitationRequest> = {},
+): AcpElicitationRequest {
+  return {
+    sessionId: "acp-session-1",
+    message: "Which greeting should I use?",
+    requestedSchema: ASK_SCHEMA,
+    toolCallId: "ask-1",
+    raw: {} as AcpElicitationRequest["raw"],
+    ...overrides,
+  };
+}
+
+function parkElicitation(
+  manager: PendingRequestManager,
+  controller: AbortController,
+  request = makeElicitationRequest(),
+) {
+  return manager.parkElicitation(
+    { request, taskRequestId: "task-1" },
+    { signal: controller.signal },
+  );
+}
+
+test("parkElicitation stores the agent's form and an accept answers it", async () => {
+  await withTempHome(async () => {
+    const { manager, events } = makeManager();
+    const controller = new AbortController();
+    const decision = parkElicitation(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+    assert.equal(pending.kind, "elicitation");
+
+    const stored = await readPendingRequest(SESSION_ID, pending.requestId);
+    assert.equal(stored?.kind, "elicitation");
+    if (stored?.kind !== "elicitation") {
+      throw new Error("expected an elicitation entry");
+    }
+    // Verbatim: the responder types its answer against exactly this.
+    assert.deepEqual(stored.elicitation.requestedSchema, ASK_SCHEMA);
+    assert.equal(stored.elicitation.message, "Which greeting should I use?");
+    assert.equal(stored.elicitation.mode, "form");
+    assert.equal(stored.elicitation.toolCallId, "ask-1");
+
+    const settled = await manager.respond(pending.requestId, {
+      type: "accept",
+      content: { question_0: "Greeting A" },
+    });
+
+    // The content reaches the blocked ACP handler unchanged.
+    assert.deepEqual(await decision, {
+      outcome: "accept",
+      content: { question_0: "Greeting A" },
+    });
+    assert.equal(settled.state, "answered");
+    assert.equal(settled.resolution?.source, "cli");
+    // The action is recorded; the answer itself is not, by design.
+    assert.equal(settled.resolution?.action, "accept");
+    assert.equal(settled.resolution?.optionId, undefined);
+    assert.deepEqual(
+      events.map((event) => event.event),
+      ["created", "answered"],
+    );
+  });
+});
+
+test("an elicitation can be declined or cancelled, and says which it was", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+
+    const declineController = new AbortController();
+    const declined = parkElicitation(manager, declineController);
+    const [first] = await waitForPending(manager, 1);
+    assert(first);
+    const declinedEntry = await manager.respond(first.requestId, { type: "decline" });
+    // Declining is a real answer — "the form was skipped" — so it is answered,
+    // not cancelled, and the agent is told `decline` rather than an option id.
+    assert.deepEqual(await declined, { outcome: "decline" });
+    assert.equal(declinedEntry.state, "answered");
+    assert.equal(declinedEntry.resolution?.action, "decline");
+
+    const cancelController = new AbortController();
+    const cancelled = parkElicitation(manager, cancelController);
+    const second = (await waitForPending(manager, 1)).find(
+      (entry) => entry.requestId !== first.requestId,
+    );
+    assert(second);
+    const cancelledEntry = await manager.respond(second.requestId, { type: "cancel" });
+    assert.deepEqual(await cancelled, { outcome: "cancel" });
+    assert.equal(cancelledEntry.state, "cancelled");
+    assert.equal(cancelledEntry.resolution?.action, "cancel");
+  });
+});
+
+test("expiry declines an elicitation and never accepts one", async () => {
+  await withTempHome(async () => {
+    const { manager, events } = makeManager({ deferMaxAgeMs: 5 });
+    const controller = new AbortController();
+    const decision = parkElicitation(manager, controller);
+
+    // Nobody filled the form in, so the only truthful answer is that it was
+    // skipped. Synthesizing content would put words in the operator's mouth.
+    assert.deepEqual(await decision, { outcome: "decline" });
+
+    const [pending] = await listPendingRequests(SESSION_ID);
+    assert.equal(pending?.state, "expired");
+    assert.equal(pending?.resolution?.source, "expiry");
+    assert.equal(pending?.resolution?.action, "decline");
+    assert.deepEqual(
+      events.map((event) => event.event),
+      ["created", "expired"],
+    );
+  });
+});
+
+test("aborting the turn cancels a parked elicitation", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    const decision = parkElicitation(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    controller.abort();
+
+    assert.deepEqual(await decision, { outcome: "cancel" });
+    const stored = await readPendingRequest(SESSION_ID, pending.requestId);
+    assert.equal(stored?.state, "cancelled");
+    assert.equal(stored?.resolution?.source, "cancel");
+    assert.equal(stored?.resolution?.action, "cancel");
+  });
+});
+
+test("each kind refuses the other kind's answer and stays parked", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const permissionController = new AbortController();
+    const permission = park(manager, permissionController);
+    const [parkedPermission] = await waitForPending(manager, 1);
+    assert(parkedPermission);
+
+    // A form answer is not an answer to a permission request.
+    await assert.rejects(
+      async () =>
+        await manager.respond(parkedPermission.requestId, { type: "accept", content: {} }),
+      (error: unknown) => {
+        assert.equal(error instanceof PendingRequestNotAnswerableError, true);
+        assert.match((error as Error).message, /--option, --decline or --cancel/);
+        assert.match((error as Error).message, /offered: allow, reject/);
+        return true;
+      },
+    );
+
+    const elicitationController = new AbortController();
+    const elicitation = parkElicitation(manager, elicitationController);
+    const parkedElicitation = (await waitForPending(manager, 2)).find(
+      (entry) => entry.requestId !== parkedPermission.requestId,
+    );
+    assert(parkedElicitation);
+
+    // And an option id is not an answer to a form.
+    await assert.rejects(
+      async () =>
+        await manager.respond(parkedElicitation.requestId, {
+          type: "select",
+          option_id: "allow",
+        }),
+      (error: unknown) => {
+        assert.equal(error instanceof PendingRequestNotAnswerableError, true);
+        assert.match((error as Error).message, /--field, --text, --decline or --cancel/);
+        assert.match((error as Error).message, /fields: question_0, question_0_custom/);
+        return true;
+      },
+    );
+
+    // A refused answer leaves both requests answerable.
+    assert.equal(
+      (await readPendingRequest(SESSION_ID, parkedPermission.requestId))?.state,
+      "pending",
+    );
+    assert.equal(
+      (await readPendingRequest(SESSION_ID, parkedElicitation.requestId))?.state,
+      "pending",
+    );
+
+    permissionController.abort();
+    elicitationController.abort();
+    await permission;
+    await elicitation;
   });
 });

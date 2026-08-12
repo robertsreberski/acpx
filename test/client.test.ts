@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import type {
+  AnyMessage,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
 import {
   AcpClient,
   buildAgentSpawnOptions,
@@ -1628,4 +1632,242 @@ test("AcpClient survives a host escalation callback that throws", async () => {
       `expected a logged escalation-callback failure, got: ${JSON.stringify(logs)}`,
     );
   });
+});
+
+/**
+ * A message-level channel onto AcpClient's own ACP connection.
+ *
+ * The point of driving the SDK's `ClientSideConnection` rather than calling the
+ * handler directly is that registration is the thing under test:
+ * `elicitation/create` is a first-class client method in the SDK's router and
+ * the legacy extension catch-all explicitly skips it, so a handler that is not
+ * registered is not merely unused — the request reaches nothing at all.
+ */
+function makeConnectionChannel(): {
+  stream: { readable: ReadableStream<AnyMessage>; writable: WritableStream<AnyMessage> };
+  sendToClient: (message: AnyMessage) => void;
+  nextFromClient: (predicate: (message: AnyMessage) => boolean) => Promise<AnyMessage>;
+} {
+  let enqueue: ((message: AnyMessage) => void) | undefined;
+  const readable = new ReadableStream<AnyMessage>({
+    start(controller) {
+      enqueue = (message) => controller.enqueue(message);
+    },
+  });
+
+  const seen: AnyMessage[] = [];
+  const waiters: Array<{
+    predicate: (message: AnyMessage) => boolean;
+    resolve: (m: AnyMessage) => void;
+  }> = [];
+  const writable = new WritableStream<AnyMessage>({
+    write(message) {
+      seen.push(message);
+      const index = waiters.findIndex((waiter) => waiter.predicate(message));
+      const [waiter] = waiters.splice(index === -1 ? waiters.length : index, index === -1 ? 0 : 1);
+      waiter?.resolve(message);
+    },
+  });
+
+  return {
+    stream: { readable, writable },
+    sendToClient: (message) => enqueue?.(message),
+    nextFromClient: async (predicate) => {
+      const already = seen.find(predicate);
+      if (already) {
+        return already;
+      }
+      return await new Promise<AnyMessage>((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(new Error(`no matching message from the client; saw ${JSON.stringify(seen)}`)),
+          2_000,
+        );
+        waiters.push({
+          predicate,
+          resolve: (message) => {
+            clearTimeout(timer);
+            resolve(message);
+          },
+        });
+      });
+    },
+  };
+}
+
+function elicitationCreateRequest(id: number, sessionId: string): AnyMessage {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "elicitation/create",
+    params: {
+      mode: "form",
+      sessionId,
+      toolCallId: "ask-1",
+      message: "Which greeting?",
+      requestedSchema: {
+        type: "object",
+        properties: { question_0: { type: "string" } },
+      },
+    },
+  };
+}
+
+async function respondToElicitationOverTheWire(
+  client: AcpClient,
+  request: AnyMessage,
+): Promise<Record<string, unknown>> {
+  const channel = makeConnectionChannel();
+  const internals = client as unknown as {
+    createConnection: (
+      stream: { readable: ReadableStream<AnyMessage>; writable: WritableStream<AnyMessage> },
+      launch: { devinAcp: boolean },
+    ) => unknown;
+  };
+  internals.createConnection(channel.stream, { devinAcp: false });
+  channel.sendToClient(request);
+  const response = (await channel.nextFromClient(
+    (message) => (message as { id?: unknown }).id === (request as { id?: unknown }).id,
+  )) as Record<string, unknown>;
+  return response;
+}
+
+test("an elicitation request reaches acpx through the SDK's own router", async () => {
+  const seen: Array<{ message: string; sessionId?: string; toolCallId?: string }> = [];
+  const client = makeClient({
+    onElicitationRequest: async (req) => {
+      seen.push({
+        message: req.message,
+        ...(req.sessionId ? { sessionId: req.sessionId } : {}),
+        ...(req.toolCallId ? { toolCallId: req.toolCallId } : {}),
+      });
+      return { outcome: "accept", content: { question_0: "Greeting A" } };
+    },
+  });
+
+  const response = await respondToElicitationOverTheWire(
+    client,
+    elicitationCreateRequest(1, "acp-session-1"),
+  );
+
+  // A result, not a JSON-RPC error: an unregistered client method would come
+  // back as method-not-found instead.
+  assert.equal("error" in response, false, JSON.stringify(response));
+  assert.deepEqual(response.result, {
+    action: "accept",
+    content: { question_0: "Greeting A" },
+  });
+  // The hook is handed the request already narrowed out of ACP's union.
+  assert.deepEqual(seen, [
+    { message: "Which greeting?", sessionId: "acp-session-1", toolCallId: "ask-1" },
+  ]);
+});
+
+test("an elicitation with no host answerer is declined, never left hanging", async () => {
+  const response = await respondToElicitationOverTheWire(
+    makeClient(),
+    elicitationCreateRequest(2, "acp-session-1"),
+  );
+
+  assert.equal("error" in response, false, JSON.stringify(response));
+  assert.deepEqual(response.result, { action: "decline" });
+});
+
+test("a mode acpx never advertised is declined rather than answered", async () => {
+  const client = makeClient({
+    onElicitationRequest: async () => {
+      throw new Error("the hook must not be reached for an unsupported mode");
+    },
+  });
+
+  const response = await respondToElicitationOverTheWire(client, {
+    jsonrpc: "2.0",
+    id: 3,
+    method: "elicitation/create",
+    params: {
+      mode: "url",
+      sessionId: "acp-session-1",
+      message: "Open this",
+      elicitationId: "e-1",
+      url: "https://example.invalid",
+    },
+  });
+
+  assert.deepEqual(response.result, { action: "decline" });
+});
+
+test("handleElicitationRequest maps every host decision onto an ACP action", async () => {
+  for (const [decision, action] of [
+    [{ outcome: "decline" }, { action: "decline" }],
+    [{ outcome: "cancel" }, { action: "cancel" }],
+    [{ outcome: "accept" }, { action: "accept" }],
+    [undefined, { action: "decline" }],
+  ] as const) {
+    const client = makeClient({ onElicitationRequest: async () => decision });
+    const internals = client as unknown as {
+      handleElicitationRequest: (params: unknown) => Promise<unknown>;
+    };
+    assert.deepEqual(
+      await internals.handleElicitationRequest({
+        mode: "form",
+        sessionId: "acp-session-1",
+        message: "m",
+        requestedSchema: { type: "object", properties: {} },
+      }),
+      action,
+      JSON.stringify(decision),
+    );
+  }
+});
+
+test("a host hook that throws declines instead of inventing an answer", async () => {
+  const client = makeClient({
+    onElicitationRequest: async () => {
+      throw new Error("host exploded");
+    },
+  });
+  const logged: string[] = [];
+  asInternals(client).log = (message: string) => logged.push(message);
+
+  const internals = client as unknown as {
+    handleElicitationRequest: (params: unknown) => Promise<unknown>;
+  };
+  const response = await internals.handleElicitationRequest({
+    mode: "form",
+    sessionId: "acp-session-1",
+    message: "m",
+    requestedSchema: { type: "object", properties: {} },
+  });
+
+  // Declining says "nothing was filled in", which is true. Accepting would
+  // claim a human supplied content that nobody did.
+  assert.deepEqual(response, { action: "decline" });
+  assert.equal(
+    logged.some((entry) => entry.includes("onElicitationRequest threw")),
+    true,
+    JSON.stringify(logged),
+  );
+});
+
+test("a cancelling session cancels its elicitations without consulting the host", async () => {
+  const client = makeClient({
+    onElicitationRequest: async () => {
+      throw new Error("the hook must not be reached for a cancelling session");
+    },
+  });
+  const internals = client as unknown as {
+    handleElicitationRequest: (params: unknown) => Promise<unknown>;
+    cancellingSessionIds: Set<string>;
+  };
+  internals.cancellingSessionIds.add("acp-session-1");
+
+  assert.deepEqual(
+    await internals.handleElicitationRequest({
+      mode: "form",
+      sessionId: "acp-session-1",
+      message: "m",
+      requestedSchema: { type: "object", properties: {} },
+    }),
+    { action: "cancel" },
+  );
 });

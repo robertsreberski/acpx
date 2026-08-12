@@ -1,17 +1,20 @@
 import { Command, InvalidArgumentError } from "commander";
 import { PendingRequestOwnerGoneError } from "../errors.js";
 import {
+  elicitationFieldNames,
   listPendingRequestSessionIds,
   listPendingRequests,
   readPendingRequest,
   serializePendingRequestForDisk,
   sweepPendingRequests,
+  type PendingElicitationRequest,
   type PendingRequest,
   type PendingRequestAnswer,
 } from "../session/pending-requests.js";
 import type { OutputFormat } from "../types.js";
 import { findRoutedSessionOrThrow } from "./command-handlers.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+import { elicitationContentFromFlags } from "./elicitation-answer.js";
 import {
   addSessionNameOption,
   parseNonEmptyValue,
@@ -30,6 +33,8 @@ export type RequestsListFlags = {
 
 export type RespondFlags = {
   option?: string;
+  field?: string[];
+  text?: string;
   decline?: boolean;
   cancel?: boolean;
   json?: boolean;
@@ -58,20 +63,42 @@ function resolveRequestsFormat(
   return json === true ? "json" : globalFormat;
 }
 
-/** Exactly one answer arm; anything else is a usage error, never a guess. */
-function resolveAnswerFromFlags(flags: RespondFlags): PendingRequestAnswer {
-  const chosen = [flags.option !== undefined, flags.decline === true, flags.cancel === true].filter(
-    Boolean,
-  ).length;
-  if (chosen !== 1) {
+/** `--field` is repeatable, so each occurrence appends rather than replaces. */
+function collectFieldFlag(value: string, previous: string[] | undefined): string[] {
+  return [...(previous ?? []), parseNonEmptyValue("Field", value)];
+}
+
+/**
+ * Which answer the flags name. `--field` may repeat, so the whole group counts
+ * as the single `form` arm; `--field` and `--text` together do not, because
+ * they are two different ways of saying which field gets the value.
+ */
+type RespondArm = "option" | "form" | "decline" | "cancel";
+
+function namedRespondArms(flags: RespondFlags): RespondArm[] {
+  const named: Array<[RespondArm, boolean]> = [
+    ["option", flags.option !== undefined],
+    ["form", (flags.field?.length ?? 0) > 0 || flags.text !== undefined],
+    ["decline", flags.decline === true],
+    ["cancel", flags.cancel === true],
+  ];
+  return named.filter(([, chosen]) => chosen).map(([arm]) => arm);
+}
+
+function resolveRespondArm(flags: RespondFlags): RespondArm {
+  const [arm, ...rest] = namedRespondArms(flags);
+  if (arm === undefined || rest.length > 0) {
     throw new InvalidArgumentError(
-      "Answer a request with exactly one of --option <optionId>, --decline, or --cancel",
+      "Answer a request with exactly one of --option <optionId>, --field <key>=<value> " +
+        "(repeatable), --text <answer>, --decline, or --cancel",
     );
   }
-  if (flags.option !== undefined) {
-    return { type: "select", option_id: flags.option };
+  if ((flags.field?.length ?? 0) > 0 && flags.text !== undefined) {
+    throw new InvalidArgumentError(
+      "--text and --field both name the field being answered; use one or the other",
+    );
   }
-  return flags.decline === true ? { type: "decline" } : { type: "cancel" };
+  return arm;
 }
 
 /**
@@ -177,7 +204,29 @@ async function listAllRequests(warn: (message: string) => void): Promise<Pending
   return sortedRequests(entries);
 }
 
-function requestOptionSummary(entry: PendingRequest): string {
+/**
+ * What this request is asking, in one line.
+ *
+ * A permission request has a tool title; an elicitation has the agent's own
+ * message, which is free text and routinely spans lines — the text listing is
+ * one row per request, so it is folded onto a single line here rather than
+ * being allowed to break the format.
+ */
+function requestSubjectSummary(entry: PendingRequest): string {
+  if (entry.kind === "elicitation") {
+    return entry.elicitation.message.replace(/\s+/g, " ").trim() || "form";
+  }
+  return entry.toolCall.title;
+}
+
+/**
+ * What can be answered with: the option ids for a permission request, the form
+ * field names for an elicitation. Both are what `respond` needs to be told.
+ */
+function requestAnswerSummary(entry: PendingRequest): string {
+  if (entry.kind === "elicitation") {
+    return elicitationFieldNames(entry).join("|") || "-";
+  }
   return entry.options.map((option) => option.optionId).join("|") || "-";
 }
 
@@ -207,7 +256,7 @@ function printRequestsByFormat(entries: PendingRequest[], format: OutputFormat):
 
   for (const entry of entries) {
     process.stdout.write(
-      `${entry.requestId}\t${entry.state}\t${entry.sessionId}\t${entry.toolCall.title}\t${requestOptionSummary(entry)}\t${entry.createdAt}\n`,
+      `${entry.requestId}\t${entry.state}\t${entry.sessionId}\t${entry.kind}\t${requestSubjectSummary(entry)}\t${requestAnswerSummary(entry)}\t${entry.createdAt}\n`,
     );
   }
 }
@@ -337,6 +386,60 @@ async function assertAnswerableByLiveOwner(sessionId: string, requestId: string)
   });
 }
 
+/**
+ * The parked entry a form answer has to be typed against.
+ *
+ * Only the form arms need this: an option id, a decline and a cancel all mean
+ * the same thing without reading the request, and the owner refuses them
+ * authoritatively if they turn out not to fit. `--field` and `--text` cannot
+ * even be built without the schema, so this reads the store and — only if the
+ * store has no entry, which happens when a park's durable write failed — asks
+ * the owner that is holding it.
+ */
+async function readFormRequest(
+  sessionId: string,
+  requestId: string,
+  warn: (message: string) => void,
+): Promise<PendingElicitationRequest> {
+  const stored =
+    (await readPendingRequest(sessionId, requestId)) ??
+    (await readLiveParkedRequests(sessionId, warn)).find((entry) => entry.requestId === requestId);
+  if (!stored) {
+    throw new InvalidArgumentError(
+      `Request ${requestId} was not found on session ${sessionId}, and --field/--text can only ` +
+        `be typed against the form the agent asked for; list the session's requests first`,
+    );
+  }
+  if (stored.kind !== "elicitation") {
+    throw new InvalidArgumentError(
+      `Request ${requestId} is a permission request, not a form; answer it with ` +
+        `--option <optionId>, --decline or --cancel`,
+    );
+  }
+  return stored;
+}
+
+async function resolveRespondAnswer(params: {
+  arm: RespondArm;
+  flags: RespondFlags;
+  sessionId: string;
+  requestId: string;
+  warn: (message: string) => void;
+}): Promise<PendingRequestAnswer> {
+  switch (params.arm) {
+    case "option":
+      return { type: "select", option_id: params.flags.option ?? "" };
+    case "decline":
+      return { type: "decline" };
+    case "cancel":
+      return { type: "cancel" };
+    default: {
+      const entry = await readFormRequest(params.sessionId, params.requestId, params.warn);
+      return { type: "accept", content: elicitationContentFromFlags(entry, params.flags) };
+    }
+  }
+}
+
 export async function handleRespond(
   explicitAgentName: string | undefined,
   requestId: string,
@@ -346,7 +449,9 @@ export async function handleRespond(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const format = resolveRequestsFormat(flags.json, globalFlags.format);
-  const answer = resolveAnswerFromFlags(flags);
+  // Resolved before anything else so a malformed answer is a usage error that
+  // costs no lookups, exactly as it was before forms existed.
+  const arm = resolveRespondArm(flags);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const record = await findRoutedSessionOrThrow(
     agent.agentCommand,
@@ -357,6 +462,13 @@ export async function handleRespond(
   const sessionId = record.acpxRecordId;
 
   await assertAnswerableByLiveOwner(sessionId, requestId);
+  const answer = await resolveRespondAnswer({
+    arm,
+    flags,
+    sessionId,
+    requestId,
+    warn: createWarn(format),
+  });
   const answered = await tryRespondOnRunningOwner({
     sessionId,
     pendingRequestId: requestId,
@@ -426,8 +538,14 @@ export function registerRequestsCommands(
     .option("--option <optionId>", "Answer with an option id the agent offered", (value: string) =>
       parseNonEmptyValue("Option id", value),
     )
-    .option("--decline", "Answer with the rejection option the agent offered")
-    .option("--cancel", "Cancel the request instead of choosing an option")
+    .option(
+      "--field <key=value>",
+      "Fill in one field of an elicitation form; repeat for more",
+      collectFieldFlag,
+    )
+    .option("--text <answer>", "Fill in an elicitation form that has exactly one field")
+    .option("--decline", "Decline: the agent's rejection option, or a declined form")
+    .option("--cancel", "Cancel the request instead of answering it")
     .option("--json", "Alias for --format json");
   addSessionNameOption(respondCommand);
   respondCommand.action(async function (this: Command, requestId: string, flags: RespondFlags) {

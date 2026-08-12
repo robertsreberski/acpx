@@ -120,9 +120,14 @@ test("tryListRequestsOnRunningOwner parses the parked requests the owner reports
     try {
       const requests = await tryListRequestsOnRunningOwner({ sessionId });
       assert.equal(requests?.length, 1);
-      assert.equal(requests?.[0]?.requestId, "pending-1");
-      assert.equal(requests?.[0]?.toolCall.toolCallId, "tool-1");
-      assert.deepEqual(requests?.[0]?.options[0], {
+      const parked = requests?.[0];
+      assert.equal(parked?.requestId, "pending-1");
+      assert.equal(parked?.kind, "permission");
+      assert.equal(
+        parked?.kind === "permission" ? parked.toolCall.toolCallId : undefined,
+        "tool-1",
+      );
+      assert.deepEqual(parked?.kind === "permission" ? parked.options[0] : undefined, {
         optionId: "allow",
         name: "Allow",
         kind: "allow_once",

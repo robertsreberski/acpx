@@ -48,6 +48,7 @@ import {
   currentModelIdFromSetModelResponse,
 } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
+import type { PendingRequest } from "../../session/pending-requests.js";
 import {
   absolutePath,
   isoNow,
@@ -578,18 +579,33 @@ function acpxExtensionNotification(method: string, params: unknown): AcpJsonRpcM
   return { jsonrpc: "2.0", method, params };
 }
 
+/**
+ * The request as the event log carries it.
+ *
+ * The agent-authored bulk — a permission request's raw tool input, an
+ * elicitation's requested schema — is dropped: both can be large and are
+ * repeated on every transition, and the durable store already holds them
+ * verbatim, so the log carries identity and the entry is where the detail
+ * lives.
+ */
+function pendingRequestForEventLog(request: PendingRequest): Record<string, unknown> {
+  if (request.kind === "elicitation") {
+    const { requestedSchema: _requestedSchema, ...elicitation } = request.elicitation;
+    return { ...request, elicitation };
+  }
+  const { rawInput: _rawInput, ...toolCall } = request.toolCall;
+  return { ...request, toolCall };
+}
+
 function registerPendingRequestSink(
   options: RunSessionPromptOptions,
   output: OutputFormatter,
   pendingMessages: AcpJsonRpcMessage[],
 ): void {
   options.onPendingRequestSink?.((event) => {
-    // rawInput can be large and is repeated on every transition; the durable
-    // store already holds it verbatim, so the event log carries only identity.
-    const { rawInput: _rawInput, ...toolCall } = event.request.toolCall;
     const notification = acpxExtensionNotification("_acpx/pending_request", {
       ...event,
-      request: { ...event.request, toolCall },
+      request: pendingRequestForEventLog(event.request),
     });
     pendingMessages.push(notification);
     // Attached --format json clients see park/answer transitions live.

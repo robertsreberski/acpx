@@ -20,6 +20,10 @@ const OPAQUE_VALUE_PATHS = new Set([
   // Agent-authored tool input on a parked permission request. Its keys belong
   // to the agent's tool schema, not to acpx's persistence contract.
   "tool_call.raw_input",
+  // The agent's own JSON Schema for a parked elicitation form. Its keys are
+  // JSON Schema's (`minItems`, `oneOf`, `_meta`) and the agent's field names,
+  // and it is stored verbatim precisely so a responder can answer against it.
+  "elicitation.requested_schema",
   "messages.Agent.content.ToolUse.input",
   "acpx.desired_config_options",
   "acpx.config_options",

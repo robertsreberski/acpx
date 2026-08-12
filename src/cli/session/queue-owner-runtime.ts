@@ -116,13 +116,22 @@ function createQueueOwnerSharedClient(
       options.sessionOptions,
       sessionOptionsFromRecord(sessionRecord),
     ),
-    ...(parking ? { onPermissionRequest: parking.onPermissionRequest } : {}),
+    // Installing the elicitation hook is also what makes this client advertise
+    // form elicitation, so the advertisement and the answerer are the same
+    // decision — an owner without --defer builds neither.
+    ...(parking
+      ? {
+          onPermissionRequest: parking.onPermissionRequest,
+          onElicitationRequest: parking.onElicitationRequest,
+        }
+      : {}),
   });
 }
 
 type ParkingBridge = {
   manager: PendingRequestManager;
   onPermissionRequest: NonNullable<AcpClientOptions["onPermissionRequest"]>;
+  onElicitationRequest: NonNullable<AcpClientOptions["onElicitationRequest"]>;
   beginTask: (taskRequestId: string) => void;
   setTaskSink: (sink: (event: PendingRequestEvent) => void) => void;
   endTask: () => void;
@@ -181,6 +190,16 @@ function createParkingBridge(params: {
         { signal: ctx.signal },
       );
     },
+    // Unconditional, unlike the permission hook: a permission policy decides
+    // which permission requests are deferred, but an elicitation is not a
+    // decision acpx has a policy about — it is a form only a human can fill
+    // in. The gate is the capability itself, which this owner advertises
+    // exactly because this hook exists to park what comes back.
+    onElicitationRequest: async (req, ctx) =>
+      await manager.parkElicitation(
+        { request: req, taskRequestId: currentTask?.taskRequestId ?? "unknown" },
+        { signal: ctx.signal },
+      ),
     beginTask: (taskRequestId) => {
       currentTask = { taskRequestId };
     },
