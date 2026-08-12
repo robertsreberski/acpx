@@ -67,6 +67,8 @@ Allow <tool>? (y/N)
 
 There is no per-session "approve next 3" option. Every non-read request is its own prompt unless you pass `--approve-all`.
 
+`escalate` and `defer` rules also prompt here rather than emitting an event: when a TTY is available, the person at the terminal _is_ the escalation target, so the request is answered inline and no `permissionEscalation` event is produced. Both only surface a structured event when no TTY is available. Orchestrators that need the event unconditionally should run `acpx` without a TTY (a pipe is enough), which is already the case for queued and CI-driven prompts.
+
 ## Non-interactive policy
 
 When there is no TTY (pipes, CI, queued prompts driven by another process), the prompt cannot be shown. `--non-interactive-permissions` decides what happens:
@@ -81,6 +83,44 @@ Set a project default if you want CI runs to fail loudly:
 ```json
 { "nonInteractivePermissions": "fail" }
 ```
+
+## Deciding permissions in a host program
+
+Programs embedding the runtime (`import { ... } from "acpx/runtime"`) can answer permission requests directly with `onPermissionRequest`, instead of relying on mode and policy alone:
+
+```ts
+const runtime = createAcpRuntime({
+  // ...
+  permissionMode: "deny-all",
+  permissionPolicy: { defer: ["execute"] },
+  onPermissionRequest: async (req, ctx) => {
+    // ctx.mode and ctx.policy describe what acpx would do on its own.
+    if (matchPermissionPolicy(req.raw, ctx.policy)?.action === "defer") {
+      const optionId = await parkForHumanReview(req, ctx.signal);
+      return optionId ? { outcome: "select", optionId } : { outcome: "cancel" };
+    }
+    return undefined; // fall back to acpx's own resolution
+  },
+});
+```
+
+The hook returns:
+
+- a decision (`allow_once`, `allow_always`, `reject_once`, `reject_always`, `cancel`), or
+- `{ outcome: "select", optionId }` to pick one of the agent's advertised options by id — useful for adapter-specific options that do not map onto the four standard kinds. An id the agent did not offer is treated as `cancel` rather than being approximated by a similar option.
+- `undefined` to decline, which hands the request back to the normal policy-then-mode resolution.
+
+Throwing is equivalent to returning `undefined`: the error is logged and acpx resolves the request itself, so a broken host UI cannot take down the turn.
+
+The `ctx` argument carries:
+
+| Field    | Meaning                                                                                   |
+| -------- | ----------------------------------------------------------------------------------------- |
+| `signal` | Aborts when the session is cancelled. Long-running review UIs should honor it.            |
+| `mode`   | The permission mode governing this request.                                               |
+| `policy` | The permission policy governing this request, if one is configured. Frozen and read-only. |
+
+`mode` and `policy` are a snapshot taken when the request arrived, and the same snapshot settles the request if the hook returns `undefined` — so a decision is never judged against settings the hook was not shown. A field is present exactly when acpx has a value for it.
 
 ## Exit code 5
 

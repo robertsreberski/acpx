@@ -603,6 +603,8 @@ Per-tool policy:
 - `--permission-policy <json-or-file>` or `--policy <json-or-file>` matches ACP permission requests by tool kind, title head, title, or raw input tool/name.
 - `autoDeny` wins over `autoApprove`, which wins over `escalate`, which wins over `defer`; unmatched requests use `defaultAction` when set, otherwise the selected permission mode.
 - `defer` marks requests whose decision belongs to an out-of-band reviewer. It resolves like `escalate` and differs only in the reported `action`.
+- `escalate` and `defer` prompt inline when a TTY is available and only emit an escalation event when one is not; see [permissions](permissions.md).
+- Reusing a warm queue owner from a build that predates `defer` fails with `QUEUE_OWNER_PROTOCOL_MISMATCH`; close the session so a current owner can start.
 - Non-interactive escalations deny the current request. Text mode prints a `[permission]` notice; JSON mode keeps raw ACP NDJSON and includes escalation details, including tool input when supplied by the agent, on the `session/request_permission` response at `_meta.acpx.permissionEscalation`.
 
 ## Exit codes
