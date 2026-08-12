@@ -11,12 +11,13 @@ import {
   sessionEventLockPath as eventsLockPath,
   sessionEventSegmentPath as segmentEventPath,
 } from "./event-log.js";
-import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
+import { resolveSessionRecord } from "./persistence.js";
 import {
   captureAcpTimelineEvent,
   type CapturedAcpTimelineEvent,
   type SessionTimelineLifecycleEvent,
   SessionTimelineWriter,
+  writeSessionRecordWithLatestTimeline,
 } from "./timeline.js";
 
 const LOCK_RETRY_MS = 15;
@@ -341,7 +342,7 @@ export class SessionEventWriter {
       });
 
       if (options.checkpoint === true) {
-        await writeSessionRecord(this.record);
+        await writeSessionRecordWithLatestTimeline(this.record);
       }
       return committedCount;
     } catch (error) {
@@ -419,7 +420,7 @@ export class SessionEventWriter {
     if (this.closed) {
       throw new Error("SessionEventWriter is closed");
     }
-    await writeSessionRecord(this.record);
+    await writeSessionRecordWithLatestTimeline(this.record);
   }
 
   async close(options: AppendOptions = {}): Promise<void> {
@@ -429,7 +430,7 @@ export class SessionEventWriter {
 
     try {
       if (options.checkpoint !== false) {
-        await writeSessionRecord(this.record);
+        await writeSessionRecordWithLatestTimeline(this.record);
       }
     } finally {
       this.closed = true;

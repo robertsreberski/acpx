@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
+import { SessionEventWriter } from "../src/session/events.js";
 import {
   PENDING_REQUEST_SCHEMA,
   writePendingRequest,
@@ -227,6 +228,102 @@ test("ambiguous queue transport loss is replayed without a duplicate turn or fal
       );
       assert.deepEqual(lifecycleTypes, ["turn_submitted"]);
     } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("follow-up prompts are admitted promptly and FIFO while an active turn writer stays open", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-queue-during-active-turn",
+      acpSessionId: "provider-queue-during-active-turn",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const activeWriter = await SessionEventWriter.open(
+      await resolveSessionRecord(initial.acpxRecordId),
+    );
+    await activeWriter.appendLifecycleEvent(
+      { type: "turn_started" },
+      { turnId: "turn-active", requestId: "turn-active" },
+    );
+
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 82,
+      queueProtocol: 3,
+      parking: true,
+      parkingMaxAgeMs: 86_400_000,
+    });
+    const submittedRequestIds: string[] = [];
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      submittedRequestIds.push(request.requestId);
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+
+    try {
+      const admit = async (prompt: string, idempotencyKey: string) => {
+        const enqueue = service.enqueuePrompt({
+          acpxRecordId: initial.acpxRecordId,
+          prompt,
+          idempotencyKey,
+        });
+        const admitted = await Promise.race([
+          enqueue.then((receipt) => ({ prompt: true as const, receipt })),
+          new Promise<{ prompt: false }>((resolve) =>
+            setTimeout(() => resolve({ prompt: false }), 500),
+          ),
+        ]);
+        if (!admitted.prompt) {
+          await activeWriter.close({ checkpoint: true });
+          await enqueue;
+          assert.fail("queue admission waited for the active turn to finish");
+        }
+        assert.equal(admitted.receipt.result.admission, "queued");
+        return admitted.receipt;
+      };
+
+      const first = await admit("first follow-up", "queue-during-active-turn-first");
+      const second = await admit("second follow-up", "queue-during-active-turn-second");
+      assert.deepEqual(submittedRequestIds, [first.result.turnId, second.result.turnId]);
+
+      await activeWriter.appendLifecycleEvent(
+        { type: "turn_completed", stop_reason: "end_turn" },
+        { turnId: "turn-active", requestId: "turn-active" },
+      );
+      await activeWriter.close({ checkpoint: true });
+
+      const transcript = await service.getTranscriptPage({
+        acpxRecordId: initial.acpxRecordId,
+        limit: 20,
+      });
+      const lifecycle = transcript.items.flatMap((item) =>
+        "seq" in item && item.payload.kind === "lifecycle"
+          ? [[item.seq, item.turn_id, item.payload.event.type] as const]
+          : [],
+      );
+      assert.deepEqual(lifecycle, [
+        [1, "turn-active", "turn_started"],
+        [2, first.result.turnId, "turn_submitted"],
+        [3, second.result.turnId, "turn_submitted"],
+        [4, "turn-active", "turn_completed"],
+      ]);
+    } finally {
+      await activeWriter.close({ checkpoint: true }).catch(() => undefined);
       service.dispose();
       await closeServer(server);
       await cleanupOwnerArtifacts(paths);

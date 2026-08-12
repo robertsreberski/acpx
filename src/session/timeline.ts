@@ -199,8 +199,9 @@ function lockOwnerIsAlive(pid: number | undefined): boolean {
 async function removeStaleLock(filePath: string): Promise<boolean> {
   try {
     const parsed = parseLock(await fs.readFile(filePath, "utf8"));
-    // Parked turns can hold the writer for an unbounded human decision. A live
-    // owner is authoritative regardless of the lock's age.
+    // Timeline locks cover one append/checkpoint critical section. Filesystem
+    // I/O can still pause indefinitely, so a live owner remains authoritative
+    // regardless of the lock's age.
     if (lockOwnerIsAlive(parsed.pid)) {
       return false;
     }
@@ -404,50 +405,99 @@ async function initializeMetadata(record: SessionRecord): Promise<SessionTimelin
   return metadata;
 }
 
+async function reconcileTimelineMetadata(
+  record: SessionRecord,
+  metadata: SessionTimelineMetadata,
+): Promise<SessionTimelineMetadata> {
+  let corrupt = false;
+  const [latest] = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
+    limit: 1,
+    onCorrupt: () => {
+      corrupt = true;
+    },
+  });
+  const latestSeq = latest?.seq ?? 0;
+  if (corrupt || metadata.last_seq > latestSeq) {
+    metadata.epoch = randomUUID();
+    metadata.last_seq = 0;
+    metadata.active_path = timelinePath(record.acpxRecordId, metadata.epoch);
+    metadata.created_at = isoNow();
+    metadata.history_incomplete = true;
+    // Make the replacement epoch discoverable before its first append. This
+    // is the same crash boundary protected by initializeMetadata.
+    await checkpointTimelineMetadata(record, metadata);
+  } else {
+    // The file is authoritative when a process died after append but before
+    // checkpointing its session record.
+    metadata.last_seq = latestSeq;
+  }
+  record.timeline = metadata;
+  return metadata;
+}
+
+function mergeLocalTimelineAnnotations(
+  latest: SessionTimelineMetadata,
+  local: SessionTimelineMetadata | undefined,
+): SessionTimelineMetadata {
+  if (!local || latest.epoch !== local.epoch) {
+    return latest;
+  }
+  latest.legacy_retained = local.legacy_retained;
+  latest.legacy_import_complete = local.legacy_import_complete;
+  latest.history_incomplete =
+    latest.history_incomplete === true || local.history_incomplete === true;
+  if (local.last_write_error != null) {
+    latest.last_write_error = local.last_write_error;
+  }
+  return latest;
+}
+
+/**
+ * Persist non-timeline session state without overwriting a timeline append
+ * that another writer committed while this caller held a long-lived record.
+ */
+export async function writeSessionRecordWithLatestTimeline(record: SessionRecord): Promise<void> {
+  const lock = await acquireTimelineLock(record.acpxRecordId);
+  try {
+    const localMetadata = record.timeline;
+    const persisted = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
+    if (!localMetadata && !persisted?.timeline) {
+      // Mode/config changes before the first prompt should not manufacture an
+      // empty timeline merely because they use the concurrency-safe writer.
+      await writeSessionRecord(record);
+      return;
+    }
+    const metadata = mergeLocalTimelineAnnotations(
+      await reconcileTimelineMetadata(record, await initializeMetadata(record)),
+      localMetadata,
+    );
+    record.timeline = metadata;
+    await writeSessionRecord(record);
+  } finally {
+    await releaseTimelineLock(lock);
+  }
+}
+
 export class SessionTimelineWriter {
   private readonly record: SessionRecord;
-  private readonly lock: TimelineLock;
-  private readonly metadata: SessionTimelineMetadata;
+  private metadata: SessionTimelineMetadata;
   private closed = false;
 
-  private constructor(
-    record: SessionRecord,
-    lock: TimelineLock,
-    metadata: SessionTimelineMetadata,
-  ) {
+  private constructor(record: SessionRecord, metadata: SessionTimelineMetadata) {
     this.record = record;
-    this.lock = lock;
     this.metadata = metadata;
   }
 
   static async open(record: SessionRecord): Promise<SessionTimelineWriter> {
     const lock = await acquireTimelineLock(record.acpxRecordId);
     try {
-      const metadata = await initializeMetadata(record);
-      let corrupt = false;
-      const [latest] = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
-        limit: 1,
-        onCorrupt: () => {
-          corrupt = true;
-        },
-      });
-      const latestSeq = latest?.seq ?? 0;
-      if (corrupt || metadata.last_seq > latestSeq) {
-        metadata.epoch = randomUUID();
-        metadata.last_seq = 0;
-        metadata.active_path = timelinePath(record.acpxRecordId, metadata.epoch);
-        metadata.created_at = isoNow();
-        metadata.history_incomplete = true;
-        await checkpointTimelineMetadata(record, metadata);
-      } else {
-        metadata.last_seq = latestSeq;
-      }
-      const writer = new SessionTimelineWriter(record, lock, metadata);
+      const metadata = await reconcileTimelineMetadata(record, await initializeMetadata(record));
+      const writer = new SessionTimelineWriter(record, metadata);
       await writer.importLegacyCompatibilityMessagesIfNeeded();
+      await checkpointTimelineMetadata(record, writer.metadata);
       return writer;
-    } catch (error) {
+    } finally {
       await releaseTimelineLock(lock);
-      throw error;
     }
   }
 
@@ -500,7 +550,7 @@ export class SessionTimelineWriter {
       if (legacyIndex <= this.metadata.last_seq) {
         continue;
       }
-      await this.append({
+      await this.appendWithoutLock({
         direction: "internal",
         capturedAt: this.metadata.created_at,
         requestId: requestIdFromMessage(message),
@@ -521,6 +571,33 @@ export class SessionTimelineWriter {
     if (this.closed) {
       throw new Error("SessionTimelineWriter is closed");
     }
+    const lock = await acquireTimelineLock(this.record.acpxRecordId);
+    try {
+      this.metadata = await reconcileTimelineMetadata(
+        this.record,
+        await initializeMetadata(this.record),
+      );
+      await this.appendWithoutLock(input);
+      try {
+        await checkpointTimelineMetadata(this.record, this.metadata);
+      } catch (error) {
+        // The envelope is already authoritative in the append-only file. Keep
+        // the checkpoint fault visible, but do not make callers retry and
+        // duplicate an event that was durably committed.
+        this.recordWriteError(error);
+      }
+    } finally {
+      await releaseTimelineLock(lock);
+    }
+  }
+
+  private async appendWithoutLock(input: {
+    direction: SessionTimelineDirection;
+    capturedAt: string;
+    turnId?: string;
+    requestId?: string;
+    payload: SessionTimelinePayload;
+  }): Promise<void> {
     const envelope: SessionTimelineEvent = {
       schema: SESSION_TIMELINE_EVENT_SCHEMA,
       acpx_record_id: this.record.acpxRecordId,
@@ -548,13 +625,22 @@ export class SessionTimelineWriter {
     if (this.closed) {
       return;
     }
+    this.closed = true;
+    if (options.checkpoint !== true) {
+      return;
+    }
+
+    const localMetadata = this.metadata;
+    const lock = await acquireTimelineLock(this.record.acpxRecordId);
     try {
-      if (options.checkpoint === true) {
-        await writeSessionRecord(this.record);
-      }
+      const latest = await reconcileTimelineMetadata(
+        this.record,
+        await initializeMetadata(this.record),
+      );
+      this.metadata = mergeLocalTimelineAnnotations(latest, localMetadata);
+      await checkpointTimelineMetadata(this.record, this.metadata);
     } finally {
-      this.closed = true;
-      await releaseTimelineLock(this.lock);
+      await releaseTimelineLock(lock);
     }
   }
 }

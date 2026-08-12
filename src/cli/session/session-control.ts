@@ -12,7 +12,8 @@ import {
 } from "../../session/mode-preference.js";
 import { currentModelIdFromSetModelResponse } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
-import { resolveSessionRecord, writeSessionRecord, isoNow } from "../../session/persistence.js";
+import { resolveSessionRecord, isoNow } from "../../session/persistence.js";
+import { writeSessionRecordWithLatestTimeline } from "../../session/timeline.js";
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
@@ -66,7 +67,7 @@ export async function setSessionMode(
   if (submittedToOwner) {
     const record = await resolveSessionRecord(options.sessionId);
     setDesiredModeId(record, options.modeId);
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       resumed: false,
@@ -104,7 +105,7 @@ export async function setSessionModel(
       record,
       currentModelIdFromSetModelResponse(submittedToOwner.response, options.modelId),
     );
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       response: submittedToOwner.response,
@@ -148,7 +149,7 @@ export async function setSessionConfigOption(
     } else {
       setDesiredConfigOption(record, options.configId, options.value);
     }
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       response: ownerResponse,
@@ -285,7 +286,7 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   record.pid = undefined;
   record.closed = true;
   record.closedAt = isoNow();
-  await writeSessionRecord(record);
+  await writeSessionRecordWithLatestTimeline(record);
 
   return record;
 }

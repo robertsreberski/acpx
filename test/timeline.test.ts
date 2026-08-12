@@ -663,11 +663,76 @@ test("concurrent timeline appends serialize without losing or reusing a sequence
       Array.from({ length: 12 }, (_value, index) => index + 1),
     );
     assert.deepEqual(
-      events.map((event) => event.turn_id).toSorted(),
-      Array.from({ length: 12 }, (_value, index) => `turn-${index}`).toSorted(),
+      events
+        .map((event) => event.turn_id)
+        .toSorted((left, right) => (left ?? "").localeCompare(right ?? "")),
+      Array.from({ length: 12 }, (_value, index) => `turn-${index}`).toSorted((left, right) =>
+        left.localeCompare(right),
+      ),
     );
     assert.equal(page.coverage, "complete");
     const persisted = await resolveSessionRecord(initial.acpxRecordId);
     assert.equal(persisted.timeline?.last_seq, 12);
+  });
+});
+
+test("an active turn writer never blocks a queued turn submission", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = sessionRecord("timeline-live-and-queued", cwd);
+    await writeSessionRecord(initial);
+
+    const activeWriter = await SessionEventWriter.open(initial);
+    await activeWriter.appendLifecycleEvent(
+      { type: "turn_started" },
+      { turnId: "turn-active", requestId: "turn-active" },
+    );
+
+    const queuedRecord = await resolveSessionRecord(initial.acpxRecordId);
+    const queuedAppend = appendSessionTimelineLifecycleEvent(
+      queuedRecord,
+      { type: "turn_submitted" },
+      { turnId: "turn-queued", requestId: "turn-queued" },
+    );
+    const admittedPromptly = await Promise.race([
+      queuedAppend.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+
+    if (!admittedPromptly) {
+      // Release the pre-fix long-lived lock so the failed assertion cannot
+      // strand a background append or leak a lock into test cleanup.
+      await activeWriter.close({ checkpoint: true });
+      await queuedAppend;
+      assert.fail("queued turn submission waited for the active turn writer to close");
+    }
+
+    // A long-lived writer still owns a stale record object here. Its ordinary
+    // session checkpoint must merge, not overwrite, the independent append.
+    await activeWriter.checkpoint();
+    assert.equal((await resolveSessionRecord(initial.acpxRecordId)).timeline?.last_seq, 2);
+
+    await activeWriter.appendLifecycleEvent(
+      { type: "turn_completed", stop_reason: "end_turn" },
+      { turnId: "turn-active", requestId: "turn-active" },
+    );
+    await activeWriter.close({ checkpoint: true });
+
+    const page = await listSessionTimelinePage(initial.acpxRecordId, { limit: 20 });
+    const events = page.items.filter((item) => "seq" in item);
+    assert.deepEqual(
+      events.map((event) => [
+        event.seq,
+        event.turn_id,
+        event.payload.kind === "lifecycle" ? event.payload.event.type : "acp",
+      ]),
+      [
+        [1, "turn-active", "turn_started"],
+        [2, "turn-queued", "turn_submitted"],
+        [3, "turn-active", "turn_completed"],
+      ],
+    );
+    assert.equal((await resolveSessionRecord(initial.acpxRecordId)).timeline?.last_seq, 3);
   });
 });

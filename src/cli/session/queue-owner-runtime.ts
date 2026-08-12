@@ -12,11 +12,8 @@ import {
   sessionOptionsFromRecord,
 } from "../../runtime/engine/session-options.js";
 import { sweepPendingRequests } from "../../session/pending-requests.js";
-import {
-  absolutePath,
-  resolveSessionRecord,
-  writeSessionRecord,
-} from "../../session/persistence.js";
+import { absolutePath, resolveSessionRecord } from "../../session/persistence.js";
+import { writeSessionRecordWithLatestTimeline } from "../../session/timeline.js";
 import type { AcpClientOptions, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
@@ -363,7 +360,7 @@ async function writeQueueOwnerLifecycleSnapshot(
   try {
     const record = await resolveSessionRecord(sessionId);
     applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
   } catch {
     // best effort - session may already be cleaned up
   }
