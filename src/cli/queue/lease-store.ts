@@ -37,6 +37,32 @@ export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
 
+/**
+ * Number of permission-policy rule keys this protocol version was decided
+ * against. Adding a key to PERMISSION_POLICY_RULE_KEYS means every existing
+ * owner silently ignores it — the same failure `defer` had — so a new rule key
+ * is a protocol decision, not a local one. When one lands: teach
+ * `permissionPolicyNeedsDeferSupport` (src/cli/queue/ipc.ts) about the new key,
+ * bump QUEUE_PROTOCOL_VERSION, then update this count. A test pins the two
+ * together so the decision cannot be skipped by accident.
+ */
+export const QUEUE_PROTOCOL_RULE_KEY_COUNT = 4;
+
+/**
+ * Known and deliberately unmitigated: a client from a build that predates
+ * protocol v2 talking to a current owner still fails with
+ * QUEUE_PROTOCOL_MALFORMED_MESSAGE when it receives action "defer", because old
+ * clients do not read `queueProtocol`.
+ *
+ * This is fixable — the submit request could carry a `clientProtocol` field and
+ * the owner could downgrade "defer" to "escalate" for old clients. We are not
+ * doing it: that direction fails loud rather than silently mis-deciding a
+ * permission, it only occurs when someone runs an older client against a newer
+ * warm owner (a downgrade, not the normal upgrade path), and the downgrade
+ * would make an owner report an action it did not take. Do not re-open this on
+ * the premise that it is unfixable; it is a cost/benefit call.
+ */
+
 export type QueueOwnerRecord = {
   pid: number;
   sessionId: string;

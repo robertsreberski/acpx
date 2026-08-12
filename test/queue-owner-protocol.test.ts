@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { trySubmitToRunningOwner } from "../src/cli/queue/ipc.js";
 import {
+  QUEUE_PROTOCOL_RULE_KEY_COUNT,
   QUEUE_PROTOCOL_VERSION,
   queueOwnerProtocolVersion,
   readQueueOwnerRecord,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/lease-store.js";
 import { QueueConnectionError } from "../src/errors.js";
+import { PERMISSION_POLICY_RULE_KEYS } from "../src/types.js";
 import type { OutputFormatter, PermissionPolicy } from "../src/types.js";
 import {
   queuePaths,
@@ -186,4 +188,17 @@ test("a freshly acquired lease stamps the queue protocol version and acpx build"
     assert.equal(typeof owner.acpxVersion, "string");
     assert.equal((owner.acpxVersion ?? "").length > 0, true);
   });
+});
+
+test("adding a permission policy rule key forces a queue protocol decision", () => {
+  // Not a style check. A new rule key is invisible to every owner already
+  // running, which is exactly how `defer` got auto-approved by v1 owners. If
+  // this fails, decide the protocol question in src/cli/queue/lease-store.ts
+  // before updating the count.
+  assert.equal(
+    PERMISSION_POLICY_RULE_KEYS.length,
+    QUEUE_PROTOCOL_RULE_KEY_COUNT,
+    "PERMISSION_POLICY_RULE_KEYS changed: teach permissionPolicyNeedsDeferSupport about the " +
+      "new key, bump QUEUE_PROTOCOL_VERSION, then update QUEUE_PROTOCOL_RULE_KEY_COUNT",
+  );
 });
