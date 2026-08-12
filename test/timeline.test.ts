@@ -20,6 +20,7 @@ import {
   writeSessionRecord,
 } from "../src/session/persistence.js";
 import {
+  appendSessionTimelineLifecycleEvent,
   captureAcpTimelineEvent,
   getActiveSessionTimelineTurn,
   getLatestSessionTimelineLifecycleEvent,
@@ -323,6 +324,47 @@ test("a corrupt timeline tail is disclosed and rotates the epoch before the next
   });
 });
 
+test("a stale record cannot resurrect an epoch after corruption rotation", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = sessionRecord("timeline-stale-epoch", cwd);
+    await writeSessionRecord(initial);
+
+    const first = await SessionTimelineWriter.open(initial);
+    await first.appendLifecycleEvent({ type: "turn_submitted" }, { turnId: "before-corrupt" });
+    await first.close({ checkpoint: true });
+    const stale = await resolveSessionRecord(initial.acpxRecordId);
+    const staleEpoch = stale.timeline?.epoch;
+    assert.ok(stale.timeline?.active_path);
+    await fs.appendFile(stale.timeline.active_path, "{corrupt tail\n", "utf8");
+
+    const rotatingRecord = await resolveSessionRecord(initial.acpxRecordId);
+    const rotated = await SessionTimelineWriter.open(rotatingRecord);
+    await rotated.appendLifecycleEvent({ type: "turn_submitted" }, { turnId: "after-rotation" });
+    await rotated.close({ checkpoint: true });
+    const rotatedEpoch = rotated.getRecord().timeline?.epoch;
+    assert.ok(rotatedEpoch);
+    assert.notEqual(rotatedEpoch, staleEpoch);
+
+    const writerFromStaleRecord = await SessionTimelineWriter.open(stale);
+    await writerFromStaleRecord.appendLifecycleEvent(
+      { type: "turn_submitted" },
+      { turnId: "from-stale-record" },
+    );
+    await writerFromStaleRecord.close({ checkpoint: true });
+
+    const persisted = await resolveSessionRecord(initial.acpxRecordId);
+    assert.equal(persisted.timeline?.epoch, rotatedEpoch);
+    const page = await listSessionTimelinePage(initial.acpxRecordId, { limit: 20 });
+    assert.equal(page.coverage, "incomplete");
+    assert.deepEqual(
+      page.items.filter((item) => "seq" in item).map((item) => item.turn_id),
+      ["after-rotation", "from-stale-record"],
+    );
+  });
+});
+
 test("legacy retained sessions disclose a gap instead of claiming complete history", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -588,5 +630,44 @@ test("live writer locks never become stale merely because a turn is old", async 
     } finally {
       keeper.kill("SIGTERM");
     }
+  });
+});
+
+test("concurrent timeline appends serialize without losing or reusing a sequence", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = sessionRecord("timeline-concurrent", cwd);
+    await writeSessionRecord(initial);
+
+    // Each call resolves the record independently, matching separate service or
+    // console processes racing to append lifecycle evidence for one session.
+    const appendFromIndependentWriter = async (turnId: string): Promise<void> => {
+      const record = await resolveSessionRecord(initial.acpxRecordId);
+      await appendSessionTimelineLifecycleEvent(
+        record,
+        { type: "turn_submitted" },
+        { turnId, requestId: turnId },
+      );
+    };
+    await Promise.all(
+      Array.from({ length: 12 }, async (_value, index) => {
+        await appendFromIndependentWriter(`turn-${index}`);
+      }),
+    );
+
+    const page = await listSessionTimelinePage(initial.acpxRecordId, { limit: 100 });
+    const events = page.items.filter((item) => "seq" in item);
+    assert.deepEqual(
+      events.map((event) => event.seq),
+      Array.from({ length: 12 }, (_value, index) => index + 1),
+    );
+    assert.deepEqual(
+      events.map((event) => event.turn_id).toSorted(),
+      Array.from({ length: 12 }, (_value, index) => `turn-${index}`).toSorted(),
+    );
+    assert.equal(page.coverage, "complete");
+    const persisted = await resolveSessionRecord(initial.acpxRecordId);
+    assert.equal(persisted.timeline?.last_seq, 12);
   });
 });

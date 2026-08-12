@@ -40,6 +40,7 @@ type ParsedCommand = {
 
 type MockAgentOptions = {
   hangOnNewSession: boolean;
+  fixedNewSessionId?: string;
   newSessionMeta?: Record<string, string>;
   loadSessionMeta?: Record<string, string>;
   resumeSessionMeta?: Record<string, string>;
@@ -428,6 +429,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let cancelDelayMs = 0;
   let hangOnNewSession = false;
+  let fixedNewSessionId: string | undefined;
   let pidFile: string | undefined;
   let callLog: string | undefined;
 
@@ -436,6 +438,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--supports-load-session") {
       supportsLoadSession = true;
+      continue;
+    }
+
+    if (token === "--fixed-new-session-id") {
+      fixedNewSessionId = parseOptionValue(argv, index + 1, token);
+      index += 1;
       continue;
     }
 
@@ -632,6 +640,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
   return {
     hangOnNewSession,
+    fixedNewSessionId,
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
     loadSessionMeta: Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
     resumeSessionMeta:
@@ -849,7 +858,7 @@ class MockAgent implements Agent {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
-    const sessionId = randomUUID();
+    const sessionId = this.options.fixedNewSessionId ?? randomUUID();
     this.sessions.set(sessionId, createSessionState(false));
     this.logCall({ method: "session/new", sessionId });
 

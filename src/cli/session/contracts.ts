@@ -64,6 +64,8 @@ export type RunOnceOptions = {
 } & TimedRunOptions;
 
 export type SessionCreateOptions = {
+  /** Optional caller-owned local record identity; provider session ids remain adapter-scoped. */
+  acpxRecordId?: string;
   agentCommand: string;
   agentArgv?: string[];
   cwd: string;

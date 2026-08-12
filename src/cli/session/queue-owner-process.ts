@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -148,6 +149,22 @@ export function queueOwnerSpawnArgsForEntry(
   execArgv: readonly string[] = process.execArgv,
 ): string[] {
   return [...sanitizeQueueOwnerExecArgv(execArgv), entryPath, "__queue-owner"];
+}
+
+/**
+ * Resolve the CLI beside a bundled public entry, while retaining the source
+ * tree layout used by the tsc test build. `dist/sessions.js` and `dist/cli.js`
+ * are siblings; `src/sessions-service/service.js` sits one directory deeper.
+ */
+export function queueOwnerSpawnArgsForModule(
+  moduleUrl: string,
+  execArgv: readonly string[] = process.execArgv,
+): string[] {
+  const modulePath = fileURLToPath(moduleUrl);
+  const moduleDir = path.dirname(modulePath);
+  const cliDir =
+    path.basename(moduleDir) === "sessions-service" ? path.dirname(moduleDir) : moduleDir;
+  return queueOwnerSpawnArgsForEntry(path.join(cliDir, "cli.js"), execArgv);
 }
 
 export function resolveQueueOwnerSpawnArgs(argv: readonly string[] = process.argv): string[] {

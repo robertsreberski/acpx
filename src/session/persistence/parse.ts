@@ -430,6 +430,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
 
   const state: SessionAcpxState = {};
 
+  assignStringState(state, "agent_id", record.agent_id);
   assignBooleanTrue(state, "reset_on_next_ensure", record.reset_on_next_ensure);
   assignStringState(state, "current_mode_id", record.current_mode_id);
   assignStringState(state, "desired_mode_id", record.desired_mode_id);
@@ -479,7 +480,7 @@ function assignBooleanTrue(
 
 function assignStringState(
   state: SessionAcpxState,
-  key: "current_mode_id" | "desired_mode_id" | "current_model_id",
+  key: "agent_id" | "current_mode_id" | "desired_mode_id" | "current_model_id",
   value: unknown,
 ): void {
   if (typeof value === "string") {

@@ -122,6 +122,22 @@ test("parseSessionRecord preserves persisted session env", () => {
   });
 });
 
+test("parseSessionRecord preserves the sessions-service agent identity", () => {
+  const serialized = serializeSessionRecordForDisk(
+    makeSessionRecord({
+      acpxRecordId: "stable-agent-identity",
+      acpSessionId: "provider-scoped-id",
+      agentCommand: "agent-command-v2",
+      cwd: "/tmp/stable-agent-identity",
+      acpx: { agent_id: "custom-agent" },
+    }),
+  );
+
+  const parsed = parseSessionRecord(serialized);
+
+  assert.equal(parsed?.acpx?.agent_id, "custom-agent");
+});
+
 test("parseSessionRecord ignores malformed config options during model-control migration", () => {
   const serialized = serializeSessionRecordForDisk(
     makeSessionRecord({

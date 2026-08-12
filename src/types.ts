@@ -497,6 +497,8 @@ export type SessionConversation = {
 };
 
 export type SessionAcpxState = {
+  /** Stable registry identity for sessions created through the public sessions service. */
+  agent_id?: string;
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;

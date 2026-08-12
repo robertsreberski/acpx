@@ -51,12 +51,13 @@ async function createSessionRecordWithClient(
     ? await resumeSessionRecordWithClient(client, options, cwd)
     : await createFreshSessionState(client, options, cwd);
   const { sessionId, agentSessionId } = createdState;
+  const acpxRecordId = options.acpxRecordId ?? sessionId;
 
   const lifecycle = client.getAgentLifecycleSnapshot();
   const now = isoNow();
   const record: SessionRecord = {
     schema: "acpx.session.v1",
-    acpxRecordId: sessionId,
+    acpxRecordId,
     acpSessionId: sessionId,
     agentSessionId,
     agentCommand: options.agentCommand,
@@ -67,7 +68,7 @@ async function createSessionRecordWithClient(
     lastUsedAt: now,
     lastSeq: 0,
     lastRequestId: undefined,
-    eventLog: defaultSessionEventLog(sessionId),
+    eventLog: defaultSessionEventLog(acpxRecordId),
     closed: false,
     closedAt: undefined,
     pid: lifecycle.running ? lifecycle.pid : undefined,

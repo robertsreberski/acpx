@@ -381,7 +381,16 @@ async function runQueueOwnerRequest<TResult>(options: {
 
       if (buffer.length > MAX_MESSAGE_BUFFER_SIZE) {
         socket.destroy();
-        finishReject(new Error(`Message buffer exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes`));
+        finishReject(
+          new QueueConnectionError(
+            `Queue owner response exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes after request write`,
+            {
+              detailCode: "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE",
+              origin: "queue",
+              retryable: true,
+            },
+          ),
+        );
         return;
       }
 
@@ -398,8 +407,17 @@ async function runQueueOwnerRequest<TResult>(options: {
       }
     });
 
-    socket.once("error", (error: Error) => {
-      finishReject(error);
+    socket.once("error", () => {
+      // Once connected, the request write is initiated synchronously below.
+      // A transport error can therefore no longer prove the owner did not
+      // accept the turn and must remain an ambiguous admission.
+      finishReject(
+        new QueueConnectionError("Queue owner transport failed after request write", {
+          detailCode: "QUEUE_TRANSPORT_ERROR_AFTER_WRITE",
+          origin: "queue",
+          retryable: true,
+        }),
+      );
     });
 
     socket.once("close", () => {

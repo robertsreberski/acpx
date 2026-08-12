@@ -45,6 +45,10 @@ function recordedCapabilities(
 }
 
 function agentIdForRecord(record: SessionRecord, registry: Record<string, string>): string {
+  const persistedAgentId = record.acpx?.agent_id;
+  if (persistedAgentId && Object.hasOwn(registry, persistedAgentId)) {
+    return persistedAgentId;
+  }
   const matching = Object.entries(registry).find(([, command]) => command === record.agentCommand);
   return matching?.[0] ?? "unregistered";
 }

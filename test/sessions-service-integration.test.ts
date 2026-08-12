@@ -25,7 +25,7 @@ async function waitFor<T>(read: () => Promise<T | undefined>, timeoutMs = 10_000
 
 async function writeAgentConfig(
   homeDir: string,
-  agents: Record<string, { args: string[] }>,
+  agents: Record<string, { args: string[]; command?: string }>,
 ): Promise<void> {
   await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
   await fs.writeFile(
@@ -34,7 +34,7 @@ async function writeAgentConfig(
       agents: Object.fromEntries(
         Object.entries(agents).map(([name, value]) => [
           name,
-          { command: process.execPath, args: [MOCK_AGENT_PATH, ...value.args] },
+          { command: value.command ?? process.execPath, args: [MOCK_AGENT_PATH, ...value.args] },
         ]),
       ),
     })}\n`,
@@ -188,8 +188,141 @@ test("a listed provider session can be adopted by its exact provider id", async 
       providerSessionId: provider.providerSessionId,
       idempotencyKey: "adopt-listed-provider",
     });
-    assert.equal(adopted.result.acpxRecordId, provider.providerSessionId);
+    assert.notEqual(adopted.result.acpxRecordId, provider.providerSessionId);
     assert.equal(adopted.result.acpSessionId, provider.providerSessionId);
+    service.dispose();
+  });
+});
+
+test("duplicate provider adoption survives configured command drift without reconnecting", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "calls.ndjson");
+    const replacementCommand = path.join(homeDir, "not-installed-node-replacement");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      resumable: {
+        args: ["--supports-resume-session", "--supports-list-sessions", "--call-log", callLog],
+      },
+    });
+    const firstService = createAcpxSessionService({ cwd });
+    const [provider] = (await firstService.listProviderSessions({ agentId: "resumable", cwd }))
+      .sessions;
+    assert.ok(provider);
+
+    const first = await firstService.adoptSession({
+      agentId: "resumable",
+      cwd,
+      name: "first-name",
+      providerSessionId: provider.providerSessionId,
+      idempotencyKey: "adopt-provider-first",
+    });
+    firstService.dispose();
+
+    await writeAgentConfig(homeDir, {
+      resumable: {
+        command: replacementCommand,
+        args: ["--supports-resume-session", "--supports-list-sessions", "--call-log", callLog],
+      },
+    });
+    const replacementService = createAcpxSessionService({ cwd });
+    const duplicate = await replacementService.adoptSession({
+      agentId: "resumable",
+      cwd,
+      name: "different-name",
+      providerSessionId: provider.providerSessionId,
+      idempotencyKey: "adopt-provider-again",
+    });
+
+    assert.equal(duplicate.replayed, false);
+    assert.equal(duplicate.result.acpxRecordId, first.result.acpxRecordId);
+    assert.equal(duplicate.result.name, "first-name");
+    assert.equal(duplicate.result.agentId, "resumable");
+    assert.equal((await listSessions()).length, 1);
+    const calls = (await fs.readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string });
+    assert.equal(calls.filter((entry) => entry.method === "session/resume").length, 1);
+    replacementService.dispose();
+  });
+});
+
+test("provider session ids cannot collide across registered agent identities", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      alpha: { args: ["--supports-resume-session", "--supports-list-sessions"] },
+      beta: { args: ["--supports-resume-session", "--supports-list-sessions"] },
+    });
+    const service = createAcpxSessionService({ cwd });
+    const [provider] = (await service.listProviderSessions({ agentId: "alpha", cwd })).sessions;
+    assert.ok(provider);
+
+    const adopted = await service.adoptSession({
+      agentId: "alpha",
+      cwd,
+      providerSessionId: provider.providerSessionId,
+      idempotencyKey: "adopt-alpha-provider",
+    });
+
+    await assert.rejects(
+      async () =>
+        await service.adoptSession({
+          agentId: "beta",
+          cwd,
+          providerSessionId: provider.providerSessionId,
+          idempotencyKey: "adopt-beta-collision",
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof AcpxSessionAdoptionError);
+        assert.match(error.message, /already adopted by agent "alpha"/u);
+        return true;
+      },
+    );
+    const records = await listSessions();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.acpxRecordId, adopted.result.acpxRecordId);
+    assert.equal(records[0]?.acpx?.agent_id, "alpha");
+    assert.equal(
+      (await service.getSession({ acpxRecordId: adopted.result.acpxRecordId }))?.agentId,
+      "alpha",
+    );
+    service.dispose();
+  });
+});
+
+test("fresh sessions use collision-safe local ids when adapters return the same provider id", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const sharedProviderId = "adapter-scoped-provider-id";
+    await writeAgentConfig(homeDir, {
+      alpha: { args: ["--fixed-new-session-id", sharedProviderId] },
+      beta: { args: ["--fixed-new-session-id", sharedProviderId] },
+    });
+    const service = createAcpxSessionService({ cwd });
+
+    const alpha = await service.createSession({
+      agentId: "alpha",
+      cwd,
+      idempotencyKey: "create-alpha-collision",
+    });
+    const beta = await service.createSession({
+      agentId: "beta",
+      cwd,
+      idempotencyKey: "create-beta-collision",
+    });
+
+    assert.notEqual(alpha.result.acpxRecordId, beta.result.acpxRecordId);
+    assert.equal(alpha.result.acpSessionId, sharedProviderId);
+    assert.equal(beta.result.acpSessionId, sharedProviderId);
+    assert.equal(alpha.result.agentId, "alpha");
+    assert.equal(beta.result.agentId, "beta");
+    const records = await listSessions();
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((record) => record.acpx?.agent_id).toSorted(), ["alpha", "beta"]);
     service.dispose();
   });
 });

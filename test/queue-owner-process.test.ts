@@ -9,6 +9,7 @@ import {
   buildQueueOwnerArgOverride,
   queueOwnerRuntimeOptionsFromSend,
   queueOwnerSpawnArgsForEntry,
+  queueOwnerSpawnArgsForModule,
   resolveQueueOwnerSpawnArgs,
   sanitizeQueueOwnerExecArgv,
   writeQueueOwnerPayloadFile,
@@ -140,6 +141,25 @@ describe("queueOwnerSpawnArgsForEntry", () => {
       "/tmp/acpx-cli.js",
       "__queue-owner",
     ]);
+  });
+});
+
+describe("queueOwnerSpawnArgsForModule", () => {
+  it("targets the sibling CLI from a bundled public entry", () => {
+    assert.deepEqual(queueOwnerSpawnArgsForModule("file:///tmp/acpx/dist/sessions.js", []), [
+      "/tmp/acpx/dist/cli.js",
+      "__queue-owner",
+    ]);
+  });
+
+  it("targets the parent CLI from the source-shaped tsc build", () => {
+    assert.deepEqual(
+      queueOwnerSpawnArgsForModule(
+        "file:///tmp/acpx/dist-test/src/sessions-service/service.js",
+        [],
+      ),
+      ["/tmp/acpx/dist-test/src/cli.js", "__queue-owner"],
+    );
   });
 });
 

@@ -65,15 +65,27 @@ session with a new one. The service mediates existing queue-owner IPC, so a web
 request cannot bypass deferred-request handling or compete with the owner for
 the adapter connection.
 
-The existing CLI session, prompt, request, and response commands should use
-this service where their contract overlaps. One queue-aware implementation is
-the defense against CLI and web semantics drifting apart.
+V1 does not mechanically route the existing CLI handlers through this service.
+The CLI remains a compatibility surface over the same persistence, timeline,
+queue IPC, pending-request, and error-classification primitives. Until those
+handlers converge, overlapping behavior is a parity obligation: exact record
+and turn identity, tagged pending answers, queue admission (including unknown
+outcomes), owner generation, permission policy, and cancellation must retain
+the same meaning on CLI and embedding surfaces. Contract tests at those shared
+primitives are the defense against semantic drift; later CLI convergence may
+delegate to the service without changing the external CLI contract.
 
 ## Identity and state
 
 The stable external identity is `acpxRecordId`. Provider session IDs and
 adapter process IDs may change after reconnect and are not browser route keys.
 Suffix or fuzzy session matching is not exposed over HTTP.
+
+Service-created records use a collision-safe local `acpxRecordId` independent
+of the adapter-scoped provider session ID. Adoption persists the registered
+agent identity with that mapping: command upgrades for the same agent keep the
+record, while a provider-ID collision from a different agent is rejected rather
+than returning or overwriting the wrong transcript.
 
 State is a product of independent axes:
 
@@ -244,6 +256,9 @@ proof follows each stateful boundary:
   idempotency replay and conflict, owner-generation changes, queued admission,
   cancellation, pending-request answers, and ambiguous owner loss without
   duplicate execution.
+- CLI/service parity tests cover their shared queue wire, exact turn
+  cancellation, tagged pending answers, and admission-error classification;
+  V1 does not claim that legacy CLI handlers delegate through the service.
 - Mock-agent integration covers create, adopt, streaming transcript updates,
   queue-next ordering, cancellation, permissions, elicitations, owner restart,
   console restart, and session close.

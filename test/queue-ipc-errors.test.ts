@@ -69,6 +69,71 @@ test("queue admission ambiguity distinguishes transport loss from explicit rejec
   assert.equal(isQueueAdmissionOutcomeUnknown(new Error("not a queue error")), false);
 });
 
+test("an acknowledged prompt whose owner generation disappears is an ambiguous admission", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "ambiguous-owner-generation";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      ownerGeneration: 71,
+      queueProtocol: 3,
+      parking: true,
+      parkingMaxAgeMs: 86_400_000,
+    });
+
+    let acceptedRequests = 0;
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      acceptedRequests += 1;
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+          ownerGeneration: 71,
+        })}\n`,
+      );
+      // The owner accepted the exact turn but died before returning a result.
+      // The client must not classify this as a definitive retryable rejection.
+      socket.end();
+    });
+    await listenServer(server, socketPath);
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            turnId: "turn-ambiguous",
+            message: "hello",
+            permissionMode: "approve-reads",
+            permissionPolicy: { defaultAction: "defer" },
+            defer: true,
+            deferMaxAgeMs: 86_400_000,
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert.equal(
+            (error as { detailCode?: string }).detailCode,
+            "QUEUE_DISCONNECTED_BEFORE_COMPLETION",
+          );
+          assert.equal(isQueueAdmissionOutcomeUnknown(error), true);
+          return true;
+        },
+      );
+      assert.equal(acceptedRequests, 1);
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "prompt-error-session";
@@ -382,8 +447,11 @@ test("trySubmitToRunningOwner rejects oversized queue messages", async () => {
             waitForCompletion: true,
           }),
         (error: unknown) => {
-          assert(error instanceof Error);
-          assert.match(error.message, /Message buffer exceeded/);
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE");
+          assert.equal(error.origin, "queue");
+          assert.equal(error.retryable, true);
+          assert.equal(isQueueAdmissionOutcomeUnknown(error), true);
           return true;
         },
       );

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -21,6 +22,7 @@ const PUBLISHED_VALUES = [
 const PUBLISHED_TYPES = [
   "AcpxCreateSessionInput",
   "AcpxMutationReceipt",
+  "AcpxModeState",
   "AcpxPendingRequest",
   "AcpxRegisteredAgent",
   "AcpxSessionDetail",
@@ -36,6 +38,71 @@ test("dist/sessions.js exports the stable service values", async () => {
     assert.equal(name in sessions, true, `dist/sessions.js does not export ${name}`);
   }
   assert.equal(typeof sessions.createAcpxSessionService, "function");
+});
+
+test("the published sessions bundle spawns its sibling CLI for queue admission", async () => {
+  const homeDir = await fs.mkdtemp(path.join(tmpdir(), "acpx-sessions-bundle-home-"));
+  const previousHome = process.env.HOME;
+  process.env.HOME = homeDir;
+  const cwd = path.join(homeDir, "workspace");
+  const mockAgentPath = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+  await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+  await fs.mkdir(cwd, { recursive: true });
+  await fs.writeFile(
+    path.join(homeDir, ".acpx", "config.json"),
+    `${JSON.stringify({
+      agents: {
+        bundled: {
+          command: process.execPath,
+          args: [mockAgentPath, "--supports-resume-session"],
+        },
+      },
+    })}\n`,
+    "utf8",
+  );
+
+  try {
+    const sessions = (await import(DIST_SESSIONS_URL.href)) as {
+      createAcpxSessionService(options?: { cwd?: string }): {
+        createSession(input: {
+          agentId: string;
+          cwd: string;
+          idempotencyKey: string;
+        }): Promise<{ result: { acpxRecordId: string } }>;
+        enqueuePrompt(input: {
+          acpxRecordId: string;
+          prompt: string;
+          idempotencyKey: string;
+        }): Promise<{ result: { admission: string } }>;
+        closeSession(input: { acpxRecordId: string; idempotencyKey: string }): Promise<unknown>;
+        dispose(): void;
+      };
+    };
+    const service = sessions.createAcpxSessionService({ cwd });
+    const created = await service.createSession({
+      agentId: "bundled",
+      cwd,
+      idempotencyKey: "published-create",
+    });
+    const admitted = await service.enqueuePrompt({
+      acpxRecordId: created.result.acpxRecordId,
+      prompt: "echo published bundle",
+      idempotencyKey: "published-enqueue",
+    });
+    assert.equal(admitted.result.admission, "queued");
+    await service.closeSession({
+      acpxRecordId: created.result.acpxRecordId,
+      idempotencyKey: "published-close",
+    });
+    service.dispose();
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = previousHome;
+    }
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
 });
 
 test("the acpx/sessions subpath types are importable by a package consumer", () => {

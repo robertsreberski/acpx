@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import {
   mergeAgentRegistry,
   normalizeAgentName,
@@ -15,7 +14,7 @@ import {
   tryRespondOnRunningOwner,
 } from "../cli/queue/ipc.js";
 import { readLiveQueueOwner, readQueueOwnerRecord } from "../cli/queue/lease-store.js";
-import { queueOwnerSpawnArgsForEntry } from "../cli/session/queue-owner-process.js";
+import { queueOwnerSpawnArgsForModule } from "../cli/session/queue-owner-process.js";
 import { sendSession } from "../cli/session/queue-owner-runtime.js";
 import {
   cancelSessionPrompt,
@@ -69,9 +68,7 @@ const LIVE_PENDING_LIST_TIMEOUT_MS = 2_000;
 const DEFAULT_PENDING_RESPONSE_TIMEOUT_MS = 60_000;
 const DEFAULT_DEFER_MAX_AGE_MS = 86_400_000;
 const NO_LIVE_OWNER_GENERATION = 0;
-const SESSION_SERVICE_QUEUE_OWNER_ARGS = queueOwnerSpawnArgsForEntry(
-  fileURLToPath(new URL("../cli.js", import.meta.url)),
-);
+const SESSION_SERVICE_QUEUE_OWNER_ARGS = queueOwnerSpawnArgsForModule(import.meta.url);
 
 /** Browser-created sessions stop at the human boundary unless a caller opts into another policy. */
 export const DEFAULT_SESSIONS_PERMISSION_POLICY: Readonly<PermissionPolicy> = {
@@ -383,18 +380,40 @@ class SessionService implements AcpxSessionService {
   ): Promise<AcpxSessionDetail> {
     const agent = await this.resolveAgent(input.agentId, input.cwd);
     if (providerSessionId) {
-      const existing = (await listSessions()).find(
-        (record) =>
-          record.acpSessionId === providerSessionId && record.agentCommand === agent.agentCommand,
+      const candidates = (await listSessions()).filter(
+        (record) => record.acpSessionId === providerSessionId,
       );
+      const existing =
+        candidates.find((record) => record.acpx?.agent_id === agent.agentId) ??
+        candidates.find(
+          (record) =>
+            record.acpx?.agent_id === undefined && record.agentCommand === agent.agentCommand,
+        );
       if (existing) {
+        if (existing.acpx?.agent_id === undefined) {
+          existing.acpx = { ...existing.acpx, agent_id: agent.agentId };
+          await writeSessionRecord(existing);
+        }
         return await this.projectDetail(existing);
+      }
+      if (candidates.length > 0) {
+        const owner = candidates[0]?.acpx?.agent_id;
+        throw new AcpxSessionAdoptionError(
+          agent.agentId,
+          providerSessionId,
+          new Error(
+            owner
+              ? `provider session is already adopted by agent ${JSON.stringify(owner)}`
+              : "provider session is already adopted by an unverified agent command",
+          ),
+        );
       }
     }
 
     let created: Awaited<ReturnType<typeof createSessionWithClient>>;
     try {
       created = await createSessionWithClient({
+        acpxRecordId: randomUUID(),
         agentCommand: agent.agentCommand,
         agentArgv: agent.agentArgv,
         cwd: input.cwd,
@@ -418,6 +437,8 @@ class SessionService implements AcpxSessionService {
     }
     const { record, client } = created;
     try {
+      record.acpx = { ...record.acpx, agent_id: agent.agentId };
+      await writeSessionRecord(record);
       await checkpoint?.({ recordId: record.acpxRecordId, phase: "created" });
       const mode = input.mode ?? defaultMode(agent.agentId);
       if (mode) {

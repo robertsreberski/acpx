@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
 import {
   PENDING_REQUEST_SCHEMA,
   writePendingRequest,
@@ -163,6 +164,132 @@ test("owner loss after dispatch never projects a turn as still running", async (
     assert.equal(detail?.ownerState, "absent");
     assert.equal(detail?.turnState, "unknown");
     assert.equal(detail?.activeTurnId, undefined);
+  });
+});
+
+test("ambiguous queue transport loss is replayed without a duplicate turn or false failure", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-ambiguous-admission",
+      acpSessionId: "provider-ambiguous-admission",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 78,
+      queueProtocol: 3,
+      parking: true,
+      parkingMaxAgeMs: 86_400_000,
+    });
+    let submissions = 0;
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      submissions += 1;
+      socket.write(`${"x".repeat(MAX_MESSAGE_BUFFER_SIZE + 1)}\n`);
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    const input = {
+      acpxRecordId: initial.acpxRecordId,
+      prompt: "do this once",
+      idempotencyKey: "ambiguous-admission",
+    };
+    try {
+      await assert.rejects(
+        async () => await service.enqueuePrompt(input),
+        (error: unknown) => {
+          assert.equal(
+            (error as { detailCode?: string }).detailCode,
+            "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE",
+          );
+          return true;
+        },
+      );
+      const replay = await service.enqueuePrompt(input);
+      assert.equal(replay.replayed, true);
+      assert.equal(replay.result.admission, "unknown");
+      assert.equal(submissions, 1);
+
+      const transcript = await service.getTranscriptPage({
+        acpxRecordId: initial.acpxRecordId,
+        limit: 20,
+      });
+      const lifecycleTypes = transcript.items.flatMap((item) =>
+        "seq" in item && item.payload.kind === "lifecycle" ? [item.payload.event.type] : [],
+      );
+      assert.deepEqual(lifecycleTypes, ["turn_submitted"]);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("service cancellation uses the CLI queue wire with the exact active turn id", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-cancel-parity",
+      acpSessionId: "provider-cancel-parity",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const record = await resolveSessionRecord(initial.acpxRecordId);
+    await appendSessionTimelineLifecycleEvent(
+      record,
+      { type: "turn_started" },
+      { turnId: "turn-exact" },
+    );
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 79,
+      queueProtocol: 3,
+    });
+    let targetTurnId: string | undefined;
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "cancel_prompt");
+      targetTurnId = (request as typeof request & { targetTurnId?: string }).targetTurnId;
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "cancel_result",
+          requestId: request.requestId,
+          cancelled: true,
+        })}\n`,
+      );
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const result = await service.cancelTurn({
+        acpxRecordId: initial.acpxRecordId,
+        turnId: "turn-exact",
+        idempotencyKey: "cancel-exact-parity",
+      });
+      assert.equal(result.result.state, "cancelling");
+      assert.equal(targetTurnId, "turn-exact");
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
   });
 });
 

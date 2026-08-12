@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { isQueueAdmissionOutcomeUnknown } from "../src/cli/queue/ipc.js";
+import { QueueConnectionError } from "../src/errors.js";
 import {
   AcpxIdempotencyConflictError,
   AcpxIdempotencyCorruptError,
@@ -126,6 +128,51 @@ test("an ambiguous mutation keeps its recovery result instead of caching failure
     assert.deepEqual(replay.result, { turnId: "turn-1", admission: "unknown" });
     assert.equal(replay.replayed, true);
     assert.equal(runs, 1);
+  });
+});
+
+test("a real acknowledged-owner disconnect replays unknown without submitting twice", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    let submissions = 0;
+    const options = {
+      operation: "enqueue_prompt" as const,
+      idempotencyKey: "owner-disconnected-after-accept",
+      input: { acpxRecordId: "record-1", prompt: "hello" },
+      recoveryResult: { turnId: "turn-stable", admission: "unknown" as const },
+      outcomeUnknown: isQueueAdmissionOutcomeUnknown,
+    };
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation<{
+          turnId: string;
+          admission: "unknown" | "queued";
+        }>({
+          ...options,
+          run: async () => {
+            submissions += 1;
+            throw new QueueConnectionError("owner accepted, then disconnected", {
+              detailCode: "QUEUE_DISCONNECTED_BEFORE_COMPLETION",
+              origin: "queue",
+              retryable: true,
+            });
+          },
+        }),
+      /owner accepted, then disconnected/u,
+    );
+
+    const replay = await runIdempotentMutation<{
+      turnId: string;
+      admission: "unknown" | "queued";
+    }>({
+      ...options,
+      run: async () => {
+        submissions += 1;
+        return { turnId: "turn-duplicate", admission: "queued" as const };
+      },
+    });
+    assert.equal(submissions, 1);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual(replay.result, { turnId: "turn-stable", admission: "unknown" });
   });
 });
 

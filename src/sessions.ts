@@ -23,6 +23,7 @@ export type {
   AcpxEnqueuePromptResult,
   AcpxMutationOperation,
   AcpxMutationReceipt,
+  AcpxModeState,
   AcpxOwnerState,
   AcpxPendingRequest,
   AcpxPendingRequestOption,

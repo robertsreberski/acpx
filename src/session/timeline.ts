@@ -370,12 +370,15 @@ async function checkpointTimelineMetadata(
 }
 
 async function initializeMetadata(record: SessionRecord): Promise<SessionTimelineMetadata> {
-  if (record.timeline) {
-    return record.timeline;
-  }
   const persisted = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
   if (persisted?.timeline) {
+    // Disk is authoritative across writers. A caller may retain a record from
+    // before another writer isolated a corrupt epoch; trusting that stale
+    // object here would resurrect the abandoned epoch and hide newer events.
     record.timeline = persisted.timeline;
+    return record.timeline;
+  }
+  if (record.timeline) {
     return record.timeline;
   }
   const createdAt = isoNow();
