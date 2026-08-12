@@ -340,6 +340,14 @@ export function getTextErrorRemediationHints(params: RenderableOutputError): str
     ];
   }
 
+  if (params.detailCode === "PENDING_REQUEST_OWNER_GONE") {
+    // The session is fine here; only the owner that held the request is gone,
+    // so the generic "start a fresh session" advice would be wrong.
+    return [
+      "hint: the parked request died with its queue owner; re-run the prompt so the agent asks again.",
+    ];
+  }
+
   if (params.code === "NO_SESSION") {
     return noSessionHints(lowerMessage);
   }

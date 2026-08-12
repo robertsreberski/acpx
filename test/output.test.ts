@@ -262,6 +262,18 @@ test("text remediation hints cover missing session and ACP runtime failures", ()
   assert.deepEqual(getTextErrorRemediationHints({ code: "NO_SESSION", message: "No session" }), [
     "hint: the saved ACP session is missing or stale; start a fresh session with `acpx <agent> sessions new`, then retry.",
   ]);
+  // A dead queue owner is reported as NO_SESSION, but the session itself is
+  // fine, so the advice must not be "create a new session".
+  assert.deepEqual(
+    getTextErrorRemediationHints({
+      code: "NO_SESSION",
+      detailCode: "PENDING_REQUEST_OWNER_GONE",
+      message: "Request abc can no longer be answered: its queue owner is no longer running.",
+    }),
+    [
+      "hint: the parked request died with its queue owner; re-run the prompt so the agent asks again.",
+    ],
+  );
   assert.deepEqual(
     getTextErrorRemediationHints({
       code: "TIMEOUT",
