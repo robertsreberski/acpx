@@ -135,6 +135,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [refreshBootstrap]);
 
   useEffect(() => {
+    selectionGeneration.current += 1;
     setSelectedSession(null);
     setTimeline(null);
     setPending([]);
@@ -144,7 +145,10 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [refreshSelection, selectedSessionId]);
 
   useEffect(() => {
-    const onPopState = () => setSelectedSessionId(selectedSessionFromLocation());
+    const onPopState = () => {
+      selectionGeneration.current += 1;
+      setSelectedSessionId(selectedSessionFromLocation());
+    };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
@@ -168,6 +172,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [refresh]);
 
   const selectSession = useCallback((id: string | null) => {
+    selectionGeneration.current += 1;
     setSelectedSessionId(id);
     window.history.pushState(null, "", id ? `/sessions/${encodeURIComponent(id)}` : "/");
   }, []);
@@ -176,16 +181,27 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     if (!selectedSessionId || !timeline?.previousCursor) {
       return;
     }
+    const sessionId = selectedSessionId;
+    const generation = selectionGeneration.current;
+    const previousCursor = timeline.previousCursor;
     try {
-      const page = await api.timeline(selectedSessionId, timeline.previousCursor);
-      setTimeline(prependEarlierTimelinePage(timeline, page));
+      const page = await api.timeline(sessionId, previousCursor);
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
+      setTimeline((current) =>
+        current ? prependEarlierTimelinePage(current, page) : normalizeTimelinePage(page),
+      );
     } catch (error) {
+      if (generation !== selectionGeneration.current) {
+        return;
+      }
       if (error instanceof ApiError && error.status === 410) {
         notice(
           "Earlier transcript pages expired. Reloading from the earliest available event.",
           "info",
         );
-        await refreshSelection(selectedSessionId, false);
+        await refreshSelection(sessionId, false);
         return;
       }
       notice(errorMessage(error));

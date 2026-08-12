@@ -32,7 +32,6 @@ function coreFixture() {
           {
             agentId: "codex",
             label: "Codex",
-            command: "codex-acp",
             capabilities: {
               sessionList: "supported" as const,
               sessionResume: "supported" as const,
@@ -82,7 +81,12 @@ function coreFixture() {
         });
       },
       async getTranscriptPage(): Promise<TimelinePage> {
-        return { items: [], hasMore: false, coverage: "complete" };
+        return {
+          items: [],
+          hasMore: false,
+          coverage: "complete",
+          writeError: "EACCES /Users/operator/private/session.ndjson",
+        };
       },
       subscribe(_listener: (event: ServiceInvalidation) => void) {
         return () => {};
@@ -99,13 +103,16 @@ test("adapter unwraps mutation receipts and projects provider and agent inventor
     {
       agentId: "codex",
       label: "Codex",
-      command: "codex-acp",
       supportsSessionList: true,
     },
   ]);
   assert.deepEqual((await service.listProviderSessions({ agentId: "codex" })).sessions, [
     { providerSessionId: "native-1", title: "Native", cwd: undefined, updatedAt: undefined },
   ]);
+  assert.equal(
+    (await service.getTranscriptPage({ acpxRecordId: "record-1" })).writeError,
+    "Authoritative timeline persistence failed; recent history may be incomplete.",
+  );
   const created = await service.createSession({
     agentId: "codex",
     cwd: "/workspace",

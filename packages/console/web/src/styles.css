@@ -1037,7 +1037,11 @@ fieldset.elicitation-field {
     width: 310px;
     max-width: 88vw;
     transform: translateX(-105%);
-    transition: transform 0.2s ease;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      transform 0.2s ease,
+      visibility 0s linear 0.2s;
     box-shadow: var(--shadow);
   }
   .network-warning + .app-body .session-sidebar {
@@ -1045,6 +1049,9 @@ fieldset.elicitation-field {
   }
   .session-sidebar.is-open {
     transform: translateX(0);
+    visibility: visible;
+    pointer-events: auto;
+    transition-delay: 0s;
   }
   .sidebar-scrim {
     position: fixed;

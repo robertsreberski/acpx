@@ -17,7 +17,6 @@ export type TurnState =
 export interface AgentSummary {
   readonly id: string;
   readonly label: string;
-  readonly command?: string;
   readonly modes?: readonly { readonly id: string; readonly label: string }[];
   readonly models?: readonly { readonly id: string; readonly label: string }[];
   readonly canBrowseSessions?: boolean;
@@ -84,6 +83,7 @@ export interface TimelinePage {
   readonly previousCursor?: string;
   readonly coverage: "complete" | "legacy_retained";
   readonly gap?: { readonly reason: string; readonly earliestAvailableAt?: string };
+  readonly writeError?: string;
 }
 
 export interface PermissionOption {

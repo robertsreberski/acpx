@@ -30,6 +30,7 @@ export const mergeRefreshedTimelinePage = (
     previousCursor: current.previousCursor,
     coverage: legacyCoverage(current.coverage, latest.coverage),
     gap: current.gap ?? latest.gap,
+    writeError: latest.writeError ?? current.writeError,
   };
 };
 
@@ -41,4 +42,5 @@ export const prependEarlierTimelinePage = (
   events: coalesceTranscriptEvents([...earlier.events, ...current.events]),
   coverage: legacyCoverage(current.coverage, earlier.coverage),
   gap: earlier.gap ?? current.gap,
+  writeError: current.writeError ?? earlier.writeError,
 });

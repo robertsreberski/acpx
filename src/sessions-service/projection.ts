@@ -1,5 +1,5 @@
 import type { AgentCapabilities } from "@agentclientprotocol/sdk";
-import { AGENT_REGISTRY, resolveCanonicalAgentName } from "../agent-registry.js";
+import { AGENT_REGISTRY } from "../agent-registry.js";
 import { inspectQueueOwnerHealth } from "../cli/queue/ipc-health.js";
 import { getDesiredModelId } from "../session/mode-preference.js";
 import { listPendingRequests, type PendingRequest } from "../session/pending-requests.js";
@@ -42,11 +42,10 @@ export function projectRegisteredAgents(
 ): AcpxRegisteredAgent[] {
   return Object.entries(registry)
     .map(([agentId, command]) => {
-      const canonical = resolveCanonicalAgentName(agentId);
       const capabilities = recordedCapabilities(records, command);
       return {
-        agentId: canonical,
-        label: canonical,
+        agentId,
+        label: agentId,
         capabilities: {
           sessionList: capabilitySupport(capabilities?.sessionCapabilities?.list),
           sessionResume: capabilitySupport(capabilities?.sessionCapabilities?.resume),

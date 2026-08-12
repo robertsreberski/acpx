@@ -52,7 +52,7 @@ export const useDismissibleLayer = (
 
   useEffect(() => {
     if (!open) {
-      return;
+      return undefined;
     }
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const layer = layerRef?.current ?? null;

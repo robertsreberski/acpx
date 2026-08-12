@@ -17,7 +17,6 @@ export type TurnState =
 export interface ConsoleAgent {
   agentId: string;
   label: string;
-  command?: string;
   supportsSessionList?: boolean;
 }
 
@@ -69,6 +68,7 @@ export interface TimelinePage {
   previousCursor?: string;
   hasMore: boolean;
   coverage: "complete" | "legacy_retained";
+  writeError?: string;
 }
 
 export interface PendingInteraction {

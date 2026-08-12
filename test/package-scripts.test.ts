@@ -84,3 +84,14 @@ test("test scripts build packaged output before running package-bin smoke tests"
   assert.match(pkg.scripts?.test ?? "", /^pnpm run build && pnpm run build:test && /);
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
 });
+
+test("the repository gate includes the independent console package", () => {
+  const pkg = readPackageJson();
+
+  assert.match(pkg.scripts?.check ?? "", /pnpm run console:check/);
+  assert.equal(pkg.scripts?.["console:check"], "pnpm --filter acpx-console check");
+  assert.equal(
+    pkg.scripts?.["smoke:console:package"],
+    "node scripts/smoke-acpx-console-package.mjs",
+  );
+});

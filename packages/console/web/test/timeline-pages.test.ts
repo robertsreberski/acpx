@@ -25,18 +25,21 @@ test("a live refresh replaces its window but preserves loaded history and its ol
     previousCursor: "oldest-cursor",
     coverage: "legacy_retained",
     gap: { reason: "oldest retained gap" },
+    writeError: "old warning",
   };
   const latest: TimelinePage = {
     events: [event("stale-100", 100, "fresh "), event("stale-101", 101, "reply")],
     previousCursor: "latest-window-cursor",
     coverage: "complete",
     gap: { reason: "new gap" },
+    writeError: "latest warning",
   };
 
   const merged = mergeRefreshedTimelinePage(current, latest);
   assert.equal(merged.previousCursor, "oldest-cursor");
   assert.equal(merged.coverage, "legacy_retained");
   assert.deepEqual(merged.gap, { reason: "oldest retained gap" });
+  assert.equal(merged.writeError, "latest warning");
   assert.deepEqual(
     merged.events.map(({ id, text, sequence, sourceEvents }) => ({
       id,

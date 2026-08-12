@@ -43,14 +43,11 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   }, [mode, store.bootstrap.agents, store.bootstrap.workspaceRoots]);
 
   useEffect(() => {
-    if (mode !== "adopt" || !agentId || agent?.canBrowseSessions === false) {
-      return;
+    if (mode !== "adopt" || !agentId || !cwd || agent?.canBrowseSessions === false) {
+      return undefined;
     }
     let cancelled = false;
     setLoadingProviders(true);
-    if (!cwd) {
-      return;
-    }
     void api
       .providerSessions(agentId, cwd)
       .then(

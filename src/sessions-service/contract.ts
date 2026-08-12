@@ -189,6 +189,8 @@ export type AcpxTranscriptPage = {
   previousCursor?: string;
   hasMore: boolean;
   coverage: SessionTimelineCoverage;
+  /** Present when the durable append-only transcript could not persist its latest write. */
+  writeError?: string;
 };
 
 export type AcpxSessionInvalidation = {

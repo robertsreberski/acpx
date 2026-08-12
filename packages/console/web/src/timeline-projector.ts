@@ -256,7 +256,7 @@ export const coalesceTranscriptEvents = (
     if (event.kind === "tool_call" && event.requestId) {
       const index = toolIndex.get(event.requestId);
       if (index !== undefined) {
-        const original = result[index]!;
+        const original = result[index];
         result[index] = {
           ...original,
           title: event.title ?? original.title,

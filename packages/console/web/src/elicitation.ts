@@ -2,14 +2,25 @@ import type { ElicitationProperty } from "./types";
 
 const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u;
 
+const formValueText = (value: FormDataEntryValue): string => {
+  if (typeof value !== "string") {
+    throw new Error("File answers are not supported by ACP elicitation forms.");
+  }
+  return value;
+};
+
+const isFormValueArray = (
+  value: FormDataEntryValue | readonly FormDataEntryValue[],
+): value is readonly FormDataEntryValue[] => Array.isArray(value);
+
 export const coerceElicitationValue = (
   property: ElicitationProperty,
   value: FormDataEntryValue | readonly FormDataEntryValue[],
 ): unknown => {
-  if (Array.isArray(value)) {
-    return value.map(String);
+  if (isFormValueArray(value)) {
+    return value.map(formValueText);
   }
-  const scalar = String(value);
+  const scalar = formValueText(value);
   if (property.type === "number" || property.type === "integer") {
     const normalized = scalar.trim();
     if (!JSON_NUMBER.test(normalized)) {
@@ -51,11 +62,11 @@ export const readElicitationField = (
   values: readonly FormDataEntryValue[],
   required: boolean,
 ): ElicitationFieldRead => {
-  if (values.length === 0 || (values.length === 1 && String(values[0]) === "")) {
+  if (values.length === 0 || (values.length === 1 && formValueText(values[0]) === "")) {
     return { kind: required ? "missing" : "omitted" };
   }
   return {
     kind: "value",
-    value: coerceElicitationValue(property, property.type === "array" ? values : values[0]!),
+    value: coerceElicitationValue(property, property.type === "array" ? values : values[0]),
   };
 };

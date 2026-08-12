@@ -19,7 +19,6 @@ type CoreReceipt<T> = { result: T; replayed: boolean; idempotencyKey: string; op
 type CoreAgent = {
   agentId: string;
   label: string;
-  command: string;
   capabilities: { sessionList: "supported" | "unsupported" | "unknown" };
 };
 type CoreSession = ConsoleSession & { acpSessionId?: string; title?: string };
@@ -164,8 +163,17 @@ function projectAgent(agent: CoreAgent): ConsoleAgent {
   return {
     agentId: agent.agentId,
     label: agent.label,
-    command: agent.command,
     supportsSessionList: agent.capabilities.sessionList === "supported",
+  };
+}
+
+const TIMELINE_WRITE_WARNING =
+  "Authoritative timeline persistence failed; recent history may be incomplete.";
+
+function projectTimeline(page: TimelinePage): TimelinePage {
+  return {
+    ...page,
+    writeError: page.writeError ? TIMELINE_WRITE_WARNING : undefined,
   };
 }
 
@@ -244,7 +252,9 @@ export function adaptAcpxSessionService(core: CoreSessionsService): AcpxConsoleS
         })
       ).result;
     },
-    getTranscriptPage: (input) => core.getTranscriptPage(input),
+    async getTranscriptPage(input) {
+      return projectTimeline(await core.getTranscriptPage(input));
+    },
     subscribe: (listener) => core.subscribe(listener),
     dispose: () => core.dispose(),
   };

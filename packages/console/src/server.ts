@@ -67,6 +67,7 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
       code?: string;
       detailCode?: string;
       details?: unknown;
+      earliestCursor?: string;
       outputCode?: string;
     };
     if (
@@ -87,20 +88,29 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
     const mappedStatus =
       shaped.name === "SessionNotFoundError"
         ? 404
-        : code === "IDEMPOTENCY_KEY_CONFLICT" || code === "TURN_CONFLICT"
-          ? 409
-          : code === "TURN_NOT_ACTIVE" || code === "PENDING_REQUEST_NOT_ANSWERABLE"
-            ? 409
-            : code === "PENDING_REQUEST_OWNER_GONE"
-              ? 410
-              : code === "AGENT_CAPABILITY_UNSUPPORTED"
-                ? 422
-                : shaped.outputCode === "USAGE"
-                  ? 400
-                  : undefined;
+        : code === "CURSOR_INVALID" || code === "AGENT_NOT_REGISTERED"
+          ? 400
+          : code === "CURSOR_EXPIRED" || code === "PENDING_REQUEST_OWNER_GONE"
+            ? 410
+            : code === "SESSION_ADOPTION_FAILED" || code === "AGENT_CAPABILITY_UNSUPPORTED"
+              ? 422
+              : code === "IDEMPOTENCY_KEY_CONFLICT" || code === "TURN_CONFLICT"
+                ? 409
+                : code === "TURN_NOT_ACTIVE" ||
+                    code === "PENDING_REQUEST_NOT_ANSWERABLE" ||
+                    code === "IDEMPOTENCY_RESULT_UNKNOWN" ||
+                    code === "IDEMPOTENCY_RECORD_CORRUPT"
+                  ? 409
+                  : shaped.outputCode === "USAGE"
+                    ? 400
+                    : undefined;
     if (mappedStatus !== undefined) {
+      const details =
+        code === "CURSOR_EXPIRED" && shaped.earliestCursor
+          ? { earliestCursor: shaped.earliestCursor }
+          : undefined;
       return {
-        response: new HttpError(mappedStatus, code ?? "REQUEST_FAILED", shaped.message),
+        response: new HttpError(mappedStatus, code ?? "REQUEST_FAILED", shaped.message, details),
       };
     }
     return {
@@ -181,7 +191,17 @@ async function serveStatic(
 
 function routeMatch(pathname: string, pattern: RegExp): string[] | undefined {
   const match = pattern.exec(pathname);
-  return match?.slice(1).map((value) => decodeURIComponent(value));
+  if (!match) {
+    return undefined;
+  }
+  try {
+    return match.slice(1).map((value) => decodeURIComponent(value));
+  } catch (error) {
+    if (error instanceof URIError) {
+      throw new HttpError(400, "INVALID_PATH", "API path is invalid");
+    }
+    throw error;
+  }
 }
 
 function parseLimit(url: URL): number {

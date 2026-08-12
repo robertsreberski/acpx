@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   mergeAgentRegistry,
+  normalizeAgentName,
   resolveAgentArgv,
   resolveCanonicalAgentName,
 } from "../agent-registry.js";
@@ -156,6 +157,18 @@ function configuredAgentArgv(agentId: string, config: ResolvedAcpxConfig): strin
   return resolveAgentArgv(canonical);
 }
 
+function registeredAgent(
+  agentId: string,
+  registry: Record<string, string>,
+): { agentId: string; agentCommand: string } | undefined {
+  const normalized = normalizeAgentName(agentId);
+  const key = Object.hasOwn(registry, normalized)
+    ? normalized
+    : resolveCanonicalAgentName(normalized);
+  const agentCommand = registry[key];
+  return agentCommand ? { agentId: key, agentCommand } : undefined;
+}
+
 function defaultMode(agentId: string): string | undefined {
   switch (resolveCanonicalAgentName(agentId)) {
     case "codex":
@@ -240,15 +253,15 @@ class SessionService implements AcpxSessionService {
 
   private async resolveAgent(agentId: string, cwd: string): Promise<ResolvedAgent> {
     const config = await this.config(cwd);
-    const canonical = resolveCanonicalAgentName(agentId);
     const registry = mergeAgentRegistry(customCommands(config));
-    if (!Object.hasOwn(registry, canonical)) {
+    const registered = registeredAgent(agentId, registry);
+    if (!registered) {
       throw new AcpxAgentNotRegisteredError(agentId);
     }
     return {
-      agentId: canonical,
-      agentCommand: registry[canonical],
-      agentArgv: configuredAgentArgv(canonical, config),
+      agentId: registered.agentId,
+      agentCommand: registered.agentCommand,
+      agentArgv: configuredAgentArgv(registered.agentId, config),
       config,
     };
   }
@@ -718,4 +731,5 @@ export const sessionsServiceTestInternals = {
   exactRecord,
   mergePending,
   providerSessionProjection,
+  registeredAgent,
 };

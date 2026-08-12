@@ -228,6 +228,46 @@ test("malformed URI escapes are classified as invalid paths", async () => {
       (JSON.parse(response.body) as { error: { code: string } }).error.code,
       "INVALID_PATH",
     );
+    const apiResponse = await requestPath(running.origin, "/api/v1/sessions/%E0%A4%A/timeline");
+    assert.equal(apiResponse.status, 400);
+    assert.equal(
+      (JSON.parse(apiResponse.body) as { error: { code: string } }).error.code,
+      "INVALID_PATH",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
+test("timeline cursor errors retain their stable HTTP semantics", async () => {
+  const { running, service } = await fixture();
+  service.getTranscriptPage = async (input?: { before?: string }) => {
+    const before = input?.before;
+    const error = new Error(
+      before ? "Timeline cursor has expired" : "Timeline cursor is invalid",
+    ) as Error & { code: string; earliestCursor?: string };
+    error.code = before ? "CURSOR_EXPIRED" : "CURSOR_INVALID";
+    error.earliestCursor = before ? "earliest-safe-cursor" : undefined;
+    throw error;
+  };
+  try {
+    const invalid = await fetch(`${running.origin}/api/v1/sessions/record-1/timeline`);
+    assert.equal(invalid.status, 400);
+    assert.equal(
+      ((await invalid.json()) as { error: { code: string } }).error.code,
+      "CURSOR_INVALID",
+    );
+    const expired = await fetch(
+      `${running.origin}/api/v1/sessions/record-1/timeline?before=old-cursor`,
+    );
+    assert.equal(expired.status, 410);
+    assert.deepEqual(await expired.json(), {
+      error: {
+        code: "CURSOR_EXPIRED",
+        message: "Timeline cursor has expired",
+        details: { earliestCursor: "earliest-safe-cursor" },
+      },
+    });
   } finally {
     await running.close();
   }

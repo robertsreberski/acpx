@@ -34,11 +34,14 @@ const SESSION = {
   updatedAt: "2026-08-12T10:00:00.000Z",
 };
 
+const requestUrl = (input: RequestInfo | URL): string =>
+  typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+
 test("unwraps session and pending routes while preserving exact record identity", async () => {
   const client = new ConsoleApi();
   await withFetch(
     async (input) => {
-      const url = String(input);
+      const url = requestUrl(input);
       return url.endsWith("/pending")
         ? response({
             pending: [
@@ -124,8 +127,8 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   await withFetch(
     async (input, init) => {
-      requests.push({ url: String(input), init });
-      if (String(input).includes("/agents/")) {
+      requests.push({ url: requestUrl(input), init });
+      if (requestUrl(input).includes("/agents/")) {
         return response({ sessions: [] });
       }
       return response({ pending: {} });
@@ -135,9 +138,52 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
       await client.answerInteraction("record-1", "request-1", { type: "cancel" });
     },
   );
-  assert.match(requests[0]!.url, /cwd=%2Fwork%2Fcheckout/u);
-  const headers = requests[1]!.init?.headers as Record<string, string>;
-  assert.equal(headers["X-CSRF-Token"], "csrf-1");
-  assert.ok(headers["Idempotency-Key"]);
-  assert.deepEqual(JSON.parse(String(requests[1]!.init?.body)), { response: { type: "cancel" } });
+  assert.match(requests[0].url, /cwd=%2Fwork%2Fcheckout/u);
+  const headers = new Headers(requests[1].init?.headers);
+  assert.equal(headers.get("X-CSRF-Token"), "csrf-1");
+  assert.ok(headers.get("Idempotency-Key"));
+  const body = requests[1].init?.body;
+  assert.equal(typeof body, "string");
+  assert.deepEqual(JSON.parse(body), { response: { type: "cancel" } });
+});
+
+test("a network retry reuses the same idempotency key", async () => {
+  const client = new ConsoleApi();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (attempts === 1) {
+        throw new TypeError("network disconnected");
+      }
+      return response({ pending: {} });
+    },
+    async () => {
+      await client.answerInteraction("record-1", "request-1", { type: "cancel" });
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.ok(keys[0]);
+  assert.equal(keys[1], keys[0]);
+});
+
+test("an HTTP failure is not retried", async () => {
+  const client = new ConsoleApi();
+  let attempts = 0;
+  await assert.rejects(
+    async () =>
+      await withFetch(
+        async () => {
+          attempts += 1;
+          return response({ error: { code: "TURN_CONFLICT", message: "Turn is busy" } }, 409);
+        },
+        async () => {
+          await client.sendPrompt("record-1", "hello");
+        },
+      ),
+    (error: unknown) => error instanceof Error && error.message === "Turn is busy",
+  );
+  assert.equal(attempts, 1);
 });

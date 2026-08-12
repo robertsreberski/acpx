@@ -37,7 +37,13 @@ const jsonValue = (value: unknown): JsonValue => {
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, jsonValue(item)]));
   }
-  return value === undefined ? null : String(value);
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "symbol") {
+    return value.description ?? "symbol";
+  }
+  return typeof value === "function" ? "[function]" : null;
 };
 
 const record = (value: unknown): { readonly [key: string]: JsonValue } => {

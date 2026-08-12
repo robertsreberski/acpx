@@ -77,13 +77,22 @@ export class ConsoleApi {
     if (this.#csrfToken) {
       headers["X-CSRF-Token"] = this.#csrfToken;
     }
-    return await json<T>(
+    const request = async (): Promise<Response> =>
       await fetch(path, {
         method,
         headers,
         body: JSON.stringify(body),
-      }),
-    );
+      });
+    let response: Response;
+    try {
+      response = await request();
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw error;
+      }
+      response = await request();
+    }
+    return await json<T>(response);
   }
 
   bootstrap(): Promise<BootstrapSnapshot> {
@@ -91,7 +100,6 @@ export class ConsoleApi {
       agents: snapshot.agents.map((agent) => ({
         id: agent.agentId,
         label: agent.label,
-        command: agent.command,
         canBrowseSessions: agent.supportsSessionList,
       })),
       workspaceRoots: snapshot.workspaceRoots.map((path) => ({
@@ -128,6 +136,7 @@ export class ConsoleApi {
         previousCursor: page.previousCursor,
         coverage: page.coverage,
         gap: gap ? { reason: gap.message } : undefined,
+        writeError: page.writeError,
       };
     });
   }
@@ -227,7 +236,6 @@ interface WireBootstrap {
   readonly agents: readonly {
     readonly agentId: string;
     readonly label: string;
-    readonly command?: string;
     readonly supportsSessionList?: boolean;
   }[];
   readonly sessions: readonly WireSession[];
@@ -265,6 +273,7 @@ interface WireTimelinePage {
   readonly previousCursor?: string;
   readonly hasMore: boolean;
   readonly coverage: "complete" | "legacy_retained";
+  readonly writeError?: string;
 }
 
 interface WirePendingInteraction {

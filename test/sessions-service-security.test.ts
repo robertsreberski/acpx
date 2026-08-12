@@ -55,6 +55,21 @@ test("a configured built-in command override without argv never falls back to st
   });
 });
 
+test("an explicitly configured alias wins over its built-in canonical fallback", () => {
+  const registry = {
+    droid: "droid exec --output-format acp",
+    "factory-droid": "custom-factory-droid --acp",
+  };
+  assert.deepEqual(sessionsServiceTestInternals.registeredAgent("factory-droid", registry), {
+    agentId: "factory-droid",
+    agentCommand: "custom-factory-droid --acp",
+  });
+  assert.deepEqual(sessionsServiceTestInternals.registeredAgent("factorydroid", registry), {
+    agentId: "droid",
+    agentCommand: "droid exec --output-format acp",
+  });
+});
+
 test("adapter operations have a bounded default with explicit config and service overrides", async () => {
   await withTempHome("acpx-sessions-security-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

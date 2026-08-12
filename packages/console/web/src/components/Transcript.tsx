@@ -378,6 +378,11 @@ export function Transcript() {
               Some earlier history predates lossless capture. The retained transcript begins here.
             </div>
           )}
+          {store.timeline?.writeError && (
+            <div className="history-gap is-error" role="alert">
+              {store.timeline.writeError}
+            </div>
+          )}
         </div>
         <ThreadPrimitive.Empty>
           <div className="empty-thread">
