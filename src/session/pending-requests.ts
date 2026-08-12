@@ -429,9 +429,10 @@ export async function sweepPendingRequests(params: {
   const cutoff = new Date(now.getTime() - retentionMs).toISOString();
 
   const result: PendingRequestSweepResult = { orphaned: [], pruned: [], discarded: [] };
-  // Unparseable files are invisible to listPendingRequests, so nothing else
-  // would ever clear them. They cannot be answered, so they are dropped.
-  for (const name of await listUnparseablePendingRequestFiles(params.sessionId, homeDir)) {
+  // Malformed files are invisible to listPendingRequests, so nothing else would
+  // ever clear them. Entries carrying a schema we simply do not know are left
+  // alone: an older acpx must never destroy a newer store.
+  for (const name of await listMalformedPendingRequestFiles(params.sessionId, homeDir)) {
     await fs
       .rm(path.join(pendingRequestsSessionDir(params.sessionId, homeDir), name), { force: true })
       .catch(() => undefined);
@@ -485,7 +486,30 @@ async function sweepPendingRequestEntry(
   }
 }
 
-async function listUnparseablePendingRequestFiles(
+/**
+ * A file is malformed when it is not JSON, not an object, or carries no schema
+ * string at all. A recognisable-but-unknown schema (a future version) is NOT
+ * malformed and must be preserved.
+ */
+function isMalformedPendingRequestPayload(payload: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return true;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return true;
+  }
+  const schema = (parsed as { schema?: unknown }).schema;
+  if (typeof schema !== "string" || schema.length === 0) {
+    return true;
+  }
+  // Our own schema must still parse cleanly; anything else is a future version.
+  return schema === PENDING_REQUEST_SCHEMA && !parsePendingRequest(parsed);
+}
+
+async function listMalformedPendingRequestFiles(
   sessionId: string,
   homeDir: string,
 ): Promise<string[]> {
@@ -497,21 +521,21 @@ async function listUnparseablePendingRequestFiles(
     return [];
   }
 
-  const unparseable: string[] = [];
+  const malformed: string[] = [];
   for (const name of names) {
     if (!name.endsWith(".json")) {
       continue;
     }
     try {
       const payload = await fs.readFile(path.join(dir, name), "utf8");
-      if (!parsePendingRequest(JSON.parse(payload))) {
-        unparseable.push(name);
+      if (isMalformedPendingRequestPayload(payload)) {
+        malformed.push(name);
       }
     } catch {
-      unparseable.push(name);
+      malformed.push(name);
     }
   }
-  return unparseable;
+  return malformed;
 }
 
 export async function deletePendingRequestsForSession(

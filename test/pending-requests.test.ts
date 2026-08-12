@@ -255,15 +255,34 @@ test("sweep discards entries that can no longer be parsed", async () => {
     await writePendingRequest(makeEntry({ requestId: "good" }));
     const dir = pendingRequestsSessionDir("session-record-1");
     await fs.writeFile(path.join(dir, "corrupt.json"), "{not json\n", "utf8");
-    await fs.writeFile(path.join(dir, "wrong-schema.json"), '{"schema":"nope"}\n', "utf8");
+    await fs.writeFile(path.join(dir, "no-schema.json"), '{"request_id":"x"}\n', "utf8");
+    await fs.writeFile(path.join(dir, "not-object.json"), "[1,2,3]\n", "utf8");
+    // A schema we do not know is a NEWER acpx, not corruption. An older binary
+    // must never destroy a newer store.
+    await fs.writeFile(
+      path.join(dir, "future.json"),
+      '{"schema":"acpx.pending_request.v2","request_id":"future"}\n',
+      "utf8",
+    );
+    // Our own schema that no longer parses is genuinely malformed.
+    await fs.writeFile(
+      path.join(dir, "broken-v1.json"),
+      '{"schema":"acpx.pending_request.v1","request_id":"broken"}\n',
+      "utf8",
+    );
 
     const result = await sweepPendingRequests({
       sessionId: "session-record-1",
       ownerGeneration: 99,
     });
 
-    assert.deepEqual(result.discarded.toSorted(), ["corrupt.json", "wrong-schema.json"]);
-    assert.deepEqual(await fs.readdir(dir), ["good.json"]);
+    assert.deepEqual(result.discarded.toSorted(), [
+      "broken-v1.json",
+      "corrupt.json",
+      "no-schema.json",
+      "not-object.json",
+    ]);
+    assert.deepEqual((await fs.readdir(dir)).toSorted(), ["future.json", "good.json"]);
   });
 });
 

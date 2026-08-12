@@ -29,6 +29,7 @@ import {
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import {
+  DEFAULT_DEFER_MAX_AGE_MS,
   PendingRequestManager,
   type PendingRequestEvent,
 } from "../queue/pending-request-manager.js";
@@ -187,6 +188,11 @@ function createParkingBridge(params: {
     // "finished". Keeping the last context means such a straggler is attributed
     // to the task that actually provoked it instead of "unknown" or, worse, the
     // next task. It is replaced on the next beginTask, and turns are serialized.
+    //
+    // Residual, deferred to M3: a straggler arriving after the NEXT task has
+    // begun is still attributed to that next task, and a straggler's events go
+    // to a sink whose event writer has already closed, so they are dropped. The
+    // durable store entry is unaffected in both cases.
     setTaskSink: (sink) => {
       if (currentTask) {
         currentTask.sink = sink;
@@ -469,7 +475,12 @@ function queueOwnerLeaseMetadata(options: QueueOwnerRuntimeOptions): {
     path: options.mcpConfigPath,
     fingerprint: options.mcpConfigFingerprint,
     parking: options.defer === true,
-    ...(options.deferMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: options.deferMaxAgeMs }),
+    // Stamp the EFFECTIVE value, never the requested one: an owner seeded with
+    // an explicit age and one that fell back to the default must be comparable,
+    // in both directions.
+    ...(options.defer === true
+      ? { parkingMaxAgeMs: options.deferMaxAgeMs ?? DEFAULT_DEFER_MAX_AGE_MS }
+      : {}),
   };
 }
 

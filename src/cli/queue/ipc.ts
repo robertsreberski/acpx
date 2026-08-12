@@ -40,6 +40,7 @@ import {
   type QueueSetModeRequest,
   type QueueSubmitRequest,
 } from "./messages.js";
+import { DEFAULT_DEFER_MAX_AGE_MS } from "./pending-request-manager.js";
 
 export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
@@ -768,15 +769,20 @@ function assertQueueOwnerParkingMaxAgeMatches(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
 ): void {
-  if (!options.defer || options.deferMaxAgeMs === undefined) {
+  if (!options.defer) {
     return;
   }
-  if (owner.parkingMaxAgeMs === options.deferMaxAgeMs) {
+  // Compare effective ages. Comparing what each side *asked for* is wrong both
+  // ways: a caller omitting the flag silently inherits the owner's age, and a
+  // caller naming the default gets refused by an owner that merely defaulted.
+  const requested = options.deferMaxAgeMs ?? DEFAULT_DEFER_MAX_AGE_MS;
+  const effective = owner.parkingMaxAgeMs ?? DEFAULT_DEFER_MAX_AGE_MS;
+  if (requested === effective) {
     return;
   }
   throw new QueueConnectionError(
-    `Session queue owner parks for ${owner.parkingMaxAgeMs ?? "its default"} ms and cannot honour ` +
-      `--defer-max-age ${options.deferMaxAgeMs}; close the session (or let its TTL lapse) so a new owner starts`,
+    `Session queue owner expires parked requests after ${effective} ms and cannot honour the ` +
+      `requested ${requested} ms; close the session (or let its TTL lapse) so a new owner starts`,
     {
       detailCode: "QUEUE_OWNER_PARKING_UNSUPPORTED",
       origin: "queue",

@@ -6,8 +6,10 @@ import {
   QUEUE_PROTOCOL_VERSION,
   queueOwnerProtocolVersion,
   readQueueOwnerRecord,
+  refreshQueueOwnerLease,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/lease-store.js";
+import { DEFAULT_DEFER_MAX_AGE_MS } from "../src/cli/queue/pending-request-manager.js";
 import { QueueConnectionError } from "../src/errors.js";
 import { PERMISSION_POLICY_RULE_KEYS } from "../src/types.js";
 import type { OutputFormatter, PermissionPolicy } from "../src/types.js";
@@ -31,15 +33,35 @@ function noopFormatter(): OutputFormatter {
 async function submitWithPolicy(params: {
   sessionId: string;
   permissionPolicy?: PermissionPolicy;
+  defer?: boolean;
+  deferMaxAgeMs?: number;
 }): Promise<unknown> {
   return await trySubmitToRunningOwner({
     sessionId: params.sessionId,
     message: "hello",
     permissionMode: "approve-all",
     ...(params.permissionPolicy ? { permissionPolicy: params.permissionPolicy } : {}),
+    ...(params.defer ? { defer: true } : {}),
+    ...(params.deferMaxAgeMs === undefined ? {} : { deferMaxAgeMs: params.deferMaxAgeMs }),
     outputFormatter: noopFormatter(),
     waitForCompletion: true,
   });
+}
+
+async function assertParkingRefusal(
+  params: Parameters<typeof submitWithPolicy>[0],
+  messagePattern: RegExp,
+): Promise<void> {
+  await assert.rejects(
+    async () => await submitWithPolicy(params),
+    (error: unknown) => {
+      const queueError = error as QueueConnectionError;
+      assert.equal(queueError.detailCode, "QUEUE_OWNER_PARKING_UNSUPPORTED");
+      assert.equal(queueError.retryable, false);
+      assert.match(queueError.message, messagePattern);
+      return true;
+    },
+  );
 }
 
 /**
@@ -50,7 +72,12 @@ async function submitWithPolicy(params: {
 async function withFakeOwner(
   homeDir: string,
   sessionId: string,
-  fields: { queueProtocol?: number; acpxVersion?: string },
+  fields: {
+    queueProtocol?: number;
+    acpxVersion?: string;
+    parking?: boolean;
+    parkingMaxAgeMs?: number;
+  },
   run: () => Promise<void>,
 ): Promise<void> {
   const keeper = await startKeeperProcess();
@@ -122,10 +149,9 @@ test("a pre-defer queue owner refuses defaultAction defer", async () => {
  * socket behind them, so the transport failure (QUEUE_NOT_ACCEPTING_REQUESTS) is
  * the signal that gating let the request through.
  */
-async function assertReachesTransport(params: {
-  sessionId: string;
-  permissionPolicy?: PermissionPolicy;
-}): Promise<void> {
+async function assertReachesTransport(
+  params: Parameters<typeof submitWithPolicy>[0],
+): Promise<void> {
   await assert.rejects(
     async () => await submitWithPolicy(params),
     (error: unknown) => {
@@ -201,4 +227,104 @@ test("adding a permission policy rule key forces a queue protocol decision", () 
     "PERMISSION_POLICY_RULE_KEYS changed: teach permissionPolicyNeedsDeferSupport about the " +
       "new key, bump QUEUE_PROTOCOL_VERSION, then update QUEUE_PROTOCOL_RULE_KEY_COUNT",
   );
+});
+
+test("a queue owner without parking refuses a --defer submit", async () => {
+  await withTempHome(async (homeDir) => {
+    await withFakeOwner(
+      homeDir,
+      "owner-no-parking",
+      { queueProtocol: QUEUE_PROTOCOL_VERSION },
+      async () => {
+        await assertParkingRefusal(
+          { sessionId: "owner-no-parking", defer: true, deferMaxAgeMs: 1_000 },
+          /cannot park deferred requests/,
+        );
+        // A submit that does not ask for parking is unaffected.
+        await assertReachesTransport({ sessionId: "owner-no-parking" });
+      },
+    );
+  });
+});
+
+test("parking max-age is compared on effective values, not requested ones", async () => {
+  await withTempHome(async (homeDir) => {
+    // Owner seeded with an explicit 2s age.
+    await withFakeOwner(
+      homeDir,
+      "owner-explicit-age",
+      { queueProtocol: QUEUE_PROTOCOL_VERSION, parking: true, parkingMaxAgeMs: 2_000 },
+      async () => {
+        // Same age named explicitly: allowed.
+        await assertReachesTransport({
+          sessionId: "owner-explicit-age",
+          defer: true,
+          deferMaxAgeMs: 2_000,
+        });
+        // Different age: refused.
+        await assertParkingRefusal(
+          { sessionId: "owner-explicit-age", defer: true, deferMaxAgeMs: 5_000 },
+          /expires parked requests after 2000 ms and cannot honour the requested 5000 ms/,
+        );
+        // Caller omits the flag, so it means the default — NOT "whatever the
+        // owner happens to use". Silently inheriting 2s was the bug.
+        await assertParkingRefusal(
+          { sessionId: "owner-explicit-age", defer: true },
+          new RegExp(`requested ${DEFAULT_DEFER_MAX_AGE_MS} ms`),
+        );
+      },
+    );
+
+    // Owner that fell back to the default must accept a caller naming it.
+    await withFakeOwner(
+      homeDir,
+      "owner-default-age",
+      {
+        queueProtocol: QUEUE_PROTOCOL_VERSION,
+        parking: true,
+        parkingMaxAgeMs: DEFAULT_DEFER_MAX_AGE_MS,
+      },
+      async () => {
+        await assertReachesTransport({
+          sessionId: "owner-default-age",
+          defer: true,
+          deferMaxAgeMs: DEFAULT_DEFER_MAX_AGE_MS,
+        });
+        await assertReachesTransport({ sessionId: "owner-default-age", defer: true });
+      },
+    );
+  });
+});
+
+test("a lease stamps effective parking metadata on acquire and on heartbeat", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-parking-stamp", {
+      parking: true,
+      parkingMaxAgeMs: 1_500,
+    });
+    assert(lease);
+    assert.equal(lease.parking, true);
+    assert.equal(lease.parkingMaxAgeMs, 1_500);
+
+    const acquired = await readQueueOwnerRecord("owner-parking-stamp");
+    assert.equal(acquired?.parking, true);
+    assert.equal(acquired?.parkingMaxAgeMs, 1_500);
+
+    // The heartbeat is the second writer and must not drop the capability.
+    await refreshQueueOwnerLease(lease, { queueDepth: 3 });
+    const refreshed = await readQueueOwnerRecord("owner-parking-stamp");
+    assert.equal(refreshed?.parking, true);
+    assert.equal(refreshed?.parkingMaxAgeMs, 1_500);
+    assert.equal(refreshed?.queueDepth, 3);
+  });
+});
+
+test("a lease without parking records no parking metadata", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-plain-stamp", {});
+    assert(lease);
+    const record = await readQueueOwnerRecord("owner-plain-stamp");
+    assert.equal(record?.parking, undefined);
+    assert.equal(record?.parkingMaxAgeMs, undefined);
+  });
 });

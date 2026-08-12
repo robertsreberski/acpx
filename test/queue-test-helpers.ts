@@ -62,6 +62,8 @@ export async function writeQueueOwnerLock(options: {
   heartbeatAt?: string;
   queueProtocol?: number;
   acpxVersion?: string;
+  parking?: boolean;
+  parkingMaxAgeMs?: number;
 }): Promise<void> {
   const now = new Date().toISOString();
   const createdAt = options.createdAt ?? now;
@@ -84,6 +86,10 @@ export async function writeQueueOwnerLock(options: {
         : {}),
       ...(options.queueProtocol !== undefined ? { queueProtocol: options.queueProtocol } : {}),
       ...(options.acpxVersion ? { acpxVersion: options.acpxVersion } : {}),
+      ...(options.parking ? { parking: true } : {}),
+      ...(options.parkingMaxAgeMs === undefined
+        ? {}
+        : { parkingMaxAgeMs: options.parkingMaxAgeMs }),
     })}\n`,
     "utf8",
   );

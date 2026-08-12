@@ -5837,3 +5837,57 @@ test("integration: a warm non-parking owner refuses a --defer submit", async () 
     }
   });
 });
+
+test("integration: cancelling a session unwinds a parked permission request", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const deferArgs = [...baseAgentArgs(cwd), "--defer", "--defer-max-age", "0"];
+    try {
+      await runCli([...deferArgs, "--format", "json", "sessions", "new"], homeDir);
+
+      // max-age 0 parks indefinitely, so only the cancel can settle this.
+      const submitted = await runCli(
+        [
+          ...deferArgs,
+          "--policy",
+          '{"defaultAction":"defer"}',
+          "--format",
+          "json",
+          "--ttl",
+          "30",
+          "prompt",
+          "--no-wait",
+          "permission execute Bash",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(submitted.code, 0, submitted.stderr);
+
+      const deadline = Date.now() + 25_000;
+      let stored = await readStoredPendingRequests(homeDir);
+      while (stored[0]?.state !== "pending" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        stored = await readStoredPendingRequests(homeDir);
+      }
+      assert.equal(stored[0]?.state, "pending", JSON.stringify(stored));
+
+      // IPC cancel -> turn controller -> AbortSignal -> attachAbort.
+      const cancelled = await runCli([...deferArgs, "--format", "json", "cancel"], homeDir, {
+        timeoutMs: 30_000,
+      });
+      assert.equal(cancelled.code, 0, cancelled.stderr);
+
+      while (stored[0]?.state === "pending" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        stored = await readStoredPendingRequests(homeDir);
+      }
+      assert.equal(stored[0]?.state, "cancelled", JSON.stringify(stored));
+      assert.equal(stored[0]?.resolution?.source, "cancel");
+
+      await runCli([...deferArgs, "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});

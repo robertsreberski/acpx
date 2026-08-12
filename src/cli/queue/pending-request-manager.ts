@@ -107,9 +107,13 @@ export class PendingRequestManager {
 
   /**
    * Park a permission request until something answers it, it expires, or the
-   * turn is cancelled. The durable entry is written before the returned promise
-   * is handed back, so a lister can never observe a turn blocked on a request
-   * that is not yet on disk.
+   * turn is cancelled.
+   *
+   * listPending() reports a waiter only after its write has been attempted, so
+   * a visible waiter normally implies a durable entry. It is not a guarantee:
+   * completePark swallows a write failure rather than stranding the agent, so a
+   * disk error yields a waiter with no file. Unblocking the turn is worth more
+   * than the invariant.
    */
   async park(
     input: PendingRequestParkInput,
