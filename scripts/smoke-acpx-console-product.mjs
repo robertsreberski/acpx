@@ -421,6 +421,15 @@ async function main() {
       const started = await run(process.execPath, startArgs, { env });
       assert.match(started.stdout, /ACPX Console started/u);
       consoleRunning = true;
+      const status = await run(
+        process.execPath,
+        [consoleBin, "status", "--json", "--state-dir", stateDir],
+        { env },
+      );
+      const statusValue = JSON.parse(status.stdout);
+      assert.equal(statusValue.status, "running");
+      assert.equal(statusValue.record.port, port);
+      trackedPids.add(statusValue.record.pid);
     };
     const stopConsole = async () => {
       if (!consoleRunning) {
@@ -566,6 +575,12 @@ async function main() {
     assert(firstPromptIndex >= 0 && secondPromptIndex > firstPromptIndex, prompts.join(" | "));
     assert.match(assistantText(queuedPage), /slept 0ms/u);
     assert.equal((await api.get(sessionPath)).session.queue.depth, 0);
+    const queuedPromptCalls = (await readCallLog(callLog))
+      .filter((entry) => entry.method === "session/prompt")
+      .map((entry) => entry.text);
+    const firstCallIndex = queuedPromptCalls.indexOf("stream-sleep 10000 queue-first-live");
+    const secondCallIndex = queuedPromptCalls.indexOf("sleep 0");
+    assert(firstCallIndex >= 0 && secondCallIndex > firstCallIndex, queuedPromptCalls.join(" | "));
     await sse.waitFor(
       "live transcript invalidation",
       (frame) => frame.event === "timeline" && frame.data.acpxRecordId === sessionId,
