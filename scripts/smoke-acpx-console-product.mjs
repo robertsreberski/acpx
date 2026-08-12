@@ -574,6 +574,12 @@ async function main() {
     const oldOwner = await waitFor("queue owner lease", () => ownerLease(homeDir, sessionId));
     trackedPids.add(oldOwner.pid);
     assert(processAlive(oldOwner.pid));
+    const preRestartCalls = await readCallLog(callLog);
+    const preRestartAgentPids = new Set(
+      preRestartCalls
+        .filter((entry) => entry.method === "session/prompt")
+        .map((entry) => entry.pid),
+    );
     await terminateOwnedProcess(oldOwner.pid, [consoleBin, "__queue-owner"]);
     const restartedTurn = await enqueue("sleep 1");
     await waitFor("turn after owner restart", async () => {
@@ -586,14 +592,22 @@ async function main() {
     });
     trackedPids.add(newOwner.pid);
     const postRestartCalls = await readCallLog(callLog);
-    const replacementCalls = postRestartCalls.filter((entry) => entry.pid === newOwner.pid);
-    assert.equal(replacementCalls[0]?.method, "session/resume");
-    assert.equal(
-      replacementCalls.some(
-        (entry) => entry.method === "session/prompt" && entry.text === "sleep 1",
-      ),
-      true,
+    const replacementPrompt = postRestartCalls.find(
+      (entry) => entry.method === "session/prompt" && entry.text === "sleep 1",
     );
+    assert(replacementPrompt);
+    assert.equal(preRestartAgentPids.has(replacementPrompt.pid), false);
+    const replacementCalls = postRestartCalls.filter(
+      (entry) => entry.pid === replacementPrompt.pid,
+    );
+    const replacementResumeIndex = replacementCalls.findIndex(
+      (entry) => entry.method === "session/resume",
+    );
+    const replacementPromptIndex = replacementCalls.findIndex(
+      (entry) => entry.method === "session/prompt" && entry.text === "sleep 1",
+    );
+    assert(replacementResumeIndex >= 0);
+    assert(replacementPromptIndex > replacementResumeIndex);
 
     await sse.stop();
     sse = undefined;
