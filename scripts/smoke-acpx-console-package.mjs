@@ -71,7 +71,7 @@ async function getJson(url, host) {
 }
 
 async function packageTarball(packDir, packageDir, before) {
-  await run("pnpm", ["pack", "--pack-destination", packDir], { cwd: packageDir, inherit: true });
+  await run("npm", ["pack", "--pack-destination", packDir], { cwd: packageDir, inherit: true });
   const after = await fs.readdir(packDir);
   const created = after.filter((name) => name.endsWith(".tgz") && !before.has(name));
   assert.equal(
@@ -111,6 +111,15 @@ async function main() {
       consolePackageDir,
       new Set(await fs.readdir(packDir)),
     );
+    const packedConsoleManifest = JSON.parse(
+      (
+        await run("tar", ["-xOf", consoleTarball, "package/package.json"], {
+          cwd: scratch,
+        })
+      ).stdout,
+    );
+    assert.equal(packedConsoleManifest.dependencies.acpx, "0.13.0-fork.2");
+    assert.doesNotMatch(JSON.stringify(packedConsoleManifest), /workspace:/);
     await run(
       "npm",
       ["install", "--ignore-scripts", "--prefix", installDir, acpxTarball, consoleTarball],
@@ -125,23 +134,33 @@ async function main() {
     assert.match(help.stdout, /--trust-network/);
 
     const port = await availablePort();
-    const start = await run(
-      process.execPath,
-      [
-        consoleBin,
-        "start",
-        "--detach",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        String(port),
-        "--workspace-root",
-        workspace,
-        "--state-dir",
-        stateDir,
-      ],
-      { env },
-    );
+    let start;
+    try {
+      start = await run(
+        process.execPath,
+        [
+          consoleBin,
+          "start",
+          "--detach",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          String(port),
+          "--workspace-root",
+          workspace,
+          "--state-dir",
+          stateDir,
+        ],
+        { env },
+      );
+    } catch (error) {
+      const diagnostics = await fs
+        .readFile(path.join(stateDir, "console.error.log"), "utf8")
+        .catch(() => "<console error log unavailable>");
+      throw new Error(`${error instanceof Error ? error.message : String(error)}\n${diagnostics}`, {
+        cause: error,
+      });
+    }
     assert.match(start.stdout, /ACPX Console started/);
 
     const status = await run(

@@ -1,9 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath, stat, type FileHandle } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { extname, join, normalize, sep } from "node:path";
+import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { assertWorkspaceAllowed, ConsoleInputError, type ResolvedConsoleConfig } from "./config.js";
 import type {
   AcpxConsoleSessionService,
@@ -63,54 +64,20 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
   }
   if (error instanceof Error) {
     const shaped = error as Error & {
-      statusCode?: number;
       code?: string;
       detailCode?: string;
-      details?: unknown;
       earliestCursor?: string;
-      outputCode?: string;
     };
-    if (
-      typeof shaped.statusCode === "number" &&
-      shaped.statusCode >= 400 &&
-      shaped.statusCode < 500
-    ) {
-      return {
-        response: new HttpError(
-          shaped.statusCode,
-          shaped.detailCode ?? shaped.code ?? "REQUEST_FAILED",
-          shaped.message,
-          shaped.details,
-        ),
-      };
-    }
     const code = shaped.detailCode ?? shaped.code;
-    const mappedStatus =
-      shaped.name === "SessionNotFoundError"
-        ? 404
-        : code === "CURSOR_INVALID" || code === "AGENT_NOT_REGISTERED"
-          ? 400
-          : code === "CURSOR_EXPIRED" || code === "PENDING_REQUEST_OWNER_GONE"
-            ? 410
-            : code === "SESSION_ADOPTION_FAILED" || code === "AGENT_CAPABILITY_UNSUPPORTED"
-              ? 422
-              : code === "IDEMPOTENCY_KEY_CONFLICT" || code === "TURN_CONFLICT"
-                ? 409
-                : code === "TURN_NOT_ACTIVE" ||
-                    code === "PENDING_REQUEST_NOT_ANSWERABLE" ||
-                    code === "IDEMPOTENCY_RESULT_UNKNOWN" ||
-                    code === "IDEMPOTENCY_RECORD_CORRUPT"
-                  ? 409
-                  : shaped.outputCode === "USAGE"
-                    ? 400
-                    : undefined;
-    if (mappedStatus !== undefined) {
+    const safeCode = shaped.name === "SessionNotFoundError" ? "SESSION_NOT_FOUND" : code;
+    const mapping = safeCode ? SAFE_SERVICE_ERRORS[safeCode] : undefined;
+    if (mapping) {
       const details =
-        code === "CURSOR_EXPIRED" && shaped.earliestCursor
+        safeCode === "CURSOR_EXPIRED" && shaped.earliestCursor
           ? { earliestCursor: shaped.earliestCursor }
           : undefined;
       return {
-        response: new HttpError(mappedStatus, code ?? "REQUEST_FAILED", shaped.message, details),
+        response: new HttpError(mapping.statusCode, safeCode!, mapping.message, details),
       };
     }
     return {
@@ -123,6 +90,30 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
     original: error,
   };
 }
+
+const SAFE_SERVICE_ERRORS: Readonly<
+  Record<string, { statusCode: number; message: string } | undefined>
+> = {
+  SESSION_NOT_FOUND: { statusCode: 404, message: "Session not found" },
+  CURSOR_INVALID: { statusCode: 400, message: "Timeline cursor is invalid" },
+  CURSOR_EXPIRED: { statusCode: 410, message: "Timeline cursor has expired" },
+  AGENT_NOT_REGISTERED: { statusCode: 400, message: "Agent is not registered" },
+  SESSION_ADOPTION_FAILED: { statusCode: 422, message: "Provider session could not be adopted" },
+  AGENT_CAPABILITY_UNSUPPORTED: {
+    statusCode: 422,
+    message: "Agent does not support this operation",
+  },
+  IDEMPOTENCY_KEY_CONFLICT: { statusCode: 409, message: "Idempotency key conflicts" },
+  IDEMPOTENCY_RESULT_UNKNOWN: { statusCode: 409, message: "Mutation result is unknown" },
+  IDEMPOTENCY_RECORD_CORRUPT: { statusCode: 409, message: "Mutation record is unavailable" },
+  IDEMPOTENT_MUTATION_FAILED: { statusCode: 409, message: "Mutation previously failed" },
+  TURN_CONFLICT: { statusCode: 409, message: "Session cannot accept this turn" },
+  TURN_NOT_ACTIVE: { statusCode: 409, message: "Turn is not active" },
+  PENDING_REQUEST_NOT_ANSWERABLE: { statusCode: 409, message: "Request is not answerable" },
+  PENDING_REQUEST_OWNER_GONE: { statusCode: 410, message: "Request owner is no longer live" },
+  PENDING_REQUEST_ANSWER_TIMEOUT: { statusCode: 504, message: "Request answer timed out" },
+  UNSUPPORTED_PROMPT_CONTENT: { statusCode: 400, message: "Prompt content is unsupported" },
+};
 
 function mimeType(path: string): string {
   switch (extname(path)) {
@@ -143,11 +134,49 @@ function mimeType(path: string): string {
   }
 }
 
-async function fileExists(path: string): Promise<boolean> {
+function isContainedPath(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate);
+  return (
+    pathFromRoot === "" ||
+    (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
+  );
+}
+
+async function openStaticFile(
+  candidate: string,
+  staticRoot: string,
+): Promise<{ handle: FileHandle; canonicalPath: string } | undefined> {
+  let handle: FileHandle;
   try {
-    return (await stat(path)).isFile();
-  } catch {
-    return false;
+    handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return undefined;
+    }
+    if (code === "ELOOP") {
+      throw new HttpError(400, "INVALID_PATH", "Static asset path is invalid");
+    }
+    throw error;
+  }
+  try {
+    const [opened, canonicalPath] = await Promise.all([handle.stat(), realpath(candidate)]);
+    if (!opened.isFile()) {
+      await handle.close();
+      return undefined;
+    }
+    const canonical = await stat(canonicalPath);
+    if (
+      !isContainedPath(staticRoot, canonicalPath) ||
+      opened.dev !== canonical.dev ||
+      opened.ino !== canonical.ino
+    ) {
+      throw new HttpError(400, "INVALID_PATH", "Static asset path is invalid");
+    }
+    return { handle, canonicalPath };
+  } catch (error) {
+    await handle.close();
+    throw error;
   }
 }
 
@@ -170,23 +199,62 @@ async function serveStatic(
   if (relative === ".." || relative.startsWith(`..${sep}`)) {
     throw new HttpError(400, "INVALID_PATH", "Static asset path is invalid");
   }
-  const candidate = join(staticDir, relative === "" ? "index.html" : relative);
-  const path = (await fileExists(candidate)) ? candidate : join(staticDir, "index.html");
-  if (!(await fileExists(path))) {
+  const staticRoot = await realpath(staticDir).catch(() => undefined);
+  if (!staticRoot) {
+    throw new HttpError(503, "WEB_ASSETS_MISSING", "ACPX Console web assets are not installed");
+  }
+  const candidate = join(staticRoot, relative === "" ? "index.html" : relative);
+  let asset = await openStaticFile(candidate, staticRoot);
+  if (!asset) {
+    asset = await openStaticFile(join(staticRoot, "index.html"), staticRoot);
+  }
+  if (!asset) {
     throw new HttpError(503, "WEB_ASSETS_MISSING", "ACPX Console web assets are not installed");
   }
   response.statusCode = 200;
-  response.setHeader("Content-Type", mimeType(path));
-  if (path.endsWith("index.html")) {
+  response.setHeader("Content-Type", mimeType(asset.canonicalPath));
+  if (asset.canonicalPath.endsWith("index.html")) {
     response.setHeader("Cache-Control", "no-store");
   } else {
     response.setHeader("Cache-Control", "public, max-age=31536000, immutable");
   }
   if (method === "HEAD") {
+    await asset.handle.close();
     response.end();
   } else {
-    createReadStream(path).pipe(response);
+    try {
+      await pipeline(asset.handle.createReadStream({ autoClose: false }), response);
+    } finally {
+      await asset.handle.close();
+    }
   }
+}
+
+function assertPendingResponse(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "INVALID_INPUT", "response must be a tagged answer object");
+  }
+  const answer = value as Record<string, unknown>;
+  if (answer.type === "select" && typeof answer.option_id === "string" && answer.option_id !== "") {
+    return;
+  }
+  if (answer.type === "decline" || answer.type === "cancel") {
+    return;
+  }
+  if (
+    answer.type === "accept" &&
+    answer.content &&
+    typeof answer.content === "object" &&
+    !Array.isArray(answer.content) &&
+    Object.values(answer.content as Record<string, unknown>).every((field) => {
+      const scalar =
+        typeof field === "string" || typeof field === "number" || typeof field === "boolean";
+      return scalar || (Array.isArray(field) && field.every((item) => typeof item === "string"));
+    })
+  ) {
+    return;
+  }
+  throw new HttpError(400, "INVALID_INPUT", "response has an unsupported answer shape");
 }
 
 function routeMatch(pathname: string, pattern: RegExp): string[] | undefined {
@@ -366,6 +434,7 @@ async function handleApi(
     if (!("response" in body)) {
       throw new HttpError(400, "INVALID_INPUT", "response is required");
     }
+    assertPendingResponse(body.response);
     const pendingResult = await context.service.respondToPendingRequest({
       acpxRecordId: responseRoute[0],
       requestId: responseRoute[1],
@@ -551,13 +620,26 @@ export async function startAcpxConsoleServer(
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.config.port, options.config.host, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(options.config.port, options.config.host, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    unsubscribe?.();
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    sockets.clear();
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    await options.service.dispose?.();
+    throw error;
+  }
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : options.config.port;
   const displayHost = options.config.host.includes(":")
@@ -570,28 +652,32 @@ export async function startAcpxConsoleServer(
       "Network trust enabled: every browser that can reach this address has session-control authority.",
     );
   }
+  let closeStarted: Promise<void> | undefined;
   return {
     server,
     origin,
     csrfToken,
-    async close() {
-      unsubscribe?.();
-      for (const client of clients) {
-        client.end();
-      }
-      clients.clear();
-      const closed = new Promise<void>((resolve, reject) => {
-        server.once("close", resolve);
-        server.once("error", reject);
-      });
-      server.close();
-      server.closeAllConnections();
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      sockets.clear();
-      await closed;
-      await options.service.dispose?.();
+    close() {
+      closeStarted ??= (async () => {
+        unsubscribe?.();
+        for (const client of clients) {
+          client.end();
+        }
+        clients.clear();
+        const closed = new Promise<void>((resolve, reject) => {
+          server.once("close", resolve);
+          server.once("error", reject);
+        });
+        server.close();
+        server.closeAllConnections();
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        sockets.clear();
+        await closed;
+        await options.service.dispose?.();
+      })();
+      return closeStarted;
     },
   };
 }

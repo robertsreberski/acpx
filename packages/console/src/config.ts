@@ -161,8 +161,19 @@ export async function resolveConsoleConfig(
 }
 
 export async function assertWorkspaceAllowed(cwd: string, roots: string[]): Promise<string> {
-  const candidate = await realpath(resolve(cwd));
-  const canonicalRoots = await Promise.all(roots.map(async (root) => realpath(resolve(root))));
+  let candidate: string;
+  try {
+    candidate = await realpath(resolve(cwd));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "EACCES") {
+      throw new ConsoleInputError(`Workspace is not accessible: ${resolve(cwd)}`);
+    }
+    throw error;
+  }
+  const canonicalRoots = await Promise.all(
+    roots.map(async (root) => await realpath(resolve(root))),
+  );
   const allowed = canonicalRoots.some((root) => {
     const pathFromRoot = relative(root, candidate);
     return (

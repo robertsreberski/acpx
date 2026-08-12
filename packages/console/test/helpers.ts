@@ -93,4 +93,5 @@ export class MockSessionService implements AcpxConsoleSessionService {
   emit(event: ServiceInvalidation) {
     this.listener?.(event);
   }
+  dispose() {}
 }

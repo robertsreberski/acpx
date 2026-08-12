@@ -1,6 +1,8 @@
 packages:
   - "packages/*"
 
+linkWorkspacePackages: true
+
 minimumReleaseAge: 2880
 minimumReleaseAgeExclude:
   - "@assistant-ui/*"

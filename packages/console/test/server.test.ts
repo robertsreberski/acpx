@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -152,6 +152,49 @@ test("mutations require CSRF and idempotency, then forward exact session ids", a
   }
 });
 
+test("mutations reject cross-origin and cross-site browser requests", async () => {
+  const { running } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    for (const headers of [
+      { Origin: "https://evil.example" },
+      { "Sec-Fetch-Site": "cross-site" },
+    ] satisfies Array<Record<string, string>>) {
+      const requestHeaders = new Headers(mutationHeaders(auth));
+      for (const [name, value] of Object.entries(headers)) {
+        requestHeaders.set(name, value);
+      }
+      const response = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+        method: "POST",
+        headers: requestHeaders,
+        body: JSON.stringify({ text: "hello" }),
+      });
+      assert.equal(response.status, 403);
+    }
+  } finally {
+    await running.close();
+  }
+});
+
+test("JSON request bodies are bounded before parsing", async () => {
+  const { running } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    const response = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: mutationHeaders(auth),
+      body: JSON.stringify({ text: "x".repeat(1024 * 1024) }),
+    });
+    assert.equal(response.status, 413);
+    assert.equal(
+      ((await response.json()) as { error: { code: string } }).error.code,
+      "BODY_TOO_LARGE",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
 test("session creation enforces the configured real workspace boundary", async () => {
   const { running, workspace } = await fixture();
   const outside = await mkdtemp(join(tmpdir(), "acpx-console-denied-"));
@@ -216,6 +259,43 @@ test("SPA routes fall back to installed web assets but API typos remain JSON 404
     assert.equal(api.headers.get("content-type"), "application/json; charset=utf-8");
   } finally {
     await running.close();
+  }
+});
+
+test("static assets cannot escape the installed web root through symlinks", async () => {
+  const { root, running } = await fixture();
+  const outside = join(root, "private.txt");
+  await writeFile(outside, "TOP-SECRET");
+  await symlink(outside, join(root, "web", "leak.txt"));
+  try {
+    const response = await fetch(`${running.origin}/leak.txt`);
+    assert.equal(response.status, 400);
+    assert.doesNotMatch(await response.text(), /TOP-SECRET/);
+  } finally {
+    await running.close();
+  }
+});
+
+test("static stream failures close the response without an uncaught process error", async () => {
+  const { root, running } = await fixture();
+  const blocked = join(root, "web", "blocked.js");
+  await writeFile(blocked, "not-readable");
+  await chmod(blocked, 0);
+  let uncaught: unknown;
+  const onUncaught = (error: unknown) => {
+    uncaught = error;
+  };
+  process.once("uncaughtException", onUncaught);
+  try {
+    const response = await fetch(`${running.origin}/blocked.js`);
+    assert.equal(response.status, 500);
+    await response.body?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(uncaught, undefined);
+  } finally {
+    process.off("uncaughtException", onUncaught);
+    await running.close();
+    await chmod(blocked, 0o600);
   }
 });
 
@@ -363,6 +443,94 @@ test("untyped service failures do not expose adapter details or local paths", as
   }
 });
 
+test("structurally shaped service failures cannot expose messages or details", async () => {
+  const { running, service } = await fixture();
+  service.listSessions = async () => {
+    throw Object.assign(new Error("provider token SECRET from /Users/operator/private.json"), {
+      statusCode: 400,
+      details: { token: "SECRET" },
+    });
+  };
+  try {
+    const response = await fetch(`${running.origin}/api/v1/sessions`);
+    assert.equal(response.status, 500);
+    const text = await response.text();
+    assert.doesNotMatch(text, /SECRET|operator|private\.json|token/);
+    assert.match(text, /INTERNAL_ERROR/);
+  } finally {
+    await running.close();
+  }
+});
+
+test("invalid pending answers and inaccessible workspaces are typed client errors", async () => {
+  const { root, running } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    const badAnswer = await fetch(
+      `${running.origin}/api/v1/sessions/record-1/pending/request-1/responses`,
+      {
+        method: "POST",
+        headers: mutationHeaders(auth, "bad-answer-key"),
+        body: JSON.stringify({ response: { unsupported: true } }),
+      },
+    );
+    assert.equal(badAnswer.status, 400);
+    assert.equal(
+      ((await badAnswer.json()) as { error: { code: string } }).error.code,
+      "INVALID_INPUT",
+    );
+
+    const missingWorkspace = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "missing-workspace-key"),
+      body: JSON.stringify({ agentId: "codex", cwd: join(root, "does-not-exist") }),
+    });
+    assert.equal(missingWorkspace.status, 400);
+    assert.equal(
+      ((await missingWorkspace.json()) as { error: { code: string } }).error.code,
+      "INVALID_INPUT",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
+test("a failed listen unsubscribes and disposes the service", async () => {
+  const { root, running } = await fixture();
+  const service = new MockSessionService();
+  let unsubscribed = 0;
+  let disposed = 0;
+  service.subscribe = () => () => {
+    unsubscribed += 1;
+  };
+  service.dispose = () => {
+    disposed += 1;
+  };
+  const occupiedPort = Number(new URL(running.origin).port);
+  try {
+    await assert.rejects(
+      startAcpxConsoleServer({
+        config: {
+          host: "127.0.0.1",
+          port: occupiedPort,
+          trustNetwork: false,
+          allowedHosts: ["127.0.0.1"],
+          workspaceRoots: [root],
+          stateDir: join(root, "other-state"),
+          staticDir: join(root, "web"),
+        },
+        service,
+        logger: { info() {}, warn() {}, error() {} },
+      }),
+      /EADDRINUSE/,
+    );
+    assert.equal(unsubscribed, 1);
+    assert.equal(disposed, 1);
+  } finally {
+    await running.close();
+  }
+});
+
 test("session detail, provider inventory, timeline, pending, cancellation, response and close routes keep exact ids", async () => {
   const { running, service } = await fixture();
   try {
@@ -465,6 +633,50 @@ test("a slow SSE client is disconnected on the first backpressure signal", async
     ]);
   } finally {
     socket.destroy();
+    await running.close();
+  }
+});
+
+test("event streams replay retained ids and reset clients outside the replay window", async () => {
+  const { running, service } = await fixture();
+  const readUntil = async (headers: HeadersInit, pattern: RegExp): Promise<string> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2_000);
+    const response = await fetch(`${running.origin}/api/v1/events`, {
+      headers,
+      signal: controller.signal,
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    try {
+      while (!pattern.test(body)) {
+        const next = await reader.read();
+        if (next.done) {
+          break;
+        }
+        body += decoder.decode(next.value, { stream: true });
+      }
+      return body;
+    } finally {
+      clearTimeout(timeout);
+      await reader.cancel();
+    }
+  };
+  try {
+    service.emit({ type: "sessions" });
+    service.emit({ type: "session", acpxRecordId: "record-1" });
+    const replay = await readUntil({ "Last-Event-ID": "1" }, /id: 2\n/);
+    assert.doesNotMatch(replay, /id: 1\n/);
+    assert.match(replay, /event: session\n/);
+
+    for (let index = 0; index < 512; index++) {
+      service.emit({ type: "timeline", acpxRecordId: "record-1", cursor: String(index) });
+    }
+    const reset = await readUntil({ "Last-Event-ID": "0" }, /event: reset\n/);
+    assert.match(reset, /event: reset\n/);
+  } finally {
     await running.close();
   }
 });

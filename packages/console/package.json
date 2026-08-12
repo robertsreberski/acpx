@@ -27,6 +27,7 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run test",
     "dev:web": "vite --config web/vite.config.ts",
     "lint": "oxlint --type-aware --deny-warnings src test web/src web/test",
+    "prepack": "pnpm run build",
     "test": "tsx --test test/*.test.ts web/test/*.test.ts",
     "typecheck": "tsc --noEmit && pnpm run typecheck:web",
     "typecheck:web": "tsc -p web/tsconfig.json --noEmit"
@@ -34,7 +35,7 @@
   "dependencies": {
     "@assistant-ui/react": "0.15.14",
     "@assistant-ui/react-markdown": "0.14.10",
-    "acpx": "workspace:0.13.0-fork.2",
+    "acpx": "0.13.0-fork.2",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "remark-gfm": "^4.0.1"

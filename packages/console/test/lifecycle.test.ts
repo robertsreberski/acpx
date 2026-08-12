@@ -41,12 +41,111 @@ test("foreground lifecycle writes private control state and stops without an HTT
   await new Promise<void>((resolve, reject) => {
     const socket = createConnection(lifecyclePaths(config.stateDir).control);
     socket.setEncoding("utf8");
-    socket.once("connect", () => socket.write("stop\n"));
+    socket.once("connect", () =>
+      socket.write(
+        `${JSON.stringify({ command: "stop", instanceToken: foreground.record.instanceToken })}\n`,
+      ),
+    );
     socket.once("data", () => resolve());
     socket.once("error", reject);
   });
   await foreground.stopped;
   assert.equal(await readRuntimeRecord(config.stateDir), undefined);
+});
+
+test("foreground shutdown destroys partial control clients instead of hanging", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-control-partial-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const config: ResolvedConsoleConfig = {
+    host: "127.0.0.1",
+    port: 0,
+    trustNetwork: false,
+    allowedHosts: ["127.0.0.1"],
+    workspaceRoots: [root],
+    stateDir: join(root, "state"),
+    staticDir: web,
+  };
+  const foreground = await startForegroundConsole(config, new MockSessionService());
+  const socket = createConnection(foreground.record.controlPath);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write("partial-without-newline");
+  await Promise.race([
+    foreground.stop(),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("foreground shutdown hung on control client")), 1_000),
+    ),
+  ]);
+  assert.equal(socket.destroyed, true);
+});
+
+test("control socket paths remain bounded for arbitrarily long state directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-long-state-"));
+  const web = join(root, "web");
+  const stateDir = join(root, "a".repeat(90), "b".repeat(90), "state");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const foreground = await startForegroundConsole(
+    {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [root],
+      stateDir,
+      staticDir: web,
+    },
+    new MockSessionService(),
+  );
+  try {
+    assert.ok(foreground.record.controlPath.length < 100);
+    assert.equal((await consoleStatus(stateDir)).status, "running");
+  } finally {
+    await foreground.stop();
+  }
+});
+
+test("a reused live pid without the exact instance token is stale and does not block startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-stale-pid-"));
+  const web = join(root, "web");
+  const stateDir = join(root, "state");
+  await Promise.all([mkdir(web), mkdir(stateDir)]);
+  await writeFile(join(web, "index.html"), "ok");
+  await writeFile(
+    lifecyclePaths(stateDir).runtime,
+    JSON.stringify({
+      schema: "acpx.console.runtime.v1",
+      pid: process.pid,
+      host: "127.0.0.1",
+      port: 9,
+      origin: "http://127.0.0.1:9",
+      startedAt: new Date().toISOString(),
+      controlPath: lifecyclePaths(stateDir).control,
+      healthHost: "127.0.0.1",
+      instanceToken: "stale-instance-token-00000000000000",
+    }),
+  );
+  const foreground = await startForegroundConsole(
+    {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [root],
+      stateDir,
+      staticDir: web,
+    },
+    new MockSessionService(),
+  );
+  try {
+    assert.notEqual(foreground.record.instanceToken, "stale-instance-token-00000000000000");
+  } finally {
+    await foreground.stop();
+  }
 });
 
 test("corrupt runtime metadata fails closed without deleting the control endpoint", async () => {
@@ -86,6 +185,7 @@ test("stop requires one bounded newline-delimited success response", async () =>
       startedAt: new Date().toISOString(),
       controlPath: paths.control,
       healthHost: "127.0.0.1",
+      instanceToken: "test-instance-token-00000000000000",
     }),
   );
   try {
@@ -121,6 +221,7 @@ test("stop rejects an oversized control response before waiting for process exit
       startedAt: new Date().toISOString(),
       controlPath: paths.control,
       healthHost: "127.0.0.1",
+      instanceToken: "test-instance-token-00000000000000",
     }),
   );
   try {

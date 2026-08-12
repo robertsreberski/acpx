@@ -1,3 +1,4 @@
+import { ConsoleInputError } from "./config.js";
 import type {
   AcpxConsoleSessionService,
   ConsoleAgent,
@@ -128,7 +129,7 @@ function defaultMode(agentId: string, supplied: string | undefined): string | un
 
 function pendingAnswer(value: unknown): PendingAnswer {
   if (!value || typeof value !== "object" || Array.isArray(value) || !("type" in value)) {
-    throw new Error("pending response must be a tagged answer object");
+    throw new ConsoleInputError("pending response must be a tagged answer object");
   }
   const answer = value as Record<string, unknown>;
   if (answer.type === "select" && typeof answer.option_id === "string" && answer.option_id) {
@@ -148,7 +149,7 @@ function pendingAnswer(value: unknown): PendingAnswer {
         typeof field === "string" || typeof field === "number" || typeof field === "boolean";
       const strings = Array.isArray(field) && field.every((item) => typeof item === "string");
       if (!scalar && !strings) {
-        throw new Error("elicitation content values must be scalar or string arrays");
+        throw new ConsoleInputError("elicitation content values must be scalar or string arrays");
       }
     }
     return {
@@ -156,7 +157,7 @@ function pendingAnswer(value: unknown): PendingAnswer {
       content: answer.content as Record<string, string | number | boolean | string[]>,
     };
   }
-  throw new Error("pending response has an unsupported answer shape");
+  throw new ConsoleInputError("pending response has an unsupported answer shape");
 }
 
 function projectAgent(agent: CoreAgent): ConsoleAgent {
