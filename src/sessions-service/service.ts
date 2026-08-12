@@ -86,7 +86,7 @@ type ResolvedAgent = {
 
 type StartSessionCheckpoint = {
   recordId: string;
-  phase: "created" | "configured";
+  phase: "allocated" | "created" | "configured";
 };
 
 function parseStartSessionCheckpoint(value: unknown): StartSessionCheckpoint {
@@ -96,7 +96,7 @@ function parseStartSessionCheckpoint(value: unknown): StartSessionCheckpoint {
   const record = value as Record<string, unknown>;
   if (
     typeof record.recordId !== "string" ||
-    (record.phase !== "created" && record.phase !== "configured")
+    (record.phase !== "allocated" && record.phase !== "created" && record.phase !== "configured")
   ) {
     throw new Error("Invalid persisted session-start recovery checkpoint");
   }
@@ -131,6 +131,18 @@ export class AcpxSessionAdoptionError extends Error {
       { cause },
     );
     this.name = "AcpxSessionAdoptionError";
+  }
+}
+
+export class AcpxSessionStartInDoubtError extends Error {
+  readonly code = "SESSION_START_RESULT_UNKNOWN";
+
+  constructor(recordId: string) {
+    super(
+      `Session start for local record ${recordId} may have reached the provider, but no durable ` +
+        "session record exists; refusing to repeat the provider mutation",
+    );
+    this.name = "AcpxSessionStartInDoubtError";
   }
 }
 
@@ -472,10 +484,15 @@ class SessionService implements AcpxSessionService {
       }
     }
 
+    const recordId = randomUUID();
+    // Establish local identity before any provider-side effect. If the process
+    // dies after session/new or session/resume but before the record is written,
+    // recovery fails closed instead of repeating the provider mutation.
+    await checkpoint?.({ recordId, phase: "allocated" });
     let created: Awaited<ReturnType<typeof createSessionWithClient>>;
     try {
       created = await createSessionWithClient({
-        acpxRecordId: randomUUID(),
+        acpxRecordId: recordId,
         agentCommand: agent.agentCommand,
         agentArgv: agent.agentArgv,
         cwd: input.cwd,
@@ -528,12 +545,23 @@ class SessionService implements AcpxSessionService {
     providerSessionId?: string,
   ): Promise<AcpxSessionDetail> {
     const checkpoint = parseStartSessionCheckpoint(checkpointValue);
-    const [agent, record] = await Promise.all([
+    const [agent, records] = await Promise.all([
       this.resolveAgent(input.agentId, input.cwd),
-      this.requireExactRecord(checkpoint.recordId),
+      listSessions(),
     ]);
+    const record = exactRecord(records, checkpoint.recordId);
+    if (!record) {
+      if (checkpoint.phase === "allocated") {
+        throw new AcpxSessionStartInDoubtError(checkpoint.recordId);
+      }
+      throw new SessionNotFoundError(checkpoint.recordId);
+    }
     this.assertStartedSessionIdentity(record, agent, providerSessionId);
-    if (checkpoint.phase === "created") {
+    if (record.acpx?.agent_id === undefined) {
+      record.acpx = { ...record.acpx, agent_id: agent.agentId };
+      await writeSessionRecord(record);
+    }
+    if (checkpoint.phase !== "configured") {
       await this.ensureStartedSessionMode(input, agent, record);
     }
     return await this.projectDetail(await this.requireExactRecord(checkpoint.recordId));

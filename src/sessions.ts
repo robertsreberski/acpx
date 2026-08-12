@@ -2,6 +2,7 @@ export {
   AcpxAgentCapabilityError,
   AcpxAgentNotRegisteredError,
   AcpxSessionAdoptionError,
+  AcpxSessionStartInDoubtError,
   AcpxTurnConflictError,
   AcpxTurnNotActiveError,
   DEFAULT_SESSIONS_PERMISSION_POLICY,

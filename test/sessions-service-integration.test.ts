@@ -4,7 +4,12 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { listSessions } from "../src/session/persistence.js";
-import { AcpxSessionAdoptionError, createAcpxSessionService } from "../src/sessions.js";
+import { idempotencyTestInternals } from "../src/sessions-service/idempotency.js";
+import {
+  AcpxSessionAdoptionError,
+  AcpxSessionStartInDoubtError,
+  createAcpxSessionService,
+} from "../src/sessions.js";
 import { withTempHome } from "./runtime-test-helpers.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -191,6 +196,61 @@ test("session creation with a fresh key reconciles a post-create mode failure", 
     assert.equal(calls.filter((entry) => entry.method === "session/new").length, 1);
     assert.equal(calls.filter((entry) => entry.method === "session/resume").length, 1);
     service.dispose();
+  });
+});
+
+test("allocated session starts fail closed across keys without repeating the provider mutation", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "allocated-start-calls.ndjson");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: ["--supports-resume-session", "--call-log", callLog],
+      },
+    });
+    const firstInput = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      idempotencyKey: "allocated-start-first",
+    };
+    const recoveryScope = { agentId: "recoverable", cwd: path.resolve(cwd), mode: "plan" };
+    const now = new Date().toISOString();
+    const ledgerPath = idempotencyTestInternals.mutationPath(firstInput.idempotencyKey);
+    await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
+    await fs.writeFile(
+      ledgerPath,
+      `${JSON.stringify({
+        schema: "acpx.session_mutation.v1",
+        idempotency_key: firstInput.idempotencyKey,
+        operation: "create_session",
+        fingerprint: idempotencyTestInternals.fingerprint(firstInput),
+        state: "started",
+        created_at: now,
+        updated_at: now,
+        pid: process.pid,
+        recovery_scope: idempotencyTestInternals.fingerprint(recoveryScope),
+        recovery_result: { recordId: "allocated-local-record", phase: "allocated" },
+      })}\n`,
+      "utf8",
+    );
+    const service = createAcpxSessionService({ cwd });
+    try {
+      for (const input of [
+        firstInput,
+        { ...firstInput, idempotencyKey: "allocated-start-second" },
+      ]) {
+        await assert.rejects(
+          async () => await service.createSession(input),
+          AcpxSessionStartInDoubtError,
+        );
+      }
+      assert.equal((await listSessions()).length, 0);
+      await assert.rejects(async () => await fs.access(callLog));
+    } finally {
+      service.dispose();
+    }
   });
 });
 
