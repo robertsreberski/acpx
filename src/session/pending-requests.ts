@@ -398,6 +398,83 @@ export async function listPendingRequests(
   return entries;
 }
 
+export const PENDING_REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export type PendingRequestSweepResult = {
+  orphaned: PendingRequest[];
+  pruned: string[];
+};
+
+/**
+ * Reconcile a session's request directory with the owner that is starting.
+ *
+ * Entries still marked pending but stamped with a different owner generation
+ * cannot be answered by anyone — their waiter died with the previous owner — so
+ * they are marked orphaned. This is the one transition a process other than the
+ * parking owner may perform, and only because the generation proves the owner
+ * is gone. Terminal entries older than the retention window are deleted.
+ */
+export async function sweepPendingRequests(params: {
+  sessionId: string;
+  ownerGeneration: number;
+  now?: Date;
+  retentionMs?: number;
+  homeDir?: string;
+}): Promise<PendingRequestSweepResult> {
+  const homeDir = params.homeDir ?? os.homedir();
+  const now = params.now ?? new Date();
+  const retentionMs = params.retentionMs ?? PENDING_REQUEST_RETENTION_MS;
+  const cutoff = new Date(now.getTime() - retentionMs).toISOString();
+
+  const result: PendingRequestSweepResult = { orphaned: [], pruned: [] };
+  for (const entry of await listPendingRequests(params.sessionId, homeDir)) {
+    await sweepPendingRequestEntry(entry, {
+      ownerGeneration: params.ownerGeneration,
+      now,
+      cutoff,
+      homeDir,
+      result,
+    });
+  }
+  return result;
+}
+
+async function sweepPendingRequestEntry(
+  entry: PendingRequest,
+  params: {
+    ownerGeneration: number;
+    now: Date;
+    cutoff: string;
+    homeDir: string;
+    result: PendingRequestSweepResult;
+  },
+): Promise<void> {
+  if (entry.state === "pending") {
+    if (entry.ownerGeneration === params.ownerGeneration) {
+      return;
+    }
+    const answeredAt = params.now.toISOString();
+    const orphaned: PendingRequest = {
+      ...entry,
+      state: "orphaned",
+      updatedAt: answeredAt,
+      resolution: { answeredAt, source: "shutdown" },
+    };
+    await writePendingRequest(orphaned, params.homeDir).catch(() => undefined);
+    params.result.orphaned.push(orphaned);
+    return;
+  }
+
+  if (entry.updatedAt < params.cutoff) {
+    await fs
+      .rm(pendingRequestFilePath(entry.sessionId, entry.requestId, params.homeDir), {
+        force: true,
+      })
+      .catch(() => undefined);
+    params.result.pruned.push(entry.requestId);
+  }
+}
+
 export async function deletePendingRequestsForSession(
   sessionId: string,
   homeDir: string = os.homedir(),

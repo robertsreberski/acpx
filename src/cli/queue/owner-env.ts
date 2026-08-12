@@ -86,6 +86,8 @@ function assignQueueOwnerScalarOptions(
   assignBooleanOption(options, "terminal", record.terminal);
   assignBooleanOption(options, "suppressSdkConsoleErrors", record.suppressSdkConsoleErrors);
   assignBooleanOption(options, "verbose", record.verbose);
+  assignBooleanOption(options, "defer", record.defer);
+  assignRoundedNumberOption(options, "deferMaxAgeMs", record.deferMaxAgeMs, 0);
   assignFiniteNumberOption(options, "ttlMs", record.ttlMs);
   assignRoundedNumberOption(options, "maxQueueDepth", record.maxQueueDepth, 1);
   assignRoundedNumberOption(options, "promptRetries", record.promptRetries, 0);
@@ -93,7 +95,7 @@ function assignQueueOwnerScalarOptions(
 
 function assignBooleanOption(
   options: QueueOwnerRuntimeOptions,
-  key: "fs" | "terminal" | "suppressSdkConsoleErrors" | "verbose",
+  key: "fs" | "terminal" | "suppressSdkConsoleErrors" | "verbose" | "defer",
   value: unknown,
 ): void {
   if (typeof value === "boolean") {
@@ -113,7 +115,7 @@ function assignFiniteNumberOption(
 
 function assignRoundedNumberOption(
   options: QueueOwnerRuntimeOptions,
-  key: "maxQueueDepth" | "promptRetries",
+  key: "maxQueueDepth" | "promptRetries" | "deferMaxAgeMs",
   value: unknown,
   min: number,
 ): void {

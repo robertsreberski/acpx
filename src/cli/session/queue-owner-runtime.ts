@@ -3,18 +3,20 @@ import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { setPerfGauge } from "../../perf-metrics.js";
+import { matchPermissionPolicy } from "../../permissions.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import {
   mergeSessionOptions,
   sessionOptionsFromRecord,
 } from "../../runtime/engine/session-options.js";
+import { sweepPendingRequests } from "../../session/pending-requests.js";
 import {
   absolutePath,
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
-import type { SessionSendOutcome } from "../../types.js";
+import type { AcpClientOptions, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
   SessionQueueOwner,
@@ -26,6 +28,10 @@ import {
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
+import {
+  PendingRequestManager,
+  type PendingRequestEvent,
+} from "../queue/pending-request-manager.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeQueueOwnerTtlMs,
@@ -78,9 +84,16 @@ async function submitToRunningOwner(
   });
 }
 
+/**
+ * The parking hook is installed at construction because `updateRuntimeOptions`
+ * does not carry callbacks. That is fine: the hook reads `ctx.policy`, which is
+ * the per-request snapshot of whatever policy the *current task* installed, so
+ * one long-lived hook still honours per-task policies.
+ */
 function createQueueOwnerSharedClient(
   options: QueueOwnerRuntimeOptions,
   sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>,
+  parking: ParkingBridge | undefined,
 ): AcpClient {
   return new AcpClient({
     agentCommand: sessionRecord.agentCommand,
@@ -99,7 +112,83 @@ function createQueueOwnerSharedClient(
       options.sessionOptions,
       sessionOptionsFromRecord(sessionRecord),
     ),
+    ...(parking ? { onPermissionRequest: parking.onPermissionRequest } : {}),
   });
+}
+
+type ParkingBridge = {
+  manager: PendingRequestManager;
+  onPermissionRequest: NonNullable<AcpClientOptions["onPermissionRequest"]>;
+  beginTask: (taskRequestId: string) => void;
+  setTaskSink: (sink: (event: PendingRequestEvent) => void) => void;
+  endTask: () => void;
+};
+
+/**
+ * Bridges the shared client's permission hook to this owner's parking manager.
+ *
+ * Turns are serialized by QueueOwnerTurnController, so a single mutable slot is
+ * enough to attribute a parked request to the task that provoked it and to
+ * route its transitions back to that task's event log.
+ */
+function createParkingBridge(params: {
+  options: QueueOwnerRuntimeOptions;
+  ownerGeneration: number;
+  sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>;
+}): ParkingBridge | undefined {
+  if (!params.options.defer) {
+    return undefined;
+  }
+
+  let currentTask:
+    | { taskRequestId: string; sink?: (event: PendingRequestEvent) => void }
+    | undefined;
+  const manager = new PendingRequestManager({
+    sessionId: params.options.sessionId,
+    acpSessionId: params.sessionRecord.acpSessionId,
+    agentCommand: params.sessionRecord.agentCommand,
+    cwd: absolutePath(params.sessionRecord.cwd),
+    ownerGeneration: params.ownerGeneration,
+    ...(params.options.deferMaxAgeMs !== undefined
+      ? { deferMaxAgeMs: params.options.deferMaxAgeMs }
+      : {}),
+    onEvent: (event) => currentTask?.sink?.(event),
+    log: (message) => {
+      if (params.options.verbose) {
+        process.stderr.write(`[acpx] ${message}\n`);
+      }
+    },
+  });
+
+  return {
+    manager,
+    onPermissionRequest: async (req, ctx) => {
+      // ctx.policy is the snapshot for THIS request, so a per-task policy is
+      // honoured even though the hook outlives every individual task.
+      if (matchPermissionPolicy(req.raw, ctx.policy)?.action !== "defer") {
+        return undefined;
+      }
+      return await manager.park(
+        {
+          request: req.raw,
+          taskRequestId: currentTask?.taskRequestId ?? "unknown",
+          action: "defer",
+        },
+        { signal: ctx.signal },
+      );
+    },
+    beginTask: (taskRequestId) => {
+      currentTask = { taskRequestId };
+    },
+    setTaskSink: (sink) => {
+      if (currentTask) {
+        currentTask.sink = sink;
+      }
+    },
+    endTask: () => {
+      currentTask = undefined;
+    },
+  };
 }
 
 function createQueueOwnerTurnController(
@@ -248,6 +337,7 @@ type QueueOwnerShutdownController = {
 
 function createQueueOwnerShutdownController(params: {
   lease: QueueOwnerLease;
+  parking: ParkingBridge | undefined;
   getOwner: () => SessionQueueOwner | undefined;
   stopHeartbeat: () => void;
   turnController: QueueOwnerTurnController;
@@ -288,7 +378,15 @@ function createQueueOwnerShutdownController(params: {
     requested = true;
     params.stopHeartbeat();
     params.getOwner()?.beginShutdown();
-    activeTurnShutdown ??= drainActiveTurn();
+    // Unwind parked requests first: a turn blocked on one cannot respond to
+    // session/cancel, so draining before cancelling would burn the whole grace
+    // and then kill the bridge from under it.
+    activeTurnShutdown ??= (async () => {
+      await params.parking?.manager.cancelAll("shutdown").catch(() => {
+        // best effort while shutting down
+      });
+      await drainActiveTurn();
+    })();
   };
 
   return {
@@ -361,7 +459,18 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
-  const sharedClient = createQueueOwnerSharedClient(options, sessionRecord);
+  const parking = createParkingBridge({
+    options,
+    ownerGeneration: lease.ownerGeneration,
+    sessionRecord,
+  });
+  const sharedClient = createQueueOwnerSharedClient(options, sessionRecord, parking);
+  // Reconcile leftovers from a previous owner before serving anything: entries
+  // still pending under a dead generation can never be answered.
+  await sweepPendingRequests({
+    sessionId: options.sessionId,
+    ownerGeneration: lease.ownerGeneration,
+  }).catch(() => undefined);
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
   const taskPollTimeoutMs = ttlMs === 0 ? undefined : ttlMs;
@@ -408,6 +517,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
   const shutdown = createQueueOwnerShutdownController({
     lease,
+    parking,
     getOwner: () => owner,
     stopHeartbeat: () => {
       if (heartbeatTimer) {
@@ -489,6 +599,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
       const turnPromise = runPromptTurn(async () => {
         try {
+          parking?.beginTask(task.requestId);
           await runQueuedTask(options.sessionId, task, {
             sharedClient,
             verbose: options.verbose,
@@ -501,6 +612,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             sessionOptions: options.sessionOptions,
             onClientAvailable: setActiveController,
             onClientClosed: clearActiveController,
+            ...(parking ? { onPendingRequestSink: parking.setTaskSink } : {}),
             onPromptActive: async () => {
               turnController.markPromptActive();
               await applyPendingCancel();
@@ -508,6 +620,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             handleProcessInterrupts: false,
           });
         } finally {
+          parking?.endTask();
           checkpointPerfMetricsCapture();
         }
       });

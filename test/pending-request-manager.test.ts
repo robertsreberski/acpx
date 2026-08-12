@@ -308,3 +308,30 @@ test("listPending reports only in-flight requests from this owner", async () => 
     assert.deepEqual(await manager.listPending(), []);
   });
 });
+
+test("a throwing onEvent consumer cannot strand the parked turn", async () => {
+  await withTempHome(async () => {
+    const logs: string[] = [];
+    const { manager } = makeManager({
+      onEvent: () => {
+        throw new Error("event consumer exploded");
+      },
+      log: (message) => logs.push(message),
+    });
+    const controller = new AbortController();
+
+    // Every transition notifies the consumer; none of them may propagate.
+    const decision = park(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+    await manager.respond(pending.requestId, { optionId: "allow" });
+
+    assert.deepEqual(await decision, { outcome: "select", optionId: "allow" });
+    assert.equal((await readPendingRequest(SESSION_ID, pending.requestId))?.state, "answered");
+    assert.equal(
+      logs.filter((line) => line.includes("pending request event consumer threw")).length,
+      2,
+      `expected created+answered failures to be logged, got: ${JSON.stringify(logs)}`,
+    );
+  });
+});

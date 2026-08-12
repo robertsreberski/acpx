@@ -30,6 +30,8 @@ export type QueueOwnerRuntimeOptions = {
   maxQueueDepth?: number;
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;
+  defer?: boolean;
+  deferMaxAgeMs?: number;
 };
 
 type SessionSendLike = {
@@ -49,6 +51,8 @@ type SessionSendLike = {
   maxQueueDepth?: number;
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;
+  defer?: boolean;
+  deferMaxAgeMs?: number;
 };
 
 function isNonEmptyStringArray(value: unknown): value is string[] {
@@ -177,6 +181,8 @@ export function queueOwnerRuntimeOptionsFromSend(
     maxQueueDepth: options.maxQueueDepth,
     promptRetries: options.promptRetries,
     sessionOptions: options.sessionOptions,
+    ...(options.defer ? { defer: true } : {}),
+    ...(options.deferMaxAgeMs !== undefined ? { deferMaxAgeMs: options.deferMaxAgeMs } : {}),
   };
 }
 

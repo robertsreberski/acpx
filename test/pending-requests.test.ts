@@ -12,6 +12,7 @@ import {
   pendingRequestsSessionDir,
   readPendingRequest,
   serializePendingRequestForDisk,
+  sweepPendingRequests,
   writePendingRequest,
   type PendingRequest,
 } from "../src/session/pending-requests.js";
@@ -204,5 +205,47 @@ test("session ids that are not path-safe still get their own directory", async (
     const loaded = await readPendingRequest(entry.sessionId, entry.requestId);
     assert.deepEqual(loaded, entry);
     assert.equal(pendingRequestsSessionDir(entry.sessionId).includes(".."), false);
+  });
+});
+
+test("sweep orphans pending entries left by a previous owner generation", async () => {
+  await withTempHome(async () => {
+    await writePendingRequest(makeEntry({ requestId: "stale", ownerGeneration: 1 }));
+    await writePendingRequest(makeEntry({ requestId: "mine", ownerGeneration: 2 }));
+
+    const result = await sweepPendingRequests({
+      sessionId: "session-record-1",
+      ownerGeneration: 2,
+    });
+
+    assert.deepEqual(
+      result.orphaned.map((entry) => entry.requestId),
+      ["stale"],
+    );
+    assert.equal((await readPendingRequest("session-record-1", "stale"))?.state, "orphaned");
+    // The live owner's own pending entry is untouched.
+    assert.equal((await readPendingRequest("session-record-1", "mine"))?.state, "pending");
+  });
+});
+
+test("sweep prunes terminal entries past the retention window and keeps fresh ones", async () => {
+  await withTempHome(async () => {
+    const now = new Date("2026-08-12T00:00:00.000Z");
+    await writePendingRequest(
+      makeEntry({ requestId: "old", state: "answered", updatedAt: "2026-08-01T00:00:00.000Z" }),
+    );
+    await writePendingRequest(
+      makeEntry({ requestId: "recent", state: "expired", updatedAt: "2026-08-11T00:00:00.000Z" }),
+    );
+
+    const result = await sweepPendingRequests({
+      sessionId: "session-record-1",
+      ownerGeneration: 99,
+      now,
+    });
+
+    assert.deepEqual(result.pruned, ["old"]);
+    assert.equal(await readPendingRequest("session-record-1", "old"), undefined);
+    assert.equal((await readPendingRequest("session-record-1", "recent"))?.state, "expired");
   });
 });

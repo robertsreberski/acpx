@@ -364,6 +364,10 @@ export async function handlePrompt(
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     timeoutMs: globalFlags.timeout,
     ttlMs: globalFlags.ttl,
+    ...(globalFlags.defer ? { defer: true } : {}),
+    ...(globalFlags.deferMaxAgeMs === undefined
+      ? {}
+      : { deferMaxAgeMs: globalFlags.deferMaxAgeMs }),
     maxQueueDepth: config.queueMaxDepth,
     promptRetries: globalFlags.promptRetries,
     verbose: globalFlags.verbose,

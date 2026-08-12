@@ -44,6 +44,7 @@ export type PendingRequestManagerOptions = {
   /** Milliseconds before a parked request expires; 0 parks indefinitely. */
   deferMaxAgeMs?: number;
   onEvent?: (event: PendingRequestEvent) => void;
+  log?: (message: string) => void;
   now?: () => Date;
   createRequestId?: () => string;
 };
@@ -281,7 +282,17 @@ export class PendingRequestManager {
   }
 
   private emit(event: PendingRequestEventType, request: PendingRequest): void {
-    this.options.onEvent?.({ type: "pending_request", event, request });
+    try {
+      this.options.onEvent?.({ type: "pending_request", event, request });
+    } catch (error) {
+      // Report-only channel. A consumer that throws must not abort a
+      // transition, strand the parked turn, or take down owner shutdown.
+      this.options.log?.(
+        `pending request event consumer threw for ${event} ${request.requestId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
 

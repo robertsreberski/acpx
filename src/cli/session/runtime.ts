@@ -74,6 +74,7 @@ import type {
 } from "../../types.js";
 import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
+import type { PendingRequestEvent } from "../queue/pending-request-manager.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
@@ -84,6 +85,12 @@ type RunSessionPromptOptions = Omit<
 > & {
   sessionRecordId: string;
   handleProcessInterrupts?: boolean;
+  /**
+   * Hands back a sink that turns pending-request transitions into event-log
+   * entries for THIS turn. Same shape as onClientAvailable: the turn owns the
+   * log, so the producer has to be given a way in.
+   */
+  onPendingRequestSink?: (sink: (event: PendingRequestEvent) => void) => void;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
@@ -562,6 +569,28 @@ async function waitBeforePromptRetry(
 
 type QueuedTaskRuntimeOptions = Parameters<typeof runQueuedTask>[2];
 
+/**
+ * Synthetic JSON-RPC notification for an acpx-originated event. Underscore
+ * prefix marks it as a client extension so an ACP reader can skip it; the event
+ * log accepts any well-formed notification.
+ */
+function acpxExtensionNotification(method: string, params: unknown): AcpJsonRpcMessage {
+  return { jsonrpc: "2.0", method, params };
+}
+
+function registerPendingRequestSink(
+  options: RunSessionPromptOptions,
+  output: OutputFormatter,
+  pendingMessages: AcpJsonRpcMessage[],
+): void {
+  options.onPendingRequestSink?.((event) => {
+    const notification = acpxExtensionNotification("_acpx/pending_request", event);
+    pendingMessages.push(notification);
+    // Attached --format json clients see park/answer transitions live.
+    output.onAcpMessage(notification);
+  });
+}
+
 function buildQueuedTaskRunOptions(
   sessionRecordId: string,
   task: QueueTask,
@@ -588,6 +617,7 @@ function buildQueuedTaskRunOptions(
     onClientAvailable: options.onClientAvailable,
     onClientClosed: options.onClientClosed,
     onPromptActive: options.onPromptActive,
+    onPendingRequestSink: options.onPendingRequestSink,
     handleProcessInterrupts: options.handleProcessInterrupts,
     client: options.sharedClient,
   };
@@ -644,6 +674,7 @@ export async function runQueuedTask(
     onClientAvailable?: (controller: ActiveSessionController) => void;
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
+    onPendingRequestSink?: (sink: (event: PendingRequestEvent) => void) => void;
     handleProcessInterrupts?: boolean;
   },
 ): Promise<void> {
@@ -813,10 +844,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       options.onClientOperation?.(operation);
     },
     onPermissionEscalation: (event) => {
+      // Also land it in the durable event log. The formatter is discarded for
+      // --no-wait turns, so without this an escalation leaves no trace at all.
+      pendingMessages.push(acpxExtensionNotification("_acpx/permission_escalation", event));
       output.onPermissionEscalation(event);
       options.onPermissionEscalation?.(event);
     },
   });
+  registerPendingRequestSink(options, output, pendingMessages);
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
   const activeController: ActiveSessionController = {

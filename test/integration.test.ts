@@ -5591,3 +5591,204 @@ test("runPromptTurn: existing agent reply still allows post-success drain", asyn
   assert.equal(result.stopReason, "end_turn");
   assert.deepEqual(calls, ["prompt", "drain"]);
 });
+
+async function readStoredPendingRequests(homeDir: string): Promise<
+  Array<{
+    state: string;
+    task_request_id: string;
+    resolution?: { source?: string; option_id?: string };
+  }>
+> {
+  const base = path.join(homeDir, ".acpx", "requests");
+  const entries: Array<{
+    state: string;
+    task_request_id: string;
+    resolution?: { source?: string; option_id?: string };
+  }> = [];
+  let sessionDirs: string[];
+  try {
+    sessionDirs = await fs.readdir(base);
+  } catch {
+    return entries;
+  }
+  for (const dir of sessionDirs) {
+    for (const name of await fs.readdir(path.join(base, dir))) {
+      if (!name.endsWith(".json")) {
+        continue;
+      }
+      entries.push(
+        JSON.parse(await fs.readFile(path.join(base, dir, name), "utf8")) as (typeof entries)[0],
+      );
+    }
+  }
+  return entries;
+}
+
+async function readAcpxExtensionMethods(homeDir: string): Promise<string[]> {
+  const sessionsDir = path.join(homeDir, ".acpx", "sessions");
+  const methods: string[] = [];
+  for (const name of await fs.readdir(sessionsDir)) {
+    if (!name.endsWith(".stream.ndjson")) {
+      continue;
+    }
+    const contents = await fs.readFile(path.join(sessionsDir, name), "utf8");
+    for (const line of contents.split("\n")) {
+      const match = /"method":"(_acpx\/[a-z_]+)"/.exec(line);
+      if (match?.[1]) {
+        methods.push(match[1]);
+      }
+    }
+  }
+  return methods;
+}
+
+test("integration: --defer parks a deferred permission and expiry resolves it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--defer",
+          "--defer-max-age",
+          "1",
+          "--policy",
+          '{"defaultAction":"defer"}',
+          "--format",
+          "json",
+          "--ttl",
+          "20",
+          "prompt",
+          "permission execute Bash",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+
+      assert.equal(result.code, 5, result.stderr);
+      assert.match(result.stdout, /"outcome":"selected","optionId":"reject"/);
+
+      const stored = await readStoredPendingRequests(homeDir);
+      assert.equal(stored.length, 1, JSON.stringify(stored));
+      assert.equal(stored[0]?.state, "expired");
+      assert.equal(stored[0]?.resolution?.source, "expiry");
+      assert.equal(stored[0]?.resolution?.option_id, "reject");
+
+      const methods = await readAcpxExtensionMethods(homeDir);
+      assert.equal(
+        methods.filter((method) => method === "_acpx/pending_request").length >= 2,
+        true,
+        `expected created+expired notifications, got ${JSON.stringify(methods)}`,
+      );
+
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: a no-wait deferred permission still reaches the event log", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "new"], homeDir);
+
+      // --no-wait discards the formatter, so the durable event log is the only
+      // place these transitions can surface.
+      const submitted = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--defer",
+          "--defer-max-age",
+          "1",
+          "--policy",
+          '{"defaultAction":"defer"}',
+          "--format",
+          "json",
+          "--ttl",
+          "20",
+          "prompt",
+          "--no-wait",
+          "permission execute Bash",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(submitted.code, 0, submitted.stderr);
+
+      const deadline = Date.now() + 25_000;
+      let stored = await readStoredPendingRequests(homeDir);
+      while (stored[0]?.state !== "expired" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        stored = await readStoredPendingRequests(homeDir);
+      }
+
+      assert.equal(stored.length, 1, JSON.stringify(stored));
+      assert.equal(stored[0]?.state, "expired");
+      assert.equal((stored[0]?.task_request_id ?? "").length > 0, true);
+
+      // The store is written synchronously by the manager, but the event log is
+      // batched and flushed at turn checkpoints, so it needs its own wait.
+      let methods = await readAcpxExtensionMethods(homeDir);
+      while (!methods.includes("_acpx/pending_request") && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        methods = await readAcpxExtensionMethods(homeDir);
+      }
+      assert.equal(
+        methods.includes("_acpx/pending_request"),
+        true,
+        `expected pending-request notifications, got ${JSON.stringify(methods)}`,
+      );
+
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: without --defer a defer policy still degrades to deny plus event", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "new"], homeDir);
+
+      const result = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--policy",
+          '{"defaultAction":"defer"}',
+          "--format",
+          "json",
+          "--ttl",
+          "20",
+          "prompt",
+          "permission execute Bash",
+        ],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+
+      assert.equal(result.code, 5, result.stderr);
+      assert.match(result.stdout, /"outcome":"selected","optionId":"reject"/);
+      assert.match(result.stdout, /"action":"defer"/);
+      // Nothing is parked without the opt-in.
+      assert.deepEqual(await readStoredPendingRequests(homeDir), []);
+
+      const methods = await readAcpxExtensionMethods(homeDir);
+      assert.equal(methods.includes("_acpx/permission_escalation"), true);
+      assert.equal(methods.includes("_acpx/pending_request"), false);
+
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});

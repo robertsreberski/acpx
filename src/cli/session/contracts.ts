@@ -107,6 +107,10 @@ export type SessionSendOptions = {
   waitForCompletion?: boolean;
   ttlMs?: number;
   maxQueueDepth?: number;
+  /** Park `defer`-matched permission requests instead of denying them. */
+  defer?: boolean;
+  /** Milliseconds a parked request waits before expiring; 0 parks forever. */
+  deferMaxAgeMs?: number;
   client?: AcpClient;
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;

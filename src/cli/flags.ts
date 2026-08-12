@@ -52,6 +52,9 @@ export type GlobalFlags = PermissionFlags & {
   systemPrompt?: SystemPromptOption;
   promptRetries?: number;
   permissionPolicy?: string;
+  defer?: boolean;
+  /** Absent means "use the manager default"; 0 means "never expire". */
+  deferMaxAgeMs?: number;
 };
 
 export type PromptFlags = {
@@ -175,6 +178,21 @@ export function parseTtlSeconds(value: string): number {
   const milliseconds = toTimerMilliseconds(parsed, true);
   if (milliseconds === undefined) {
     throw new InvalidArgumentError("TTL exceeds the maximum supported timer delay");
+  }
+  return milliseconds;
+}
+
+export function parseDeferMaxAgeSeconds(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--defer-max-age must be a non-negative number of seconds");
+  }
+  if (parsed === 0) {
+    return 0;
+  }
+  const milliseconds = toTimerMilliseconds(parsed, true);
+  if (milliseconds === undefined) {
+    throw new InvalidArgumentError("--defer-max-age exceeds the maximum supported timer delay");
   }
   return milliseconds;
 }
@@ -356,6 +374,15 @@ export function addGlobalFlags(command: Command): Command {
       parseTtlSeconds,
     )
     .option(
+      "--defer",
+      "Park permission requests matched by a defer policy rule instead of denying them",
+    )
+    .option(
+      "--defer-max-age <seconds>",
+      "How long a parked request waits before expiring (0 = never) (default: 86400)",
+      parseDeferMaxAgeSeconds,
+    )
+    .option(
       "--mcp-config <path>",
       "Load MCP servers from a JSON config file instead of project/global mcpServers",
     )
@@ -434,6 +461,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     terminal: resolveTerminalOption(opts.terminal),
     timeout: resolveTimeoutOption(opts.timeout, config),
     ttl: resolveTtlOption(opts.ttl, config),
+    ...resolveDeferOptions(opts),
     verbose,
     format,
     model: resolveModelOption(opts.model),
@@ -487,6 +515,17 @@ function resolveTerminalOption(value: unknown): boolean | undefined {
 
 function resolveTimeoutOption(value: unknown, config: ResolvedAcpxConfig): number | undefined {
   return numberOption(value) ?? config.timeoutMs;
+}
+
+function resolveDeferOptions(opts: Record<string, unknown>): {
+  defer?: boolean;
+  deferMaxAgeMs?: number;
+} {
+  const deferMaxAgeMs = numberOption(opts.deferMaxAge);
+  return {
+    ...(opts.defer === true ? { defer: true } : {}),
+    ...(deferMaxAgeMs === undefined ? {} : { deferMaxAgeMs }),
+  };
 }
 
 function resolveTtlOption(value: unknown, config: ResolvedAcpxConfig): number {

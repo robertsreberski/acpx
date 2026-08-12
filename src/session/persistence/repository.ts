@@ -6,6 +6,7 @@ import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
+import { deletePendingRequestsForSession } from "../pending-requests.js";
 import { createAtomicWriteTempPath } from "./atomic-write.js";
 import {
   loadOrRebuildSessionIndex,
@@ -419,6 +420,9 @@ async function pruneSessionFiles(
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
     }
   }
+  // Parked requests belong to the record; leaving them would strand entries
+  // nothing can ever answer.
+  await deletePendingRequestsForSession(record.acpxRecordId).catch(() => undefined);
   return bytesFreed;
 }
 
