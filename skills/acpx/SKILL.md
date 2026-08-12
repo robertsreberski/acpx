@@ -191,6 +191,26 @@ Behavior:
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
 
+### Deferred permission requests
+
+```bash
+acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
+acpx codex requests --json
+acpx codex respond <request-id> --option allow
+acpx codex respond <request-id> --decline
+acpx codex respond <request-id> --cancel
+```
+
+Behavior:
+
+- `--defer` parks `defer`-matched permission requests instead of denying them for the turn: the turn stays blocked and a durable record is written under `~/.acpx/requests/`.
+- `--defer` and `--defer-max-age <seconds>` are owner-level, fixed when the session's queue owner starts; a submit a warm owner cannot honour is refused, not silently denied.
+- `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session and needs no session in the current directory.
+- `requests --json` prints the persisted store entries verbatim (snake_case, `acpx.pending_request.v1`). Bind scripts to that shape.
+- `respond` takes exactly one of `--option <optionId>`, `--decline`, or `--cancel`. Option ids come from the `options` array of the listed request.
+- `respond` exits `2` when the answer cannot apply (unknown option, unknown or settled request) and `4` when the owner that parked the request is gone.
+- `status` reports the parked count (`parkedRequests` in JSON).
+
 ### Sessions
 
 ```bash
@@ -264,6 +284,8 @@ Behavior:
 - `--suppress-reads`: suppress raw read-file contents while preserving the selected format
 - `--timeout <seconds>`: max wait time (positive number)
 - `--ttl <seconds>`: queue owner idle TTL before shutdown (default `300`, `0` disables TTL)
+- `--defer`: park `defer`-matched permission requests for `acpx <agent> respond` instead of denying them for the turn
+- `--defer-max-age <seconds>`: how long a parked request waits before expiring like a rejection (default `86400`, `0` never expires)
 - `--model <id>`: request an agent model during session creation; non-Claude agents must advertise a model config option or legacy `models` metadata
 - `--system-prompt <text>`: replace the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt`; persisted in `session_options.system_prompt` so reuse keeps the override. Other agents ignore the field.
 - `--append-system-prompt <text>`: append text to the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt.append`; same persistence rules as `--system-prompt`.
@@ -432,6 +454,7 @@ acpx --format json codex exec 'review changed files' \
 - `--deny-all`: deny all permission requests
 - `--non-interactive-permissions <deny|fail>`: chosen behavior when no TTY is available to prompt
 - `--policy <json-or-file>`: match ACP permission requests by tool kind/title; non-interactive escalations add ACP response metadata
+- `--defer` with a `defer` rule parks the request for `acpx <agent> respond` instead of denying it for the turn
 
 If every permission request is denied/cancelled and none approved, `acpx` exits with permission-denied status.
 

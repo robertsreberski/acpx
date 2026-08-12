@@ -42,7 +42,23 @@ Policy keys:
 
 Rule precedence is `autoDeny`, then `autoApprove`, then `escalate`, then `defer`, then `defaultAction`, then the normal permission mode. Matches are case-insensitive. In non-interactive output, an escalated request is denied for the current turn.
 
-`defer` currently resolves exactly like `escalate` and differs only in what it reports: the emitted event carries `"action": "defer"` and a deferral message, so a host can tell a request it should have parked from one it was asked to approve now. Until something parks deferred requests, a deferred tool call is denied for the current turn like any other escalation. Text mode prints a `[permission]` notice; JSON mode keeps the raw ACP stream and includes structured escalation details, including tool input when supplied by the agent, in the `session/request_permission` response `_meta.acpx.permissionEscalation` object so an orchestrator can resume with a broader policy.
+Without `--defer`, `defer` resolves exactly like `escalate` and differs only in what it reports: the emitted event carries `"action": "defer"` and a deferral message, so a host can tell a request it should have parked from one it was asked to approve now, and the tool call is denied for the current turn like any other escalation. Text mode prints a `[permission]` notice; JSON mode keeps the raw ACP stream and includes structured escalation details, including tool input when supplied by the agent, in the `session/request_permission` response `_meta.acpx.permissionEscalation` object so an orchestrator can resume with a broader policy.
+
+## Parking deferred requests
+
+`--defer` changes what a `defer` match does: instead of being denied for the current turn, the request is parked. The turn stays blocked, a durable record is written under `~/.acpx/requests/`, and the request waits for an answer.
+
+```bash
+acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
+acpx codex requests --json
+acpx codex respond <request-id> --option allow
+```
+
+- `--defer` and `--defer-max-age <seconds>` are owner-level: they are fixed when the session's queue owner starts. A submit that a warm owner cannot honour is refused rather than silently denied.
+- A parked request expires after `--defer-max-age` (default `86400`, `0` never expires). Expiry resolves like a rejection, never like an approval.
+- Cancelling the session or stopping the owner unwinds parked requests; requests a stopped owner left behind become `orphaned` and can no longer be answered.
+- [`acpx <agent> requests`](CLI.md#requests-command) lists them and [`acpx <agent> respond`](CLI.md#respond-command) answers them. `acpx <agent> status` reports how many are parked.
+- Every transition is also emitted into the session event stream as an `_acpx/pending_request` notification, so a `--no-wait` caller still sees park and answer events.
 
 ## What counts as a "read"
 

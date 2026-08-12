@@ -375,7 +375,7 @@ export function addGlobalFlags(command: Command): Command {
     )
     .option(
       "--defer",
-      "Hold defer-matched permission requests open with a durable record and observable transitions (they still resolve by expiry or cancel until the respond verb ships)",
+      "Park defer-matched permission requests with a durable record until acpx respond answers them (or they expire)",
     )
     .option(
       "--defer-max-age <seconds>",

@@ -30,6 +30,8 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
+acpx [global_options] requests [list] [--all] [--json] [-s <name>]
+acpx [global_options] respond <request-id> (--option <optionId> | --decline | --cancel) [--json] [-s <name>]
 acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
 
@@ -40,6 +42,8 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
+acpx [global_options] <agent> requests [list] [--all] [--json] [-s <name>]
+acpx [global_options] <agent> respond <request-id> (--option <optionId> | --decline | --cancel) [--json] [-s <name>]
 acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 ```
 
@@ -65,7 +69,7 @@ Prompt options:
 
 Notes:
 
-- Top-level `prompt`, `exec`, `cancel`, `set-mode`, `set`, `sessions`, and bare `acpx <prompt>` default to `codex`.
+- Top-level `prompt`, `exec`, `cancel`, `set-mode`, `set`, `sessions`, `requests`, `respond`, and bare `acpx <prompt>` default to `codex`.
 - Top-level `flow run <file>` executes a user-authored workflow module and persists run state under `~/.acpx/flows/runs/`.
 - If a prompt argument is omitted, `acpx` reads prompt text from stdin when piped.
 - `--file` works for implicit prompt, `prompt`, and `exec` commands.
@@ -124,6 +128,8 @@ All global options:
 | `--permission-policy <json-or-file>`     | Per-tool permission policy                     | JSON object or file path with `autoApprove`, `autoDeny`, `escalate`, `defer`, and optional `defaultAction` (any of the four). Alias: `--policy`. |
 | `--timeout <seconds>`                    | Max wait time for agent response               | Must be positive. Decimal seconds allowed.                                                                                                       |
 | `--ttl <seconds>`                        | Queue owner idle TTL before shutdown           | Default `300`. `0` disables TTL.                                                                                                                 |
+| `--defer`                                | Park `defer`-matched permission requests       | The turn stays blocked and the request waits for [`respond`](#respond-command). Owner-level: fixed when the session's queue owner starts.        |
+| `--defer-max-age <seconds>`              | How long a parked request waits                | Default `86400`. `0` never expires. Expiry resolves like a rejection. Owner-level, like `--defer`.                                               |
 | `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata. |
 | `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                              |
 
@@ -323,6 +329,60 @@ Behavior:
 - Falls back to a direct client reconnect when no owner is running.
 - **`set model <id>`**: Uses the advertised model config option through `session/set_config_option`; adapters that explicitly advertise legacy `models` metadata use `session/set_model`.
 
+## `requests` command
+
+```bash
+acpx [global_options] <agent> requests [-s <name>]
+acpx [global_options] <agent> requests list [-s <name>]
+acpx [global_options] <agent> requests --all
+acpx [global_options] <agent> requests --json
+acpx [global_options] requests   # defaults to codex
+```
+
+Lists the permission requests this session has parked with [`--defer`](permissions.md).
+
+Behavior:
+
+- Reads the durable request store, so it keeps working when the queue owner is unreachable.
+- Reconciles first: requests left pending by an owner that is gone are marked `orphaned`, and terminal entries past the retention window are deleted.
+- Adds anything a live owner is holding that the store does not know about. When the owner cannot be reached, the listing still prints and a warning goes to stderr.
+- `--all` lists every session's parked requests and needs no session in the current directory. Without it, the session is resolved by walking up from the cwd, and no session is exit `4`.
+- States are `pending`, `answered`, `cancelled`, `expired`, and `orphaned`. Only `pending` requests can be answered.
+
+Output:
+
+- `--json` (or `--format json`) prints the persisted store entries verbatim: a JSON array of `acpx.pending_request.v1` objects with snake_case keys. This is the same shape as the files under `~/.acpx/requests/` and is the contract scripts should bind to.
+- Text prints one tab-separated line per request: id, state, tool title, offered option ids, creation time.
+- Quiet prints one request id per line.
+
+## `respond` command
+
+```bash
+acpx [global_options] <agent> respond <request-id> --option <optionId> [-s <name>]
+acpx [global_options] <agent> respond <request-id> --decline
+acpx [global_options] <agent> respond <request-id> --cancel
+acpx [global_options] respond <request-id> --option allow   # defaults to codex
+```
+
+Answers one parked permission request. Exactly one of `--option`, `--decline`, or `--cancel` is required.
+
+- `--option <optionId>`: answer with one of the option ids the agent offered (see `requests`).
+- `--decline`: answer with the rejection option the agent offered. Refused when the agent offered none; pick an option or cancel instead.
+- `--cancel`: cancel the request without choosing an option. The turn continues; the agent sees a cancelled permission request.
+
+The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. The request is then terminal: `answered` for `--option` and `--decline`, `cancelled` for `--cancel`, both with `resolution.source: "cli"`.
+
+Output is the resulting store entry: the persisted JSON object under `--json`, a one-line summary in text, and the resulting state in quiet.
+
+Exit codes:
+
+| Code | When                                                                                                  |
+| ---- | ----------------------------------------------------------------------------------------------------- |
+| `0`  | The request was answered                                                                              |
+| `1`  | The answer could not be delivered to the queue owner                                                  |
+| `2`  | No answer flag, more than one, an unknown option id, or a request that is unknown or settled          |
+| `4`  | No session for this directory, or the owner that parked the request is gone (it is marked `orphaned`) |
+
 ## `sessions` subcommand
 
 ```bash
@@ -396,6 +456,7 @@ Shows local process status for the cwd-scoped session:
 - uptime when running
 - last prompt timestamp
 - last known exit code/signal when dead
+- `parked`: how many permission requests this session has parked and not yet settled
 
 `idle` means the persistent session is saved and resumable, but no queue owner is
 currently running. The next prompt starts a queue owner and reconnects the
@@ -403,6 +464,12 @@ session.
 
 Status checks are local and PID-based (`kill(pid, 0)` semantics). Cached session
 PIDs are not reported unless a live queue-owner lease ties them to the session.
+
+The parked count comes from the durable request store, not from the queue owner,
+so it still reports after the owner is gone. `status` only reports it; use
+[`requests`](#requests-command) to reconcile and answer. JSON output carries it
+as `parkedRequests`; quiet output adds a `parked:<n>` line only when at least one
+request is parked. See [permissions](permissions.md) for `--defer`.
 
 ## `config` command
 
@@ -602,22 +669,22 @@ Per-tool policy:
 
 - `--permission-policy <json-or-file>` or `--policy <json-or-file>` matches ACP permission requests by tool kind, title head, title, or raw input tool/name.
 - `autoDeny` wins over `autoApprove`, which wins over `escalate`, which wins over `defer`; unmatched requests use `defaultAction` when set, otherwise the selected permission mode.
-- `defer` marks requests whose decision belongs to an out-of-band reviewer. It resolves like `escalate` and differs only in the reported `action`.
+- `defer` marks requests whose decision belongs to an out-of-band reviewer. Without `--defer` it resolves like `escalate` and differs only in the reported `action`; with `--defer` the request is parked for [`respond`](#respond-command).
 - `escalate` and `defer` prompt inline when a TTY is available and only emit an escalation event when one is not; see [permissions](permissions.md).
 - Reusing a warm queue owner from a build that predates `defer` fails with `QUEUE_OWNER_PROTOCOL_MISMATCH`; close the session so a current owner can start.
 - Non-interactive escalations deny the current request. Text mode prints a `[permission]` notice; JSON mode keeps raw ACP NDJSON and includes escalation details, including tool input when supplied by the agent, on the `session/request_permission` response at `_meta.acpx.permissionEscalation`.
 
 ## Exit codes
 
-| Code  | Meaning                                                                                    |
-| ----- | ------------------------------------------------------------------------------------------ |
-| `0`   | Success                                                                                    |
-| `1`   | Agent/protocol/runtime error                                                               |
-| `2`   | CLI usage error                                                                            |
-| `3`   | Timeout                                                                                    |
-| `4`   | No session found (prompt requires an explicit `sessions new`)                              |
-| `5`   | Permission denied (permission requested, none approved, and at least one denied/cancelled) |
-| `130` | Interrupted (`SIGINT`/`SIGTERM`)                                                           |
+| Code  | Meaning                                                                                                   |
+| ----- | --------------------------------------------------------------------------------------------------------- |
+| `0`   | Success                                                                                                   |
+| `1`   | Agent/protocol/runtime error                                                                              |
+| `2`   | CLI usage error                                                                                           |
+| `3`   | Timeout                                                                                                   |
+| `4`   | No session found (prompt requires an explicit `sessions new`), or the owner that parked a request is gone |
+| `5`   | Permission denied (permission requested, none approved, and at least one denied/cancelled)                |
+| `130` | Interrupted (`SIGINT`/`SIGTERM`)                                                                          |
 
 ## Environment variables
 
