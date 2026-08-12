@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createConnection, createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import {
   readRuntimeRecord,
   startForegroundConsole,
   stopDetachedConsole,
+  openConsole,
 } from "../src/lifecycle.js";
 import { MockSessionService } from "./helpers.js";
 
@@ -230,5 +231,41 @@ test("stop rejects an oversized control response before waiting for process exit
     await new Promise<void>((resolve, reject) =>
       control.close((error) => (error ? reject(error) : resolve())),
     );
+  }
+});
+
+test("foreground startup closes its control server when runtime metadata cannot be committed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-runtime-write-failure-"));
+  const web = join(root, "web");
+  const stateDir = join(root, "state");
+  await Promise.all([mkdir(web), mkdir(stateDir)]);
+  await writeFile(join(web, "index.html"), "ok");
+  await mkdir(join(stateDir, `runtime.json.${process.pid}.tmp`));
+
+  await assert.rejects(
+    startForegroundConsole(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [root],
+        stateDir,
+        staticDir: web,
+      },
+      new MockSessionService(),
+    ),
+    /EISDIR|illegal operation on a directory/,
+  );
+  await assert.rejects(access(lifecyclePaths(stateDir).control));
+});
+
+test("opening the console rejects when the platform browser launcher cannot spawn", async () => {
+  const originalPath = process.env.PATH;
+  process.env.PATH = "";
+  try {
+    await assert.rejects(openConsole("http://127.0.0.1:4174"), /ENOENT/);
+  } finally {
+    process.env.PATH = originalPath;
   }
 });

@@ -194,3 +194,25 @@ test("browser session creation cannot inject an approve-all policy", async () =>
   );
   assert.equal(fixture.calls.length, 0);
 });
+
+test("unknown agents require an explicit mode instead of inheriting an unsafe default", async () => {
+  const fixture = coreFixture();
+  const service = adaptAcpxSessionService(fixture.core);
+  await assert.rejects(
+    service.createSession({
+      agentId: "custom-agent",
+      cwd: "/workspace",
+      idempotencyKey: "custom-agent-key",
+    }),
+    /mode is required for agent custom-agent/,
+  );
+  assert.equal(fixture.calls.length, 0);
+
+  await service.createSession({
+    agentId: "custom-agent",
+    cwd: "/workspace",
+    mode: "safe",
+    idempotencyKey: "custom-agent-safe-key",
+  });
+  assert.equal((fixture.calls.at(-1)!.input as { mode?: string }).mode, "safe");
+});

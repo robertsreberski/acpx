@@ -531,6 +531,39 @@ test("a failed listen unsubscribes and disposes the service", async () => {
   }
 });
 
+test("a failed service subscription disposes the service before startup returns", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-subscribe-failure-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const service = new MockSessionService();
+  let disposed = 0;
+  service.subscribe = () => {
+    throw new Error("subscription failed");
+  };
+  service.dispose = () => {
+    disposed += 1;
+  };
+
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [root],
+        stateDir: join(root, "state"),
+        staticDir: web,
+      },
+      service,
+      logger: { info() {}, warn() {}, error() {} },
+    }),
+    /subscription failed/,
+  );
+  assert.equal(disposed, 1);
+});
+
 test("session detail, provider inventory, timeline, pending, cancellation, response and close routes keep exact ids", async () => {
   const { running, service } = await fixture();
   try {

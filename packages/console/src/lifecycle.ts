@@ -201,17 +201,25 @@ async function startControlServer(
       setImmediate(() => void stop());
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(controlPath, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(controlPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
-  if (process.platform !== "win32") {
-    await chmod(controlPath, 0o600);
+    if (process.platform !== "win32") {
+      await chmod(controlPath, 0o600);
+    }
+    return { server, controlPath, sockets };
+  } catch (error) {
+    await closeNetServer(server, sockets).catch(() => undefined);
+    if (process.platform !== "win32") {
+      await rm(controlPath, { force: true }).catch(() => undefined);
+    }
+    throw error;
   }
-  return { server, controlPath, sockets };
 }
 
 async function closeNetServer(server: NetServer, sockets: Set<Socket>): Promise<void> {
@@ -282,6 +290,9 @@ export async function startForegroundConsole(
     await writeRuntimeRecord(config.stateDir, record);
     return { record, stopped, stop };
   } catch (error) {
+    if (control) {
+      await closeNetServer(control, controlSockets).catch(() => undefined);
+    }
     await running.close();
     await cleanStaleLifecycle(config.stateDir);
     throw error;
@@ -484,6 +495,10 @@ export async function openConsole(origin: string): Promise<void> {
         ? ["cmd", ["/c", "start", "", origin]]
         : ["xdg-open", [origin]];
   const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
   child.unref();
 }
 

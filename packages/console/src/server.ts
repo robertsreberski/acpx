@@ -533,7 +533,13 @@ export async function startAcpxConsoleServer(
       sendSse(client, item);
     }
   };
-  const unsubscribe = options.service.subscribe?.(publish);
+  let unsubscribe: (() => void) | undefined;
+  try {
+    unsubscribe = options.service.subscribe?.(publish);
+  } catch (error) {
+    await options.service.dispose?.();
+    throw error;
+  }
   const connectSse = (response: ServerResponse, lastEventId?: string): void => {
     if (clients.size >= MAX_SSE_CLIENTS) {
       sendJson(response, 503, {

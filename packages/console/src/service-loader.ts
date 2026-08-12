@@ -124,7 +124,7 @@ function defaultMode(agentId: string, supplied: string | undefined): string | un
   if (agentId === "claude") {
     return "default";
   }
-  return undefined;
+  throw new ConsoleInputError(`A mode is required for agent ${agentId}`);
 }
 
 function pendingAnswer(value: unknown): PendingAnswer {
