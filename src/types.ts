@@ -275,8 +275,12 @@ export type SessionTimelineMetadata = {
   active_path: string;
   created_at: string;
   last_write_at?: string;
+  /** Last authoritative timeline write failure, cleared by the next successful append. */
+  last_write_error?: string | null;
   /** True when events existed before the lossless timeline was enabled. */
   legacy_retained: boolean;
+  /** False only while retained compatibility-stream messages are being imported. */
+  legacy_import_complete?: boolean;
 };
 
 export type PerfMetricSummary = {

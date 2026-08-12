@@ -203,7 +203,16 @@ async function releaseEventsLock(lock: LockHandle): Promise<void> {
 type SessionEventWriterOptions = {
   maxSegmentBytes?: number;
   maxSegments?: number;
+  /** Test-only fault injection before an authoritative timeline append. */
+  beforeTimelineAppend?: (event: CapturedAcpTimelineEvent) => void | Promise<void>;
   /** Test-only fault injection after the authoritative timeline append. */
+  afterTimelineAppend?: () => void | Promise<void>;
+};
+
+type ResolvedSessionEventWriterOptions = {
+  maxSegmentBytes: number;
+  maxSegments: number;
+  beforeTimelineAppend?: (event: CapturedAcpTimelineEvent) => void | Promise<void>;
   afterTimelineAppend?: () => void | Promise<void>;
 };
 
@@ -211,12 +220,23 @@ type AppendOptions = {
   checkpoint?: boolean;
 };
 
+export class SessionEventAppendError extends Error {
+  readonly committedCount: number;
+
+  constructor(error: unknown, committedCount: number) {
+    super(error instanceof Error ? error.message : String(error), { cause: error });
+    this.name = "SessionEventAppendError";
+    this.committedCount = committedCount;
+  }
+}
+
 export class SessionEventWriter {
   private readonly record: SessionRecord;
   private readonly lock: LockHandle;
   private readonly maxSegmentBytes: number;
   private readonly maxSegments: number;
   private readonly timelineWriter: SessionTimelineWriter;
+  private readonly beforeTimelineAppend?: (event: CapturedAcpTimelineEvent) => void | Promise<void>;
   private readonly afterTimelineAppend?: () => void | Promise<void>;
   private activePath: string;
   private activeSizeBytes: number;
@@ -226,7 +246,7 @@ export class SessionEventWriter {
   private constructor(
     record: SessionRecord,
     lock: LockHandle,
-    options: Required<SessionEventWriterOptions>,
+    options: ResolvedSessionEventWriterOptions,
     timelineWriter: SessionTimelineWriter,
     state: {
       activePath: string;
@@ -239,6 +259,7 @@ export class SessionEventWriter {
     this.maxSegmentBytes = options.maxSegmentBytes;
     this.maxSegments = options.maxSegments;
     this.timelineWriter = timelineWriter;
+    this.beforeTimelineAppend = options.beforeTimelineAppend;
     this.afterTimelineAppend = options.afterTimelineAppend;
     this.activePath = state.activePath;
     this.activeSizeBytes = state.activeSizeBytes;
@@ -267,7 +288,8 @@ export class SessionEventWriter {
         {
           maxSegmentBytes,
           maxSegments,
-          afterTimelineAppend: options.afterTimelineAppend ?? (() => {}),
+          beforeTimelineAppend: options.beforeTimelineAppend,
+          afterTimelineAppend: options.afterTimelineAppend,
         },
         timelineWriter,
         {
@@ -298,25 +320,32 @@ export class SessionEventWriter {
   async appendCapturedMessages(
     captured: CapturedAcpTimelineEvent[],
     options: AppendOptions = {},
-  ): Promise<void> {
+  ): Promise<number> {
     if (this.closed) {
       throw new Error("SessionEventWriter is closed");
     }
 
     if (captured.length === 0) {
-      return;
+      return 0;
     }
 
     await ensureSessionDir();
 
-    await measurePerf("session.events.append_batch", async () => {
-      for (const event of captured) {
-        await this.appendCapturedMessage(event);
-      }
-    });
+    let committedCount = 0;
+    try {
+      await measurePerf("session.events.append_batch", async () => {
+        for (const event of captured) {
+          await this.appendCapturedMessage(event);
+          committedCount += 1;
+        }
+      });
 
-    if (options.checkpoint === true) {
-      await writeSessionRecord(this.record);
+      if (options.checkpoint === true) {
+        await writeSessionRecord(this.record);
+      }
+      return committedCount;
+    } catch (error) {
+      throw new SessionEventAppendError(error, committedCount);
     }
   }
 
@@ -325,7 +354,13 @@ export class SessionEventWriter {
     if (!isAcpJsonRpcMessage(message)) {
       throw new Error("Attempted to persist invalid ACP JSON-RPC payload");
     }
-    await this.timelineWriter.appendAcpEvents([event]);
+    try {
+      await this.beforeTimelineAppend?.(event);
+      await this.timelineWriter.appendAcpEvents([event]);
+    } catch (error) {
+      this.timelineWriter.recordWriteError(error);
+      throw error;
+    }
     try {
       await this.afterTimelineAppend?.();
       const line = `${JSON.stringify(message)}\n`;

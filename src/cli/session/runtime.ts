@@ -37,7 +37,7 @@ import {
   recordSessionUpdate as recordConversationSessionUpdate,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
-import { SessionEventWriter } from "../../session/events.js";
+import { SessionEventAppendError, SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
   clearDesiredConfigOption,
@@ -675,6 +675,35 @@ function createPendingRequestSink(params: {
   };
 }
 
+async function flushCapturedMessageQueue(params: {
+  eventWriter: Pick<SessionEventWriter, "appendCapturedMessages">;
+  pendingMessages: AcpJsonRpcMessage[];
+  pendingTimelineEvents: CapturedAcpTimelineEvent[];
+  checkpoint?: boolean;
+}): Promise<void> {
+  if (params.pendingTimelineEvents.length === 0) {
+    return;
+  }
+  if (params.pendingMessages.length !== params.pendingTimelineEvents.length) {
+    throw new Error("Session event buffers are out of sync");
+  }
+
+  const captured = params.pendingTimelineEvents.slice();
+  let committedCount = 0;
+  try {
+    committedCount = await params.eventWriter.appendCapturedMessages(captured, {
+      checkpoint: params.checkpoint,
+    });
+  } catch (error) {
+    committedCount = error instanceof SessionEventAppendError ? error.committedCount : 0;
+    params.pendingMessages.splice(0, committedCount);
+    params.pendingTimelineEvents.splice(0, committedCount);
+    throw error;
+  }
+  params.pendingMessages.splice(0, committedCount);
+  params.pendingTimelineEvents.splice(0, committedCount);
+}
+
 function buildQueuedTaskRunOptions(
   sessionRecordId: string,
   task: QueueTask,
@@ -853,18 +882,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   };
 
   const flushPendingMessages = async (checkpoint = false): Promise<void> => {
-    if (pendingMessages.length === 0) {
-      return;
-    }
-
-    const messageCount = pendingMessages.length;
-    const capturedCount = pendingTimelineEvents.length;
-    const captured = pendingTimelineEvents.slice(0, capturedCount);
     await measurePerf("session.events.flush_pending", async () => {
-      await eventWriter.appendCapturedMessages(captured, { checkpoint });
+      await flushCapturedMessageQueue({
+        eventWriter,
+        pendingMessages,
+        pendingTimelineEvents,
+        checkpoint,
+      });
     });
-    pendingMessages.splice(0, messageCount);
-    pendingTimelineEvents.splice(0, capturedCount);
   };
   const preserveClosedState = async (): Promise<void> => {
     const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
@@ -1282,8 +1307,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await liveCheckpoint.flush().catch(() => {
       // best effort on close
     });
-    await flushPendingMessages(false).catch(() => {
-      // best effort on close
+    await flushPendingMessages(false).catch((error) => {
+      // Cleanup must continue so clients and locks are released, but a failed
+      // authoritative flush must not look like complete history. The writer
+      // records the error in timeline metadata; stderr makes it immediately
+      // visible even if the following record checkpoint also fails.
+      process.stderr.write(
+        `[acpx] final session timeline flush failed; history may be incomplete: ${formatErrorMessage(error)}\n`,
+      );
     });
     await preserveClosedState().catch(() => {
       // best effort on close
@@ -1443,4 +1474,5 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
 export const sessionRuntimeTestInternals = {
   shouldRetryRuntimePrompt,
   createPendingRequestSink,
+  flushCapturedMessageQueue,
 };

@@ -5,8 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { sessionRuntimeTestInternals } from "../src/cli/session/runtime.js";
 import { defaultSessionEventLog } from "../src/session/event-log.js";
+import { sessionEventActivePath } from "../src/session/event-log.js";
 import {
+  SessionEventAppendError,
   SessionEventWriter,
   listSessionEvents,
   sessionEventTestInternals,
@@ -22,6 +25,7 @@ import {
   getLatestSessionTimelineLifecycleEvent,
   listSessionTimelinePage,
   SessionTimelineCursorError,
+  SessionTimelineWriter,
   sessionTimelineTestInternals,
 } from "../src/session/timeline.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../src/types.js";
@@ -151,6 +155,128 @@ test("authoritative timeline append precedes the bounded compatibility stream", 
   });
 });
 
+test("partial timeline failure acknowledges committed events before a retry", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-partial-retry", cwd);
+    await writeSessionRecord(record);
+    let attempts = 0;
+    let failed = false;
+    const writer = await SessionEventWriter.open(record, {
+      beforeTimelineAppend: () => {
+        attempts += 1;
+        if (!failed && attempts === 3) {
+          failed = true;
+          throw new Error("timeline disk fault");
+        }
+      },
+    });
+    const messages = ["one", "two", "three"].map((text) =>
+      updateMessage(record.acpSessionId, text),
+    );
+    const pendingMessages = [...messages];
+    const pendingTimelineEvents = messages.map((message) =>
+      captureAcpTimelineEvent("inbound", message, { turnId: "turn-1" }),
+    );
+
+    await assert.rejects(
+      sessionRuntimeTestInternals.flushCapturedMessageQueue({
+        eventWriter: writer,
+        pendingMessages,
+        pendingTimelineEvents,
+      }),
+      (error: unknown) =>
+        error instanceof SessionEventAppendError &&
+        error.committedCount === 2 &&
+        error.message === "timeline disk fault",
+    );
+    assert.equal(pendingMessages.length, 1);
+    assert.equal(pendingTimelineEvents.length, 1);
+
+    await sessionRuntimeTestInternals.flushCapturedMessageQueue({
+      eventWriter: writer,
+      pendingMessages,
+      pendingTimelineEvents,
+      checkpoint: true,
+    });
+    await writer.close({ checkpoint: true });
+
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    const timelineMessages = page.items.flatMap((item) =>
+      "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+    );
+    assert.deepEqual(timelineMessages, messages);
+    assert.deepEqual(
+      page.items.flatMap((item) => ("payload" in item ? [item.seq] : [])),
+      [1, 2, 3],
+    );
+    assert.equal(page.writeError, undefined);
+  });
+});
+
+test("an authoritative append failure remains visible after cleanup checkpoints", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-write-error", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionEventWriter.open(record, {
+      beforeTimelineAppend: () => {
+        throw new Error("timeline volume is read-only");
+      },
+    });
+    await assert.rejects(writer.appendMessage(updateMessage(record.acpSessionId, "lost")));
+    await writer.close({ checkpoint: true });
+
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal(page.writeError, "timeline volume is read-only");
+    assert.deepEqual(page.items, []);
+  });
+});
+
+test("timeline metadata survives a crash boundary before writer close", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-crash-metadata", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    const epoch = writer.getRecord().timeline?.epoch;
+    assert.ok(epoch);
+    const first = updateMessage(record.acpSessionId, "before crash");
+    await writer.appendAcpEvents([captureAcpTimelineEvent("inbound", first)]);
+
+    // Simulate a process dying before its final metadata checkpoint: reload
+    // from disk while the writer is still open. The epoch was persisted before
+    // the append, so readers can already discover the event.
+    const reloaded = await resolveSessionRecord(record.acpxRecordId);
+    assert.equal(reloaded.timeline?.epoch, epoch);
+    assert.deepEqual(
+      (await listSessionTimelinePage(record.acpxRecordId)).items.flatMap((item) =>
+        "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+      ),
+      [first],
+    );
+
+    // A real crash releases the OS/process ownership. Close without a
+    // checkpoint solely to release the in-process test lock, then prove the
+    // next writer recovers last_seq from the file and keeps the same epoch.
+    await writer.close({ checkpoint: false });
+    const reopened = await SessionTimelineWriter.open(reloaded);
+    await reopened.appendAcpEvents([
+      captureAcpTimelineEvent("inbound", updateMessage(record.acpSessionId, "after crash")),
+    ]);
+    await reopened.close({ checkpoint: true });
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal((await resolveSessionRecord(record.acpxRecordId)).timeline?.epoch, epoch);
+    assert.deepEqual(
+      page.items.flatMap((item) => ("payload" in item ? [item.seq] : [])),
+      [1, 2],
+    );
+  });
+});
+
 test("legacy retained sessions disclose a gap instead of claiming complete history", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -175,6 +301,69 @@ test("legacy retained sessions disclose a gap instead of claiming complete histo
     assert.equal(afterUpgrade.coverage, "legacy_retained");
     assert.equal(afterUpgrade.items[0]?.schema, "acpx.session_history_gap.v1");
     assert.equal(afterUpgrade.items[1]?.schema, "acpx.session_event.v1");
+  });
+});
+
+test("first activation imports retained compatibility messages without rewriting the stream", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-legacy-import", cwd);
+    const messages = [
+      updateMessage(record.acpSessionId, "retained one"),
+      updateMessage(record.acpSessionId, "retained two"),
+    ];
+    record.lastSeq = messages.length;
+    record.eventLog.last_write_at = "2026-08-12T09:00:00.000Z";
+    await writeSessionRecord(record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      messages.map((message) => JSON.stringify(message)).join("\n") + "\n",
+      "utf8",
+    );
+    const originalStream = await fs.readFile(sessionEventActivePath(record.acpxRecordId), "utf8");
+
+    const writer = await SessionEventWriter.open(record);
+    await writer.close({ checkpoint: true });
+
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal(page.coverage, "legacy_retained");
+    assert.equal(page.items[0]?.schema, "acpx.session_history_gap.v1");
+    const imported = page.items.slice(1).flatMap((item) =>
+      "payload" in item && item.payload.kind === "acp"
+        ? [
+            {
+              direction: item.direction,
+              capturedAt: item.captured_at,
+              source: item.payload.source,
+              message: item.payload.message,
+            },
+          ]
+        : [],
+    );
+    assert.deepEqual(
+      imported.map((item) => item.message),
+      messages,
+    );
+    assert.deepEqual(
+      imported.map((item) => item.direction),
+      ["internal", "internal"],
+    );
+    assert.deepEqual(
+      imported.map((item) => item.source),
+      ["legacy_stream", "legacy_stream"],
+    );
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    assert.equal(stored.timeline?.legacy_import_complete, true);
+    assert.deepEqual(
+      imported.map((item) => item.capturedAt),
+      [stored.timeline?.created_at, stored.timeline?.created_at],
+    );
+    assert.equal(
+      await fs.readFile(sessionEventActivePath(record.acpxRecordId), "utf8"),
+      originalStream,
+    );
+    assert.deepEqual(await listSessionEvents(record.acpxRecordId), messages);
   });
 });
 

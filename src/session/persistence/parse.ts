@@ -618,7 +618,16 @@ function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined
     active_path: record.active_path,
     created_at: record.created_at,
     last_write_at: typeof record.last_write_at === "string" ? record.last_write_at : undefined,
+    last_write_error:
+      record.last_write_error == null || typeof record.last_write_error === "string"
+        ? record.last_write_error
+        : null,
     legacy_retained: record.legacy_retained,
+    // Metadata written before the retained-stream importer existed represents
+    // an already-active epoch. Treat it as complete rather than appending old
+    // compatibility messages after newer lossless events.
+    legacy_import_complete:
+      typeof record.legacy_import_complete === "boolean" ? record.legacy_import_complete : true,
   };
 }
 
@@ -640,6 +649,11 @@ function hasValidTimelineCore(record: Record<string, unknown>): record is Record
     typeof record.created_at === "string",
     typeof record.legacy_retained === "boolean",
     isUndefinedOrString(record.last_write_at),
+    record.last_write_error === undefined ||
+      record.last_write_error === null ||
+      typeof record.last_write_error === "string",
+    record.legacy_import_complete === undefined ||
+      typeof record.legacy_import_complete === "boolean",
   ].every(Boolean);
 }
 

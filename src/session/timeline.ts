@@ -10,7 +10,12 @@ import type {
   SessionTimelineMetadata,
 } from "../types.js";
 import { SESSION_TIMELINE_SCHEMA } from "../types.js";
-import { safeSessionId, sessionBaseDir, sessionEventActivePath } from "./event-log.js";
+import {
+  safeSessionId,
+  sessionBaseDir,
+  sessionEventActivePath,
+  sessionEventSegmentPath,
+} from "./event-log.js";
 import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
 
 export const SESSION_TIMELINE_EVENT_SCHEMA = "acpx.session_event.v1" as const;
@@ -32,7 +37,7 @@ export type SessionTimelineLifecycleEvent =
   | { type: "turn_interrupted" };
 
 export type SessionTimelinePayload =
-  | { kind: "acp"; message: AcpJsonRpcMessage }
+  | { kind: "acp"; message: AcpJsonRpcMessage; source?: "legacy_stream" }
   | { kind: "lifecycle"; event: SessionTimelineLifecycleEvent };
 
 export type SessionTimelineEvent = {
@@ -72,6 +77,8 @@ export type SessionTimelinePage = {
   previousCursor?: string;
   hasMore: boolean;
   coverage: SessionTimelineCoverage;
+  /** Present when the last authoritative append failed and history may be incomplete. */
+  writeError?: string;
 };
 
 export class SessionTimelineCursorError extends Error {
@@ -124,6 +131,48 @@ async function sessionHasLegacyEvents(record: SessionRecord): Promise<boolean> {
     record.eventLog.last_write_at !== undefined ||
     (await fileSize(sessionEventActivePath(record.acpxRecordId))) > 0
   );
+}
+
+async function legacyCompatibilityFiles(record: SessionRecord): Promise<string[]> {
+  const files: string[] = [];
+  const maxSegments = Math.max(1, record.eventLog.max_segments);
+  for (let segment = maxSegments; segment >= 1; segment -= 1) {
+    const filePath = sessionEventSegmentPath(record.acpxRecordId, segment);
+    if ((await fileSize(filePath)) > 0) {
+      files.push(filePath);
+    }
+  }
+  const activePath = sessionEventActivePath(record.acpxRecordId);
+  if ((await fileSize(activePath)) > 0) {
+    files.push(activePath);
+  }
+  return files;
+}
+
+function parseLegacyCompatibilityPayload(payload: string): AcpJsonRpcMessage[] {
+  const messages: AcpJsonRpcMessage[] = [];
+  for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (isAcpJsonRpcMessage(parsed)) {
+        messages.push(parsed);
+      }
+    } catch {
+      // The compatibility stream has historically tolerated corrupt lines.
+      // The gap marker discloses that retained legacy history is incomplete.
+    }
+  }
+  return messages;
+}
+
+async function* readLegacyCompatibilityMessages(
+  record: SessionRecord,
+): AsyncGenerator<AcpJsonRpcMessage> {
+  const files = await legacyCompatibilityFiles(record);
+  for (const filePath of files) {
+    const payload = await fs.readFile(filePath, "utf8");
+    yield* parseLegacyCompatibilityPayload(payload);
+  }
 }
 
 function parseLock(raw: string): { pid?: number; createdAt?: string } {
@@ -305,6 +354,20 @@ export function captureAcpTimelineEvent(
   };
 }
 
+async function checkpointTimelineMetadata(
+  record: SessionRecord,
+  metadata: SessionTimelineMetadata,
+): Promise<void> {
+  record.timeline = metadata;
+  const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
+  if (latest && latest !== record) {
+    latest.timeline = metadata;
+    await writeSessionRecord(latest);
+    return;
+  }
+  await writeSessionRecord(record);
+}
+
 async function initializeMetadata(record: SessionRecord): Promise<SessionTimelineMetadata> {
   if (record.timeline) {
     return record.timeline;
@@ -316,15 +379,24 @@ async function initializeMetadata(record: SessionRecord): Promise<SessionTimelin
   }
   const createdAt = isoNow();
   const epoch = randomUUID();
+  const retainedFiles = await legacyCompatibilityFiles(persisted ?? record);
+  const legacyRetained =
+    retainedFiles.length > 0 || (await sessionHasLegacyEvents(persisted ?? record));
   const metadata: SessionTimelineMetadata = {
     schema: SESSION_TIMELINE_SCHEMA,
     epoch,
     last_seq: 0,
     active_path: timelinePath(record.acpxRecordId, epoch),
     created_at: createdAt,
-    legacy_retained: await sessionHasLegacyEvents(record),
+    last_write_error: null,
+    legacy_retained: legacyRetained,
+    legacy_import_complete: !legacyRetained,
   };
   record.timeline = metadata;
+  // The epoch must be discoverable before its first append. A process crash
+  // after append but before close must not strand an orphan timeline file and
+  // cause the next writer to create another epoch.
+  await checkpointTimelineMetadata(persisted ?? record, metadata);
   return metadata;
 }
 
@@ -352,11 +424,17 @@ export class SessionTimelineWriter {
         limit: 1,
       });
       metadata.last_seq = latest?.seq ?? 0;
-      return new SessionTimelineWriter(record, lock, metadata);
+      const writer = new SessionTimelineWriter(record, lock, metadata);
+      await writer.importLegacyCompatibilityMessagesIfNeeded();
+      return writer;
     } catch (error) {
       await releaseTimelineLock(lock);
       throw error;
     }
+  }
+
+  getRecord(): SessionRecord {
+    return this.record;
   }
 
   async appendAcpEvents(events: CapturedAcpTimelineEvent[]): Promise<void> {
@@ -387,6 +465,34 @@ export class SessionTimelineWriter {
     });
   }
 
+  recordWriteError(error: unknown): void {
+    this.metadata.last_write_error = error instanceof Error ? error.message : String(error);
+  }
+
+  private async importLegacyCompatibilityMessagesIfNeeded(): Promise<void> {
+    if (this.metadata.legacy_import_complete !== false) {
+      return;
+    }
+    // A pending import is the first operation in a freshly persisted epoch, so
+    // last_seq is also the number of legacy messages durably appended before a
+    // crash. Resume at that boundary instead of duplicating its prefix.
+    let legacyIndex = 0;
+    for await (const message of readLegacyCompatibilityMessages(this.record)) {
+      legacyIndex += 1;
+      if (legacyIndex <= this.metadata.last_seq) {
+        continue;
+      }
+      await this.append({
+        direction: "internal",
+        capturedAt: this.metadata.created_at,
+        requestId: requestIdFromMessage(message),
+        payload: { kind: "acp", message, source: "legacy_stream" },
+      });
+    }
+    this.metadata.legacy_import_complete = true;
+    await checkpointTimelineMetadata(this.record, this.metadata);
+  }
+
   private async append(input: {
     direction: SessionTimelineDirection;
     capturedAt: string;
@@ -408,10 +514,16 @@ export class SessionTimelineWriter {
       request_id: input.requestId,
       payload: input.payload,
     };
-    await fs.mkdir(path.dirname(this.metadata.active_path), { recursive: true });
-    await fs.appendFile(this.metadata.active_path, `${JSON.stringify(envelope)}\n`, "utf8");
-    this.metadata.last_seq = envelope.seq;
-    this.metadata.last_write_at = isoNow();
+    try {
+      await fs.mkdir(path.dirname(this.metadata.active_path), { recursive: true });
+      await fs.appendFile(this.metadata.active_path, `${JSON.stringify(envelope)}\n`, "utf8");
+      this.metadata.last_seq = envelope.seq;
+      this.metadata.last_write_at = isoNow();
+      this.metadata.last_write_error = null;
+    } catch (error) {
+      this.recordWriteError(error);
+      throw error;
+    }
   }
 
   async close(options: { checkpoint?: boolean } = {}): Promise<void> {
@@ -714,6 +826,7 @@ function pageFromEvents(params: {
         : undefined,
     hasMore,
     coverage: timelineCoverage(params.metadata),
+    writeError: params.metadata.last_write_error ?? undefined,
   };
 }
 
@@ -823,7 +936,7 @@ function legacyGap(record: SessionRecord): SessionTimelineHistoryGap[] {
           kind: "history_gap",
           reason: "legacy_retained",
           message:
-            "History before the lossless timeline was enabled is available only as retained legacy data.",
+            "Retained pre-timeline messages were imported with activation-time timestamps and internal direction; older rotated or malformed history and its original provenance may be missing.",
         },
       ]
     : [];
