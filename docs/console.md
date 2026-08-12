@@ -191,7 +191,7 @@ session storage and the append-only event ledger are authoritative; browser
 state is a disposable projection that can be rebuilt after a console restart.
 
 For applications that need the same backend contract without this UI, use the
-public [`acpx/sessions`](https://github.com/openclaw/acpx/blob/main/docs/2026-08-12-acpx-console-architecture.md#public-acpxsessions-service)
+public [`acpx/sessions`](https://github.com/robertsreberski/acpx/blob/fork-main/docs/2026-08-12-acpx-console-architecture.md#public-acpxsessions-service)
 service.
 
 ## Product verification
