@@ -80,9 +80,36 @@ and the whole directory is deleted when its session is closed or pruned.
 > acpx codex set mode read-only     # "Requires approval to edit files and run commands"
 > ```
 >
-> This is per session and survives for its lifetime. Every codex example below
-> assumes it. Agents that do not sandbox their own tool calls — `claude`, for
-> one — need nothing extra.
+> Run that **before the session's first prompt**, and the mode holds for the
+> session's lifetime: it is saved on the record and applied to every adapter
+> session the record is later bound to. Run it against a session whose queue
+> owner is already warm and the next prompt can still self-approve — see the
+> hazard below. Every codex example below assumes the mode was set first. Agents
+> that do not sandbox their own tool calls — `claude`, for one — need nothing
+> extra.
+
+> **Setting the mode on an already-warm session does not take effect on the next
+> prompt.** A queue owner that is warm but between turns keeps the adapter
+> session it used last, and it does not apply `set mode` to it — the change goes
+> to a throwaway connection, is saved on the record, and the next prompt runs on
+> the retained session at the **old** mode. For codex that means the `agent`
+> preset is still in force: it approves its own tool calls, `--defer` has nothing
+> to park, `requests` comes back empty, and the command has already run. It is
+> the same end state a queue-owner restart used to produce, reached from the
+> other direction.
+>
+> Nothing reveals the discrepancy from outside: `status` reports owner health,
+> not the session's mode, and the mode on the session record is the value the
+> adapter last reported, not the one in force. Follow one of these instead of
+> polling for it:
+>
+> - **Set the mode before the first prompt (preferred).** With no owner running,
+>   the mode is saved on the record and the first owner re-applies it when it
+>   binds its adapter session.
+> - **On a session that is already warm, retire the owner before the next
+>   prompt** — `acpx codex sessions close`, or let its idle TTL lapse (`--ttl`,
+>   default 300s). The next prompt rebinds and re-applies the saved mode. Answer
+>   or cancel anything parked first: closing a session deletes its requests.
 
 The mode also survives owner restarts as of `0.13.0-fork.2`. A session's mode is
 saved on its record and re-applied whenever `acpx` binds that record to a fresh
@@ -98,7 +125,9 @@ the turn still runs and the refusal is reported as an `_acpx/warning` carrying
 force rather than assuming it is.
 
 ```bash
-# 0. Make codex ask before it acts (see the note above).
+# 0. Make codex ask before it acts, before the session's first prompt
+#    (see the notes above — on an already-warm session this needs an owner
+#    restart to take effect).
 acpx codex set mode read-only
 
 # 1. Ask, and do not wait for the answer.

@@ -245,6 +245,18 @@ function createQueueOwnerTurnController(
 ): QueueOwnerTurnController {
   return new QueueOwnerTurnController({
     withTimeout: async (run, timeoutMs) => await withTimeout(run(), timeoutMs),
+    // KNOWN GAP: these fallbacks run when no turn is active, and each opens its
+    // own client — so the change lands on a throwaway adapter session while the
+    // owner's `sharedClient` keeps the session the next turn reuses. For the
+    // mode that is a security posture silently not taking effect: the record is
+    // updated, the next prompt runs at the old mode, and `status` shows nothing.
+    // The agreed fix is for the idle path to apply through `sharedClient` when
+    // it still holds the record's session, not to re-assert the saved mode at
+    // reuse time — connectAndLoadSession deliberately leaves a session this
+    // client already holds open alone (see reapplyModeOnBoundSession), because
+    // re-asserting per turn would also override a mode the agent moved to
+    // itself mid-conversation. Documented as a hazard in docs/session-control.md
+    // and docs/deferred-requests.md until then.
     setSessionModeFallback: async (modeId: string, timeoutMs?: number) => {
       await runSessionSetModeDirect({
         sessionRecordId: options.sessionId,

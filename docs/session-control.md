@@ -43,7 +43,7 @@ Unsupported mode ids are rejected by the adapter, often as `Invalid params`. `ac
 
 The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter session — a respawned queue owner, an agent process that died, a `session/resume` that fell back to `session/load` or `session/new`. Adapters start every new session at their own default, so without this a restart would quietly return the session to `agent`/`auto` and with it the adapter's self-approval. If the adapter refuses the saved mode on that fresh session, the turn is not failed: the refusal is recorded in the session event log as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`, naming the mode that is not in force.
 
-A session the current queue owner still holds open keeps the mode its live adapter session is already running under; the re-apply is for new bindings, not for every turn.
+**Set the mode before the session's first prompt.** A session the current queue owner still holds open keeps the mode its live adapter session is already running under — the re-apply is for new bindings, not for every turn — and a warm owner that is between turns applies `set-mode` to a throwaway connection rather than to that retained session. The record is updated, but the next prompt still runs at the old mode, which for a session meant to ask before it acts means the agent keeps approving itself. `status` will not show the discrepancy: it reports owner health, and the mode on the record is the value the adapter last reported. On a session that is already warm, retire the owner before the next prompt (`acpx <agent> sessions close`, or let its idle TTL lapse) so the next turn rebinds and re-applies the saved mode.
 
 ## `set <key> <value>`
 

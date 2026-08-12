@@ -190,11 +190,13 @@ Behavior:
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
+- The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter session (respawned queue owner, dead agent process, `session/resume` that fell back to `session/load`/`session/new`), so it survives owner restarts. A refusal by the adapter does not fail the turn: it is logged as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`.
+- **Set the mode before the session's first prompt.** A warm owner between turns keeps its adapter session and applies `set-mode` to a throwaway connection instead, so the record updates but the next prompt still runs at the old mode. `status` does not show the discrepancy. On an already-warm session, retire the owner (`sessions close`, or let `--ttl` lapse) before prompting again.
 
 ### Deferred permission requests
 
 ```bash
-acpx codex set mode read-only   # codex self-approves in its sandbox without this
+acpx codex set mode read-only   # codex self-approves in its sandbox without this; set it before the first prompt
 acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
 acpx codex requests --json
 acpx codex respond <request-id> --option allow
@@ -206,7 +208,7 @@ acpx codex respond <request-id> --cancel
 
 Behavior:
 
-- **Codex parks nothing until its session is set to `read-only`** (`acpx codex set mode read-only`): its default `agent` preset approves its own tool calls inside its sandbox and never sends a permission request. Agents that do not self-sandbox, such as `claude`, need nothing extra. Codex also offers no `reject_always` option and sends no tool title, so `--decline` uses `reject_once` and the listing shows the `tool` fallback — read `raw_input` for the command.
+- **Codex parks nothing until its session is set to `read-only`** (`acpx codex set mode read-only`): its default `agent` preset approves its own tool calls inside its sandbox and never sends a permission request. Set it **before the session's first prompt** — on a session whose queue owner is already warm the change does not reach the session the next prompt uses, and that prompt self-approves with nothing parked; retire the owner first (`sessions close`, or let `--ttl` lapse). Agents that do not self-sandbox, such as `claude`, need nothing extra. Codex also offers no `reject_always` option and sends no tool title, so `--decline` uses `reject_once` and the listing shows the `tool` fallback — read `raw_input` for the command.
 - `--defer` parks `defer`-matched permission requests instead of denying them for the turn: the turn stays blocked and a durable record is written under `~/.acpx/requests/`.
 - `--defer` and `--defer-max-age <seconds>` are owner-level, fixed when the session's queue owner starts; a submit a warm owner cannot honour is refused, not silently denied.
 - `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session, needs no session in the current directory, and cannot be combined with `-s`.
