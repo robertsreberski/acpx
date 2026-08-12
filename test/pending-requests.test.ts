@@ -6,8 +6,10 @@ import { findPersistedKeyPolicyViolations } from "../src/persisted-key-policy.js
 import {
   PENDING_REQUEST_SCHEMA,
   deletePendingRequestsForSession,
+  listPendingRequestSessionIds,
   listPendingRequests,
   parsePendingRequest,
+  parsePendingRequestAnswer,
   pendingRequestFilePath,
   pendingRequestsSessionDir,
   readPendingRequest,
@@ -296,5 +298,50 @@ test("pending entries record the ACP session id the request arrived on", async (
       (await readPendingRequest(entry.sessionId, entry.requestId))?.acpSessionId,
       "acp-session-after-reconnect",
     );
+  });
+});
+
+test("an answer is only accepted when it carries its own tag", () => {
+  assert.deepEqual(parsePendingRequestAnswer({ type: "select", option_id: "allow" }), {
+    type: "select",
+    option_id: "allow",
+  });
+  assert.deepEqual(parsePendingRequestAnswer({ type: "decline" }), { type: "decline" });
+  assert.deepEqual(parsePendingRequestAnswer({ type: "cancel" }), { type: "cancel" });
+
+  // An untagged payload must never be inferred from its keys: a later arm can
+  // carry the same key and would then be silently misread as this one.
+  assert.equal(parsePendingRequestAnswer({ option_id: "allow" }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "select" }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "select", option_id: "" }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "select", optionId: "allow" }), undefined);
+  assert.equal(parsePendingRequestAnswer({ type: "accept", content: "later" }), undefined);
+  assert.equal(parsePendingRequestAnswer("cancel"), undefined);
+  assert.equal(parsePendingRequestAnswer(undefined), undefined);
+});
+
+test("session ids are recoverable from the request store alone", async () => {
+  await withTempHome(async () => {
+    await writePendingRequest(makeEntry({ requestId: "a", sessionId: "session-one" }));
+    await writePendingRequest(makeEntry({ requestId: "b", sessionId: "session-one" }));
+    await writePendingRequest(makeEntry({ requestId: "c", sessionId: "session-two" }));
+
+    // The directory name is a hash, so a cross-session scan can only learn the
+    // session ids by reading the entries themselves.
+    assert.deepEqual((await listPendingRequestSessionIds()).toSorted(), [
+      "session-one",
+      "session-two",
+    ]);
+  });
+});
+
+test("a session whose entries are all unreadable contributes no session id", async () => {
+  await withTempHome(async () => {
+    await writePendingRequest(makeEntry({ requestId: "good", sessionId: "session-one" }));
+    const dir = pendingRequestsSessionDir("session-two");
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, "corrupt.json"), "{not json\n", "utf8");
+
+    assert.deepEqual(await listPendingRequestSessionIds(), ["session-one"]);
   });
 });

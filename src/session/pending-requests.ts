@@ -77,6 +77,20 @@ export type PendingRequest = {
   resolution?: PendingRequestResolution;
 };
 
+/**
+ * How a responder answers a parked request.
+ *
+ * The union is explicitly tagged. A later arm (an `accept` carrying content,
+ * say) must be a new tag rather than a new key on an existing shape, because
+ * key-sniffing would silently read the new arm as an old one. `option_id` is
+ * spelled the way the stored entry spells it, so a responder can echo back an
+ * id it read straight out of a listed entry.
+ */
+export type PendingRequestAnswer =
+  | { type: "select"; option_id: string }
+  | { type: "decline" }
+  | { type: "cancel" };
+
 export function isTerminalPendingRequestState(state: PendingRequestState): boolean {
   return state !== "pending";
 }
@@ -336,6 +350,19 @@ export function parsePendingRequest(value: unknown): PendingRequest | undefined 
   };
 }
 
+/** Parse an answer that crossed a process boundary. Unknown tags are rejected. */
+export function parsePendingRequestAnswer(value: unknown): PendingRequestAnswer | undefined {
+  const record = asRecord(value);
+  if (record?.type === "decline" || record?.type === "cancel") {
+    return { type: record.type };
+  }
+  if (record?.type !== "select") {
+    return undefined;
+  }
+  const optionId = asNonEmptyString(record.option_id);
+  return optionId ? { type: "select", option_id: optionId } : undefined;
+}
+
 export async function writePendingRequest(
   entry: PendingRequest,
   homeDir: string = os.homedir(),
@@ -368,34 +395,74 @@ export async function readPendingRequest(
   }
 }
 
+async function listPendingRequestFileNames(dir: string): Promise<string[]> {
+  try {
+    return (await fs.readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+}
+
+async function readParsedPendingRequestFile(file: string): Promise<PendingRequest | undefined> {
+  try {
+    return parsePendingRequest(JSON.parse(await fs.readFile(file, "utf8")));
+  } catch {
+    // A half-written or corrupt entry must not hide the readable ones.
+    return undefined;
+  }
+}
+
 export async function listPendingRequests(
   sessionId: string,
   homeDir: string = os.homedir(),
 ): Promise<PendingRequest[]> {
   const dir = pendingRequestsSessionDir(sessionId, homeDir);
-  let names: string[];
+  const entries: PendingRequest[] = [];
+  for (const name of await listPendingRequestFileNames(dir)) {
+    const parsed = await readParsedPendingRequestFile(path.join(dir, name));
+    if (parsed) {
+      entries.push(parsed);
+    }
+  }
+  return entries;
+}
+
+async function readPendingRequestDirSessionId(dir: string): Promise<string | undefined> {
+  for (const name of await listPendingRequestFileNames(dir)) {
+    const parsed = await readParsedPendingRequestFile(path.join(dir, name));
+    if (parsed) {
+      return parsed.sessionId;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Every session id the request store knows about.
+ *
+ * A session's directory name is a hash, so its id can only come from an entry
+ * inside it. A directory whose entries are all unreadable stays invisible here
+ * and is left for the owning session's own sweep to discard.
+ */
+export async function listPendingRequestSessionIds(
+  homeDir: string = os.homedir(),
+): Promise<string[]> {
+  const base = pendingRequestsBaseDir(homeDir);
+  let dirs: string[];
   try {
-    names = await fs.readdir(dir);
+    dirs = await fs.readdir(base);
   } catch {
     return [];
   }
 
-  const entries: PendingRequest[] = [];
-  for (const name of names) {
-    if (!name.endsWith(".json")) {
-      continue;
-    }
-    try {
-      const payload = await fs.readFile(path.join(dir, name), "utf8");
-      const parsed = parsePendingRequest(JSON.parse(payload));
-      if (parsed) {
-        entries.push(parsed);
-      }
-    } catch {
-      // A half-written or corrupt entry must not hide the readable ones.
+  const sessionIds = new Set<string>();
+  for (const dir of dirs) {
+    const sessionId = await readPendingRequestDirSessionId(path.join(base, dir));
+    if (sessionId) {
+      sessionIds.add(sessionId);
     }
   }
-  return entries;
+  return [...sessionIds];
 }
 
 export const PENDING_REQUEST_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -514,18 +581,8 @@ async function listMalformedPendingRequestFiles(
   homeDir: string,
 ): Promise<string[]> {
   const dir = pendingRequestsSessionDir(sessionId, homeDir);
-  let names: string[];
-  try {
-    names = await fs.readdir(dir);
-  } catch {
-    return [];
-  }
-
   const malformed: string[] = [];
-  for (const name of names) {
-    if (!name.endsWith(".json")) {
-      continue;
-    }
+  for (const name of await listPendingRequestFileNames(dir)) {
     try {
       const payload = await fs.readFile(path.join(dir, name), "utf8");
       if (isMalformedPendingRequestPayload(payload)) {

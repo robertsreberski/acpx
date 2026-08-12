@@ -108,7 +108,7 @@ test("respond resolves the parked request with the selected option", async () =>
     const decision = park(manager, controller);
     const [pending] = await waitForPending(manager, 1);
     assert(pending);
-    await manager.respond(pending.requestId, { optionId: "allow" });
+    await manager.respond(pending.requestId, { type: "select", option_id: "allow" });
 
     assert.deepEqual(await decision, { outcome: "select", optionId: "allow" });
     const stored = await readPendingRequest(SESSION_ID, pending.requestId);
@@ -131,13 +131,14 @@ test("respond rejects an option the agent never offered", async () => {
     assert(pending);
 
     await assert.rejects(
-      async () => await manager.respond(pending.requestId, { optionId: "not-offered" }),
+      async () =>
+        await manager.respond(pending.requestId, { type: "select", option_id: "not-offered" }),
       PendingRequestNotAnswerableError,
     );
     // The request stays parked and answerable.
     assert.equal((await readPendingRequest(SESSION_ID, pending.requestId))?.state, "pending");
 
-    await manager.respond(pending.requestId, { optionId: "reject" });
+    await manager.respond(pending.requestId, { type: "select", option_id: "reject" });
     assert.deepEqual(await decision, { outcome: "select", optionId: "reject" });
   });
 });
@@ -151,15 +152,15 @@ test("respond rejects unknown and already-settled requests", async () => {
     assert(pending);
 
     await assert.rejects(
-      async () => await manager.respond("no-such-request", { optionId: "allow" }),
+      async () => await manager.respond("no-such-request", { type: "select", option_id: "allow" }),
       PendingRequestNotAnswerableError,
     );
 
-    await manager.respond(pending.requestId, { optionId: "allow" });
+    await manager.respond(pending.requestId, { type: "select", option_id: "allow" });
     await decision;
 
     await assert.rejects(
-      async () => await manager.respond(pending.requestId, { optionId: "reject" }),
+      async () => await manager.respond(pending.requestId, { type: "select", option_id: "reject" }),
       PendingRequestNotAnswerableError,
     );
   });
@@ -324,7 +325,7 @@ test("a throwing onEvent consumer cannot strand the parked turn", async () => {
     const decision = park(manager, controller);
     const [pending] = await waitForPending(manager, 1);
     assert(pending);
-    await manager.respond(pending.requestId, { optionId: "allow" });
+    await manager.respond(pending.requestId, { type: "select", option_id: "allow" });
 
     assert.deepEqual(await decision, { outcome: "select", optionId: "allow" });
     assert.equal((await readPendingRequest(SESSION_ID, pending.requestId))?.state, "answered");
@@ -364,5 +365,147 @@ test("cancelAll settles a park whose durable write is still in flight", async ()
 
     assert.deepEqual(await decision, { outcome: "cancel" });
     assert.deepEqual(await manager.listPending(), []);
+  });
+});
+
+test("respond returns the settled entry so a responder need not re-read the store", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    const decision = park(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    const settled = await manager.respond(pending.requestId, {
+      type: "select",
+      option_id: "allow",
+    });
+
+    assert.equal(settled.requestId, pending.requestId);
+    assert.equal(settled.state, "answered");
+    assert.equal(settled.resolution?.source, "cli");
+    assert.equal(settled.resolution?.optionId, "allow");
+    assert.deepEqual(settled, await readPendingRequest(SESSION_ID, pending.requestId));
+    await decision;
+  });
+});
+
+test("a decline answer selects the option the agent offered for rejection", async () => {
+  await withTempHome(async () => {
+    const { manager, events } = makeManager();
+    const controller = new AbortController();
+    const decision = park(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    const settled = await manager.respond(pending.requestId, { type: "decline" });
+
+    // Declining is answering with the agent's own reject option, not a
+    // synthesized outcome the agent never offered.
+    assert.deepEqual(await decision, { outcome: "select", optionId: "reject" });
+    assert.equal(settled.state, "answered");
+    assert.equal(settled.resolution?.optionId, "reject");
+    assert.equal(settled.resolution?.source, "cli");
+    assert.deepEqual(
+      events.map((event) => event.event),
+      ["created", "answered"],
+    );
+  });
+});
+
+test("a decline answer prefers reject_once over reject_always", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    const decision = park(
+      manager,
+      controller,
+      makeRequest({
+        options: [
+          { optionId: "abort", name: "Abort", kind: "reject_always" },
+          { optionId: "no", name: "No", kind: "reject_once" },
+        ],
+      }),
+    );
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    await manager.respond(pending.requestId, { type: "decline" });
+    assert.deepEqual(await decision, { outcome: "select", optionId: "no" });
+  });
+});
+
+test("a decline answer is refused when the agent offered no rejection", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    const decision = park(
+      manager,
+      controller,
+      makeRequest({ options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }),
+    );
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    // Silently downgrading this to a cancel would report an outcome the agent
+    // never offered, so the responder is told to pick one instead.
+    await assert.rejects(
+      async () => await manager.respond(pending.requestId, { type: "decline" }),
+      (error: unknown) => {
+        assert.equal(error instanceof PendingRequestNotAnswerableError, true);
+        assert.match((error as Error).message, /offered: allow/);
+        return true;
+      },
+    );
+    assert.equal((await readPendingRequest(SESSION_ID, pending.requestId))?.state, "pending");
+
+    controller.abort();
+    await decision;
+  });
+});
+
+test("a cancel answer settles the request as cancelled by the CLI", async () => {
+  await withTempHome(async () => {
+    const { manager, events } = makeManager();
+    const controller = new AbortController();
+    const decision = park(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+
+    const settled = await manager.respond(pending.requestId, { type: "cancel" });
+
+    assert.deepEqual(await decision, { outcome: "cancel" });
+    assert.equal(settled.state, "cancelled");
+    assert.equal(settled.resolution?.optionId, undefined);
+    // `cli` distinguishes an operator cancel from a turn or shutdown cancel.
+    assert.equal(settled.resolution?.source, "cli");
+    assert.deepEqual(
+      events.map((event) => event.event),
+      ["created", "cancelled"],
+    );
+    assert.deepEqual(await manager.listPending(), []);
+  });
+});
+
+test("every answer arm is refused once the request has settled", async () => {
+  await withTempHome(async () => {
+    const { manager } = makeManager();
+    const controller = new AbortController();
+    const decision = park(manager, controller);
+    const [pending] = await waitForPending(manager, 1);
+    assert(pending);
+    await manager.respond(pending.requestId, { type: "cancel" });
+    await decision;
+
+    for (const answer of [
+      { type: "select", option_id: "allow" },
+      { type: "decline" },
+      { type: "cancel" },
+    ] as const) {
+      await assert.rejects(
+        async () => await manager.respond(pending.requestId, answer),
+        PendingRequestNotAnswerableError,
+      );
+    }
   });
 });

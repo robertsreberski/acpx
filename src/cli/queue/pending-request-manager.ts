@@ -7,6 +7,7 @@ import {
   listPendingRequests,
   writePendingRequest,
   type PendingRequest,
+  type PendingRequestAnswer,
   type PendingRequestOption,
   type PendingRequestResolutionSource,
   type PendingRequestState,
@@ -77,6 +78,60 @@ function pickRejectOption(options: PendingRequestOption[]): PendingRequestOption
     }
   }
   return undefined;
+}
+
+function offeredOptionIds(entry: PendingRequest): string {
+  return entry.options.map((candidate) => candidate.optionId).join(", ");
+}
+
+type ResolvedAnswer = {
+  state: Exclude<PendingRequestState, "pending">;
+  optionId?: string;
+  decision: AcpPermissionDecision;
+};
+
+function resolveSelectAnswer(entry: PendingRequest, optionId: string): ResolvedAnswer {
+  const option = entry.options.find((candidate) => candidate.optionId === optionId);
+  if (!option) {
+    throw new PendingRequestNotAnswerableError(
+      `Option ${optionId} was not offered for request ${entry.requestId} ` +
+        `(offered: ${offeredOptionIds(entry)})`,
+    );
+  }
+  return {
+    state: "answered",
+    optionId: option.optionId,
+    decision: { outcome: "select", optionId: option.optionId },
+  };
+}
+
+/**
+ * Turn an answer into the transition it stands for.
+ *
+ * `decline` answers with the agent's own reject option rather than a
+ * synthesized outcome; when the agent offered none it is refused instead of
+ * quietly downgraded to a cancel, because the two are different outcomes for
+ * the agent and only the responder can choose between them.
+ */
+function resolveAnswer(entry: PendingRequest, answer: PendingRequestAnswer): ResolvedAnswer {
+  if (answer.type === "select") {
+    return resolveSelectAnswer(entry, answer.option_id);
+  }
+  if (answer.type === "cancel") {
+    return { state: "cancelled", decision: { outcome: "cancel" } };
+  }
+  const rejectOption = pickRejectOption(entry.options);
+  if (!rejectOption) {
+    throw new PendingRequestNotAnswerableError(
+      `Request ${entry.requestId} offers no rejection option to decline with; ` +
+        `answer it with --option or --cancel (offered: ${offeredOptionIds(entry)})`,
+    );
+  }
+  return {
+    state: "answered",
+    optionId: rejectOption.optionId,
+    decision: { outcome: "select", optionId: rejectOption.optionId },
+  };
 }
 
 /**
@@ -150,25 +205,23 @@ export class PendingRequestManager {
     this.attachExpiry(parked);
   }
 
-  /** Answer a parked request with one of the options the agent offered. */
-  async respond(requestId: string, answer: { optionId: string }): Promise<void> {
+  /**
+   * Answer a parked request. Returns the terminal entry so a responder does not
+   * have to re-read the store to learn what it just did.
+   */
+  async respond(requestId: string, answer: PendingRequestAnswer): Promise<PendingRequest> {
     const parked = this.parked.get(requestId);
     if (!parked) {
       throw new PendingRequestNotAnswerableError(
         `No pending request ${requestId} is awaiting an answer on this session`,
       );
     }
-    const option = parked.entry.options.find((candidate) => candidate.optionId === answer.optionId);
-    if (!option) {
-      const offered = parked.entry.options.map((candidate) => candidate.optionId).join(", ");
-      throw new PendingRequestNotAnswerableError(
-        `Option ${answer.optionId} was not offered for request ${requestId} (offered: ${offered})`,
-      );
-    }
+    const resolved = resolveAnswer(parked.entry, answer);
 
     this.release(parked);
-    await this.settleEntry(parked.entry, "answered", "cli", option.optionId);
-    parked.settle({ outcome: "select", optionId: option.optionId });
+    const settled = await this.settleEntry(parked.entry, resolved.state, "cli", resolved.optionId);
+    parked.settle(resolved.decision);
+    return settled;
   }
 
   /** Requests this owner is currently blocked on, newest state first read. */
@@ -290,7 +343,7 @@ export class PendingRequestManager {
     state: Exclude<PendingRequestState, "pending">,
     source: PendingRequestResolutionSource,
     optionId: string | undefined,
-  ): Promise<void> {
+  ): Promise<PendingRequest> {
     const answeredAt = (this.options.now?.() ?? new Date()).toISOString();
     const settled: PendingRequest = {
       ...entry,
@@ -307,6 +360,7 @@ export class PendingRequestManager {
       // settle below still unblocks the agent.
     });
     this.emit(state === "answered" ? "answered" : stateEventType(state), settled);
+    return settled;
   }
 
   private emit(event: PendingRequestEventType, request: PendingRequest): void {
