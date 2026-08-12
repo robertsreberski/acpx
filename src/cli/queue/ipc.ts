@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
-import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
+import {
+  PendingRequestAnswerTimeoutError,
+  QueueConnectionError,
+  QueueProtocolError,
+} from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import type { PendingRequest, PendingRequestAnswer } from "../../session/pending-requests.js";
 import type {
@@ -1117,16 +1121,53 @@ export async function tryListRequestsOnRunningOwner(options: {
 }
 
 /**
+ * Wait for the owner's reply, turning an asked-for bound into its own error.
+ *
+ * A generic queue timeout would report as a runtime failure, which is the one
+ * thing this is not: the answer was delivered and may still be applied, so the
+ * caller has to be able to tell the two apart.
+ */
+async function submitRespondRequest(
+  owner: QueueOwnerRecord,
+  request: QueueRespondRequest,
+  options: { pendingRequestId: string; responseTimeoutMs?: number },
+): Promise<QueueOwnerRespondResultMessage | undefined> {
+  try {
+    return await submitControlToQueueOwner(
+      owner,
+      request,
+      (message): message is QueueOwnerRespondResultMessage =>
+        message.type === "respond_request_result",
+      options.responseTimeoutMs,
+    );
+  } catch (error) {
+    if (
+      error instanceof QueueConnectionError &&
+      error.detailCode === "QUEUE_RESPONSE_TIMEOUT" &&
+      options.responseTimeoutMs !== undefined
+    ) {
+      throw new PendingRequestAnswerTimeoutError(
+        `Queue owner did not confirm the answer to request ${options.pendingRequestId} within ` +
+          `${options.responseTimeoutMs}ms; it may still be applied`,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Answer a parked request on the owner that parked it.
  *
- * Deliberately without a response timeout, unlike the listing: once the answer
- * is on the wire the owner may apply it at any moment, so giving up early would
- * report a failure for a request that is about to be settled.
+ * Unbounded unless the caller asks for a bound: once the answer is on the wire
+ * the owner may apply it at any moment, so giving up is a decision only the
+ * caller can make. A caller that cannot wait (a turn with a run budget, say)
+ * passes `responseTimeoutMs` and accepts that the answer may still land.
  */
 export async function tryRespondOnRunningOwner(options: {
   sessionId: string;
   pendingRequestId: string;
   answer: PendingRequestAnswer;
+  responseTimeoutMs?: number;
   verbose?: boolean;
 }): Promise<PendingRequest | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
@@ -1141,12 +1182,7 @@ export async function tryRespondOnRunningOwner(options: {
     pendingRequestId: options.pendingRequestId,
     answer: options.answer,
   };
-  const response = await submitControlToQueueOwner(
-    owner,
-    request,
-    (message): message is QueueOwnerRespondResultMessage =>
-      message.type === "respond_request_result",
-  );
+  const response = await submitRespondRequest(owner, request, options);
   if (options.verbose && response) {
     process.stderr.write(
       `[acpx] answered pending request ${options.pendingRequestId} on owner pid ${owner.pid} for session ${options.sessionId}\n`,

@@ -6314,6 +6314,48 @@ test("integration: inspecting a session never retires a live queue owner", async
   });
 });
 
+test("integration: respond --timeout gives up on an owner that cannot answer", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
+    const requestId = (await readStoredPendingRequests(homeDir))[0]?.request_id ?? "";
+    const { pid } = await readQueueOwnerLock(homeDir, sessionId);
+    process.kill(pid, "SIGSTOP");
+    try {
+      const timedOut = await runCli(
+        [...deferArgs, "--format", "json", "--timeout", "1", "respond", requestId, "--cancel"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+
+      // Exit 3 is what --timeout means everywhere else in the CLI, and the
+      // detail code separates "I stopped waiting" from "delivery failed".
+      assert.equal(timedOut.code, 3, `${timedOut.stdout}${timedOut.stderr}`);
+      const payload = JSON.parse(timedOut.stdout.trim()) as {
+        error: { data: { acpxCode: string; detailCode: string } };
+      };
+      assert.equal(payload.error.data.acpxCode, "TIMEOUT");
+      assert.equal(payload.error.data.detailCode, "PENDING_REQUEST_ANSWER_TIMEOUT");
+      assert.match(timedOut.stdout, /may still be applied/);
+
+      // Giving up is not the same as deciding the request is unanswerable.
+      assert.equal(isPidAlive(pid), true);
+      assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+    } finally {
+      process.kill(pid, "SIGCONT");
+    }
+
+    // "May still be applied" is not a hedge: the resumed owner applies the
+    // answer that was already on the wire, so the request settles from the very
+    // call that reported a timeout, and a second attempt finds it settled.
+    await waitForRequestState(homeDir, "cancelled");
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.resolution?.source, "cli");
+
+    const again = await runCli([...deferArgs, "respond", requestId, "--cancel"], homeDir, {
+      timeoutMs: 30_000,
+    });
+    assert.equal(again.code, 2, `${again.stdout}${again.stderr}`);
+  });
+});
+
 test("integration: status reports parked requests, and a dead owner orphans them", async () => {
   await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
     const parkedStatus = await runCli([...deferArgs, "--format", "json", "status"], homeDir);

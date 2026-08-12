@@ -361,6 +361,9 @@ export async function handleRespond(
     sessionId,
     pendingRequestId: requestId,
     answer,
+    // Opt-in only: --timeout is how every other verb bounds its wait, and
+    // without it an answer in flight is worth waiting for indefinitely.
+    ...(globalFlags.timeout === undefined ? {} : { responseTimeoutMs: globalFlags.timeout }),
     verbose: globalFlags.verbose,
   });
   if (!answered) {

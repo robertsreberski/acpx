@@ -373,7 +373,7 @@ Answers one parked permission request. Exactly one of `--option`, `--decline`, o
 - `--decline`: answer with the rejection option the agent offered. Refused when the agent offered none; pick an option or cancel instead.
 - `--cancel`: cancel the request without choosing an option. The turn continues; the agent sees a cancelled permission request.
 
-The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. The request is then terminal: `answered` for `--option` and `--decline`, `cancelled` for `--cancel`, both with `resolution.source: "cli"`.
+The answer travels to the queue owner that parked the request, so the blocked turn resumes as soon as it lands. `respond` waits indefinitely for the owner to confirm, because an answer already on the wire may be applied at any moment. A caller that cannot wait — a turn with a run budget, say — passes the global `--timeout <seconds>`: `respond` then gives up with exit `3` and `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`, and **the answer may still be applied afterwards**, so treat it as unknown rather than failed and re-read the request before retrying. The request is then terminal: `answered` for `--option` and `--decline`, `cancelled` for `--cancel`, both with `resolution.source: "cli"`.
 
 Output is the resulting store entry: the persisted JSON object under `--json`, a one-line summary in text, and the resulting state in quiet.
 
@@ -383,6 +383,7 @@ Exit codes:
 | ---- | ----------------------------------------------------------------------------------------------------- |
 | `0`  | The request was answered                                                                              |
 | `1`  | The answer could not be delivered to the queue owner                                                  |
+| `3`  | `--timeout` elapsed before the owner confirmed; the answer may still be applied                       |
 | `2`  | No answer flag, more than one, an unknown option id, or a request that is unknown or settled          |
 | `4`  | No session for this directory, or the owner that parked the request is gone (it is marked `orphaned`) |
 

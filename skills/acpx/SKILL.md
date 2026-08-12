@@ -212,6 +212,7 @@ Behavior:
 - `respond` takes exactly one of `--option <optionId>`, `--decline`, or `--cancel`. Option ids come from the `options` array of the listed request.
 - `respond` exits `2` when the answer cannot apply (unknown option, unknown or settled request) and `4` when the owner that parked the request is gone.
 - `status` reports the parked count (`parkedRequests` in JSON), counting `pending` requests only.
+- `respond` waits indefinitely by default. Pass the global `--timeout <seconds>` to bound it: exit `3` with `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`, and the answer may still be applied afterwards — re-read the request instead of assuming it failed.
 - Inspection never retires a queue owner. A live owner that is not answering shows as `status: unreachable`, distinct from `dead`.
 
 ### Sessions

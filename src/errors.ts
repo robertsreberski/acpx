@@ -238,6 +238,24 @@ export class PendingRequestOwnerGoneError extends AcpxOperationalError {
   }
 }
 
+/**
+ * `respond` gave up waiting for the queue owner to apply an answer, because the
+ * caller asked for a bound with --timeout. Reported as TIMEOUT (exit 3) and
+ * with its own detail code, so a script can tell "I stopped waiting" from "the
+ * answer could not be delivered" — the answer may still be applied.
+ */
+export class PendingRequestAnswerTimeoutError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "TIMEOUT",
+      detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT",
+      origin: "queue",
+      retryable: true,
+      ...options,
+    });
+  }
+}
+
 export class QueueConnectionError extends AcpxOperationalError {}
 
 export class QueueProtocolError extends AcpxOperationalError {}
