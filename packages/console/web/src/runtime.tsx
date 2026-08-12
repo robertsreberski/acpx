@@ -9,6 +9,7 @@ import { type ReactNode, useCallback, useMemo } from "react";
 import { useSessionStore } from "./session-store";
 import { firstInteractionEventIds } from "./timeline-projector";
 import type { PendingInteraction, TranscriptEvent } from "./types";
+import { consumeUiAction } from "./ui-actions";
 
 export interface TimelineMessage {
   readonly event: TranscriptEvent;
@@ -184,12 +185,8 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
         ? {
             items: [],
             steerItems: [],
-            enqueue: (message) => {
-              void onNew(message);
-            },
-            steer: (message) => {
-              void onNew(message);
-            },
+            enqueue: (message) => consumeUiAction(onNew(message)),
+            steer: (message) => consumeUiAction(onNew(message)),
             move: () => undefined,
             edit: () => undefined,
             remove: () => undefined,

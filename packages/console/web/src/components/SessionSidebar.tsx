@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useDismissibleLayer } from "../dismissible-layer";
 import { sessionGroup, useSessionStore } from "../session-store";
 import type { SessionSummary } from "../types";
 import { Icon } from "./Icon";
@@ -52,6 +53,8 @@ export function SessionSidebar({
   readonly onAdopt: () => void;
 }) {
   const { bootstrap, loading, selectedSessionId, selectSession } = useSessionStore();
+  const sidebarRef = useRef<HTMLElement>(null);
+  useDismissibleLayer(open, onClose, sidebarRef);
   const [query, setQuery] = useState("");
   const groups = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -73,7 +76,11 @@ export function SessionSidebar({
   return (
     <>
       {open && <button className="sidebar-scrim" aria-label="Close sessions" onClick={onClose} />}
-      <aside className={`session-sidebar${open ? " is-open" : ""}`} aria-label="Coding sessions">
+      <aside
+        ref={sidebarRef}
+        className={`session-sidebar${open ? " is-open" : ""}`}
+        aria-label="Coding sessions"
+      >
         <header className="sidebar-header">
           <div className="product-mark" aria-hidden="true">
             A

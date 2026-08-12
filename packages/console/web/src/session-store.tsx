@@ -9,7 +9,12 @@ import {
   useState,
 } from "react";
 import { api, ApiError } from "./api";
-import { coalesceTranscriptEvents } from "./timeline-projector";
+import { listenForLiveInvalidations } from "./live-events";
+import {
+  mergeRefreshedTimelinePage,
+  normalizeTimelinePage,
+  prependEarlierTimelinePage,
+} from "./timeline-pages";
 import type {
   AdoptSessionInput,
   BootstrapSnapshot,
@@ -20,7 +25,6 @@ import type {
   SessionDetail,
   SessionSummary,
   TimelinePage,
-  TranscriptEvent,
 } from "./types";
 
 const EMPTY_BOOTSTRAP: BootstrapSnapshot = { agents: [], workspaceRoots: [], sessions: [] };
@@ -29,9 +33,6 @@ const selectedSessionFromLocation = (): string | null => {
   const match = /^\/sessions\/([^/]+)\/?$/u.exec(window.location.pathname);
   return match ? decodeURIComponent(match[1] ?? "") : null;
 };
-
-const orderEvents = (events: readonly TranscriptEvent[]): readonly TranscriptEvent[] =>
-  coalesceTranscriptEvents(events);
 
 interface SessionStoreValue {
   readonly bootstrap: BootstrapSnapshot;
@@ -90,7 +91,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [notice]);
 
   const refreshSelection = useCallback(
-    async (id: string) => {
+    async (id: string, preserveLoadedHistory = true) => {
       const generation = ++selectionGeneration.current;
       try {
         const [detail, page, interactions] = await Promise.all([
@@ -102,7 +103,11 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
           return;
         }
         setSelectedSession(detail);
-        setTimeline({ ...page, events: orderEvents(page.events) });
+        setTimeline((current) =>
+          preserveLoadedHistory
+            ? mergeRefreshedTimelinePage(current, page)
+            : normalizeTimelinePage(page),
+        );
         setPending(interactions);
       } catch (error) {
         if (generation !== selectionGeneration.current) {
@@ -134,7 +139,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     setTimeline(null);
     setPending([]);
     if (selectedSessionId) {
-      void refreshSelection(selectedSessionId);
+      void refreshSelection(selectedSessionId, false);
     }
   }, [refreshSelection, selectedSessionId]);
 
@@ -152,12 +157,9 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       }
       refreshTimer.current = window.setTimeout(() => void refresh(), 80);
     };
-    events.addEventListener("session", invalidate);
-    events.addEventListener("timeline", invalidate);
-    events.addEventListener("pending", invalidate);
-    events.addEventListener("reset", invalidate);
-    events.addEventListener("message", invalidate);
+    const stopListening = listenForLiveInvalidations(events, invalidate);
     return () => {
+      stopListening();
       events.close();
       if (refreshTimer.current !== undefined) {
         window.clearTimeout(refreshTimer.current);
@@ -176,19 +178,14 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     }
     try {
       const page = await api.timeline(selectedSessionId, timeline.previousCursor);
-      setTimeline({
-        ...page,
-        events: orderEvents([...page.events, ...timeline.events]),
-        coverage: timeline.coverage === "legacy_retained" ? "legacy_retained" : page.coverage,
-        gap: page.gap ?? timeline.gap,
-      });
+      setTimeline(prependEarlierTimelinePage(timeline, page));
     } catch (error) {
       if (error instanceof ApiError && error.status === 410) {
         notice(
           "Earlier transcript pages expired. Reloading from the earliest available event.",
           "info",
         );
-        await refreshSelection(selectedSessionId);
+        await refreshSelection(selectedSessionId, false);
         return;
       }
       notice(errorMessage(error));

@@ -1,5 +1,6 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { useDismissibleLayer } from "../dismissible-layer";
 import { useSessionStore } from "../session-store";
 import type { AgentSummary, ProviderSession } from "../types";
 import { Icon } from "./Icon";
@@ -22,6 +23,8 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [providerSessions, setProviderSessions] = useState<readonly ProviderSession[]>([]);
   const [loadingProviders, setLoadingProviders] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLElement>(null);
+  useDismissibleLayer(mode !== null, onClose, dialogRef);
 
   const agent = store.bootstrap.agents.find((item) => item.id === agentId);
 
@@ -111,6 +114,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
       }}
     >
       <section
+        ref={dialogRef}
         className="session-dialog"
         role="dialog"
         aria-modal="true"

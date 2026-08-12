@@ -42,6 +42,10 @@ export default function App() {
   const [factsOpen, setFactsOpen] = useState(false);
   const [dialog, setDialog] = useState<"create" | "adopt" | null>(null);
   const session = store.selectedSession;
+  const openDialog = (mode: "create" | "adopt") => {
+    setFactsOpen(false);
+    setDialog(mode);
+  };
 
   return (
     <div className="app-shell">
@@ -55,8 +59,8 @@ export default function App() {
         <SessionSidebar
           open={sidebarOpen}
           onClose={() => setSidebarOpen(false)}
-          onCreate={() => setDialog("create")}
-          onAdopt={() => setDialog("adopt")}
+          onCreate={() => openDialog("create")}
+          onAdopt={() => openDialog("adopt")}
         />
         <section className={`session-workspace${session ? " has-session" : ""}`}>
           <header className="workspace-header">
@@ -112,7 +116,7 @@ export default function App() {
               <Transcript />
             </AcpxRuntimeProvider>
           ) : (
-            <Welcome onCreate={() => setDialog("create")} onAdopt={() => setDialog("adopt")} />
+            <Welcome onCreate={() => openDialog("create")} onAdopt={() => openDialog("adopt")} />
           )}
         </section>
         <SessionFacts open={factsOpen} onClose={() => setFactsOpen(false)} />

@@ -1,4 +1,7 @@
+import { useRef } from "react";
+import { useDismissibleLayer } from "../dismissible-layer";
 import { useSessionStore } from "../session-store";
+import { consumeUiAction } from "../ui-actions";
 import { Icon } from "./Icon";
 
 const Fact = ({ label, value }: { readonly label: string; readonly value?: string | number }) =>
@@ -17,15 +20,13 @@ export function SessionFacts({
   readonly onClose: () => void;
 }) {
   const { selectedSession: session, closeSession, actionBusy } = useSessionStore();
-  if (!session) {
+  const drawerRef = useRef<HTMLElement>(null);
+  useDismissibleLayer(open && session !== null, onClose, drawerRef);
+  if (!session || !open) {
     return null;
   }
   return (
-    <aside
-      className={`facts-drawer${open ? " is-open" : ""}`}
-      aria-label="Session details"
-      aria-hidden={!open}
-    >
+    <aside ref={drawerRef} className="facts-drawer is-open" aria-label="Session details">
       <header>
         <div>
           <span>Session details</span>
@@ -67,7 +68,7 @@ export function SessionFacts({
           disabled={actionBusy}
           onClick={() => {
             if (window.confirm("Close this ACPX session? Pending requests will be removed.")) {
-              void closeSession();
+              consumeUiAction(closeSession());
             }
           }}
         >

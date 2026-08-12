@@ -7,10 +7,11 @@ import {
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { type FormEvent, useMemo, useState } from "react";
-import { coerceElicitationValue } from "../elicitation";
+import { booleanElicitationChoices, readElicitationField } from "../elicitation";
 import { interactionAvailability } from "../interaction-availability";
 import { useSessionStore } from "../session-store";
 import type { ElicitationProperty, PendingInteraction } from "../types";
+import { consumeUiAction } from "../ui-actions";
 import { Icon } from "./Icon";
 
 const jsonText = (value: unknown): string => {
@@ -56,7 +57,9 @@ function PermissionCard({ interaction }: { readonly interaction: PendingInteract
               className={option.kind?.startsWith("allow") ? "approve-button" : "secondary-button"}
               disabled={actionBusy || !availability.answerable}
               onClick={() =>
-                void answerInteraction(interaction.id, { type: "select", option_id: option.id })
+                consumeUiAction(
+                  answerInteraction(interaction.id, { type: "select", option_id: option.id }),
+                )
               }
             >
               {option.label}
@@ -66,7 +69,7 @@ function PermissionCard({ interaction }: { readonly interaction: PendingInteract
             type="button"
             className="secondary-button"
             disabled={actionBusy || !availability.answerable}
-            onClick={() => void answerInteraction(interaction.id, { type: "decline" })}
+            onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "decline" }))}
           >
             Decline
           </button>
@@ -74,7 +77,7 @@ function PermissionCard({ interaction }: { readonly interaction: PendingInteract
             type="button"
             className="ghost-button"
             disabled={actionBusy || !availability.answerable}
-            onClick={() => void answerInteraction(interaction.id, { type: "cancel" })}
+            onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "cancel" }))}
           >
             Cancel
           </button>
@@ -124,14 +127,12 @@ function ElicitationField({
           {label}
           {required ? " *" : ""}
         </span>
-        <select name={name} required={required} defaultValue={required ? "" : "false"}>
-          {required && (
-            <option value="" disabled>
-              Select…
+        <select name={name} required={required} defaultValue="">
+          {booleanElicitationChoices(required).map((choice) => (
+            <option key={choice.value} value={choice.value} disabled={choice.disabled}>
+              {choice.label}
             </option>
-          )}
-          <option value="true">Yes</option>
-          <option value="false">No</option>
+          ))}
         </select>
       </label>
     );
@@ -197,27 +198,26 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
     const content: Record<string, unknown> = {};
     for (const [name, property] of fields) {
       const values = data.getAll(name);
-      if (required.has(name) && values.length === 0) {
-        setError(`${property.title ?? name} is required.`);
-        return;
-      }
-      if (values.length === 0) {
-        continue;
-      }
+      let result: ReturnType<typeof readElicitationField>;
       try {
-        content[name] = coerceElicitationValue(
-          property,
-          property.type === "array" ? values : values[0]!,
-        );
+        result = readElicitationField(property, values, required.has(name));
       } catch (reason) {
         setError(
           reason instanceof Error ? reason.message : `Could not read ${property.title ?? name}.`,
         );
         return;
       }
+      if (result.kind === "missing") {
+        setError(`${property.title ?? name} is required.`);
+        return;
+      }
+      if (result.kind === "omitted") {
+        continue;
+      }
+      content[name] = result.value;
     }
     setError(null);
-    void answerInteraction(interaction.id, { type: "accept", content });
+    consumeUiAction(answerInteraction(interaction.id, { type: "accept", content }));
   };
 
   return (
@@ -262,7 +262,9 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
               type="button"
               className="secondary-button"
               disabled={actionBusy || !availability.answerable}
-              onClick={() => void answerInteraction(interaction.id, { type: "decline" })}
+              onClick={() =>
+                consumeUiAction(answerInteraction(interaction.id, { type: "decline" }))
+              }
             >
               Decline
             </button>
@@ -270,7 +272,7 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
               type="button"
               className="ghost-button"
               disabled={actionBusy || !availability.answerable}
-              onClick={() => void answerInteraction(interaction.id, { type: "cancel" })}
+              onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "cancel" }))}
             >
               Cancel
             </button>
@@ -414,7 +416,7 @@ export function Transcript() {
                 <button
                   type="button"
                   className="composer-stop"
-                  onClick={() => void store.cancelTurn()}
+                  onClick={() => consumeUiAction(store.cancelTurn())}
                   disabled={store.actionBusy}
                 >
                   <Icon name="stop" size={15} /> Stop

@@ -62,6 +62,8 @@ export type EventRole = "user" | "assistant" | "system";
 export interface TranscriptEvent {
   readonly id: string;
   readonly sequence: number;
+  /** Raw events folded into this projected item, retained for lossless page merging. */
+  readonly sourceEvents?: readonly TranscriptEvent[];
   readonly occurredAt: string;
   readonly direction?: "client_to_agent" | "agent_to_client" | "internal";
   readonly turnId?: string;

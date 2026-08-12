@@ -231,7 +231,8 @@ const sameTextStream = (left: TranscriptEvent, right: TranscriptEvent): boolean 
 export const coalesceTranscriptEvents = (
   events: readonly TranscriptEvent[],
 ): readonly TranscriptEvent[] => {
-  const ordered = [...new Map(events.map((event) => [event.id, event])).values()].toSorted(
+  const sourceEvents = events.flatMap((event) => event.sourceEvents ?? [event]);
+  const ordered = [...new Map(sourceEvents.map((event) => [event.id, event])).values()].toSorted(
     (left, right) =>
       left.sequence - right.sequence || left.occurredAt.localeCompare(right.occurredAt),
   );
@@ -244,6 +245,10 @@ export const coalesceTranscriptEvents = (
         ...previous,
         text: `${previous.text ?? ""}${event.text ?? ""}`,
         status: event.status,
+        sourceEvents: [
+          ...(previous.sourceEvents ?? [previous]),
+          ...(event.sourceEvents ?? [event]),
+        ],
         payload: [previous.payload, event.payload],
       };
       continue;
@@ -257,6 +262,10 @@ export const coalesceTranscriptEvents = (
           title: event.title ?? original.title,
           toolName: event.toolName ?? original.toolName,
           status: event.status ?? original.status,
+          sourceEvents: [
+            ...(original.sourceEvents ?? [original]),
+            ...(event.sourceEvents ?? [event]),
+          ],
           input: event.input ?? original.input,
           output: event.output ?? original.output,
           payload: [original.payload, event.payload],

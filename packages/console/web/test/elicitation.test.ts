@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { coerceElicitationValue } from "../src/elicitation";
+import {
+  booleanElicitationChoices,
+  coerceElicitationValue,
+  readElicitationField,
+} from "../src/elicitation";
 
 test("numeric form values accept JSON numbers and reject JavaScript-only spellings", () => {
   assert.equal(coerceElicitationValue({ type: "number" }, "1e3"), 1_000);
@@ -18,4 +22,31 @@ test("boolean and multi-select fields preserve explicit false and literal select
   assert.equal(coerceElicitationValue({ type: "boolean" }, "false"), false);
   assert.equal(coerceElicitationValue({ type: "boolean" }, "true"), true);
   assert.deepEqual(coerceElicitationValue({ type: "array" }, ["x,y", " z "]), ["x,y", " z "]);
+});
+
+test("optional blank scalar fields are omitted instead of fabricating values", () => {
+  assert.deepEqual(booleanElicitationChoices(false), [
+    { value: "", label: "No answer", disabled: false },
+    { value: "true", label: "Yes" },
+    { value: "false", label: "No" },
+  ]);
+  assert.deepEqual(readElicitationField({ type: "boolean" }, [""], false), {
+    kind: "omitted",
+  });
+  assert.deepEqual(readElicitationField({ type: "boolean" }, ["false"], false), {
+    kind: "value",
+    value: false,
+  });
+  assert.deepEqual(readElicitationField({ type: "number" }, [""], false), {
+    kind: "omitted",
+  });
+  assert.deepEqual(readElicitationField({ type: "string" }, [""], false), {
+    kind: "omitted",
+  });
+  assert.deepEqual(readElicitationField({ type: "boolean" }, [""], true), {
+    kind: "missing",
+  });
+  assert.deepEqual(readElicitationField({ type: "number" }, [""], true), {
+    kind: "missing",
+  });
 });
