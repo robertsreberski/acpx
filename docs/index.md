@@ -35,6 +35,9 @@ acpx flow run examples/flows/branch.flow.ts \
 
 - **One CLI, every coding agent.** Built-in adapters for Codex, Claude, Pi, OpenClaw, Gemini, Cursor, Copilot, Droid, Qwen, Qoder, Trae, and more — plus `--agent` for any custom ACP server.
 - **Persistent sessions.** Multi-turn conversations survive across invocations, scoped per repo. `-s <name>` runs parallel workstreams (`backend`, `docs`, `pr-842`).
+- **Optional web console.** The separately installed [ACPX Console](console.md)
+  browses local sessions, follows complete transcripts in real time, queues the
+  next prompt, and answers deferred requests without a mono-agent dependency.
 - **Queue-aware prompts.** Submit while a turn is running; new prompts queue and drain in order. `--no-wait` enqueues and returns. `cancel` aborts cooperatively without tearing the session down.
 - **Crash-resistant.** Dead agent processes are detected and reloaded automatically. `Ctrl+C` sends ACP `session/cancel` before any force-kill.
 - **Structured output.** `text`, `json`, and `quiet` modes. Strict JSON mode keeps stderr quiet so machines can parse stdout cleanly.
@@ -47,6 +50,8 @@ acpx flow run examples/flows/branch.flow.ts \
 - **Trying it.** [Install](install.md) → [Quickstart](quickstart.md). Two minutes from `npm i -g acpx` to your first turn.
 - **Talking to a specific agent.** The [Agents](agents.md) page lists every built-in name and the upstream CLI it wraps.
 - **Wiring an automation.** [Output formats](output-formats.md) for the JSON envelope, [Sessions](sessions.md) for scope rules, [Permissions](permissions.md) for policy.
+- **Operating sessions in a browser.** [ACPX Console](console.md) covers the
+  standalone service, session workspace, and trusted-network boundary.
 - **Multi-step orchestration.** [Flows](flows.md) covers `acp` / `action` / `compute` / `decision` / `checkpoint` nodes and replay.
 - **Looking up a flag.** The [CLI reference](CLI.md) is the long-form spec for every command, option, and exit code.
 

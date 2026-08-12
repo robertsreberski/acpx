@@ -71,6 +71,24 @@ acpx codex exec "summarize this repository"
 
 Session state lives under `~/.acpx/`. The [sessions guide](docs/sessions.md) covers scope, queue ownership, reconnects, export/import, cancellation, and cleanup.
 
+## ACPX Console
+
+[`acpx-console`](docs/console.md) is the separately installed web workspace for
+browsing ACPX sessions, following complete transcripts in real time, queuing
+the next prompt, and answering parked permissions or forms.
+
+After its first independent release:
+
+```bash
+npm install -g acpx-console
+acpx-console start --open
+```
+
+The console is its own product and package. It has no mono-agent dependency and
+does not replace the headless CLI or embedding APIs. ACPX session storage and
+queue owners remain authoritative, so closing the browser or stopping the web
+server does not stop an agent turn.
+
 ## Automation and permissions
 
 Text output is the default. `--format json` emits NDJSON ACP events for automation, while `--format quiet` prints only the final assistant text. Output events retain structured thinking, tool calls, diffs, and completion state instead of terminal escape sequences.
@@ -86,13 +104,19 @@ Permission modes range from read approval to explicit deny or approve-all polici
 
 For multi-step work, `acpx flow run` executes TypeScript workflows that combine ACP turns with deterministic actions, decisions, computation, and checkpoints. The package also exports `acpx/runtime` and `acpx/flows` for applications that need session and workflow primitives without shelling out.
 
-Start with the [flows guide](docs/flows.md), then use the [examples](examples/flows/README.md) and [architecture notes](docs/2026-03-25-acpx-flows-architecture.md) for deeper integrations.
+The package exports `acpx/sessions` for queue-aware session applications,
+`acpx/runtime` for in-process turns, and `acpx/flows` for workflow authors.
+Start with the [flows guide](docs/flows.md), then use the
+[examples](examples/flows/README.md) and
+[architecture notes](docs/2026-03-25-acpx-flows-architecture.md) for deeper
+integrations.
 
 ## Documentation
 
 - [CLI reference](docs/CLI.md) — commands, flags, and behavior
 - [Prompting](docs/prompting.md) — arguments, stdin, files, and queueing
 - [Session controls](docs/session-control.md) — cancel, modes, options, and status
+- [ACPX Console](docs/console.md) — standalone session workspace and network trust model
 - [Compare agents](docs/compare.md) — run one prompt across multiple agents
 - [ACP coverage](docs/2026-02-19-acp-coverage-roadmap.md) — implemented protocol methods
 - [Vision](VISION.md) — project scope and design principles

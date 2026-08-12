@@ -10,6 +10,15 @@ Repo: https://github.com/openclaw/acpx
 
 - Docs/readme: rewrite the project front door to the house standard and route detailed CLI guidance to the existing documentation.
 
+- Sessions/embedding: add the public `acpx/sessions` service and append-only
+  session event ledger for exact-record session inventory, durable turn
+  admission, complete transcript paging, provider-session adoption, queue-aware
+  prompts, and pending-request responses.
+
+- Console: add the separately installed `acpx-console` web product for live
+  session transcripts, create/adopt flows, queued prompts, cancellation, and
+  permission or elicitation answers.
+
 ### Breaking
 
 ### Fixes
