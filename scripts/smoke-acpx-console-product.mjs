@@ -436,8 +436,9 @@ async function main() {
     await startConsole();
     api = new ConsoleApi(origin);
     const bootstrap = await api.bootstrap();
+    const canonicalWorkspace = await fs.realpath(workspace);
     assert(bootstrap.agents.some((agent) => agent.agentId === "mock"));
-    assert.deepEqual(bootstrap.workspaceRoots, [workspace]);
+    assert.deepEqual(bootstrap.workspaceRoots, [canonicalWorkspace]);
     sse = new SseProbe(origin);
     await sse.start();
 
