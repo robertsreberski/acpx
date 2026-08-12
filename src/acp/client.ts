@@ -58,6 +58,7 @@ import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
+  AcpPermissionRequestContext,
   NonInteractivePermissionPolicy,
   PermissionMode,
   PermissionStats,
@@ -1719,12 +1720,24 @@ export class AcpClient {
           raw: params,
           inferredKind: inferToolKind(params),
         },
-        { signal },
+        this.hostPermissionContext(signal),
       );
       return this.hostPermissionDecisionResponse(params, signal, decision);
     } catch (error) {
       return this.hostPermissionErrorResponse(params, signal, error);
     }
+  }
+
+  /**
+   * Read from `this.options` per request so the context tracks
+   * `updateRuntimeOptions` rather than freezing the construction-time values.
+   */
+  private hostPermissionContext(signal: AbortSignal): AcpPermissionRequestContext {
+    return {
+      signal,
+      ...(this.options.permissionPolicy ? { policy: this.options.permissionPolicy } : {}),
+      mode: this.options.permissionMode,
+    };
   }
 
   private hostPermissionDecisionResponse(

@@ -7,6 +7,7 @@ import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpPermissionRequestContext,
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
@@ -45,7 +46,7 @@ export type WithConnectedSessionOptions<T> = {
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
+    ctx: AcpPermissionRequestContext,
   ) => Promise<AcpPermissionDecision | undefined>;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;

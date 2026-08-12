@@ -2,6 +2,7 @@ import type { ToolCallContent, ToolCallLocation, ToolKind } from "@agentclientpr
 import type {
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpPermissionRequestContext,
   McpServer,
   NonInteractivePermissionPolicy,
   PermissionMode,
@@ -11,7 +12,11 @@ import type { SessionAgentOptions } from "../engine/session-options.js";
 
 export type { SessionAgentOptions, SystemPromptOption } from "../engine/session-options.js";
 
-export type { AcpPermissionDecision, AcpPermissionRequest } from "../../types.js";
+export type {
+  AcpPermissionDecision,
+  AcpPermissionRequest,
+  AcpPermissionRequestContext,
+} from "../../types.js";
 
 export type AcpRuntimePromptMode = "prompt" | "steer";
 
@@ -308,7 +313,7 @@ export type AcpRuntimeOptions = {
   verbose?: boolean;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
+    ctx: AcpPermissionRequestContext,
   ) => Promise<AcpPermissionDecision | undefined>;
 };
 

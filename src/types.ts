@@ -19,6 +19,19 @@ export type AcpPermissionRequest = {
   inferredKind: ToolKind | undefined;
 };
 
+/**
+ * Context handed to a host permission hook. `policy` and `mode` describe what
+ * acpx would do with the request on its own, so a host can defer to, or
+ * deliberately override, the configured behavior. Both are optional: a hook
+ * written against an older contract still compiles, and `policy` is absent
+ * whenever no permission policy is configured.
+ */
+export type AcpPermissionRequestContext = {
+  signal: AbortSignal;
+  policy?: PermissionPolicy;
+  mode?: PermissionMode;
+};
+
 export type AcpPermissionDecision =
   | { outcome: "allow_once" }
   | { outcome: "allow_always" }
@@ -237,7 +250,7 @@ export type AcpClientOptions = {
   onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
   onPermissionRequest?: (
     req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
+    ctx: AcpPermissionRequestContext,
   ) => Promise<AcpPermissionDecision | undefined>;
 };
 

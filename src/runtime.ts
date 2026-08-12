@@ -48,6 +48,7 @@ export type {
   AcpFileSessionStoreOptions,
   AcpPermissionDecision,
   AcpPermissionRequest,
+  AcpPermissionRequestContext,
   AcpRuntime,
   AcpRuntimeAvailableCommand,
   AcpRuntimeCapabilities,

@@ -20,6 +20,7 @@ import {
   PermissionPromptUnavailableError,
   UnsupportedPromptContentError,
 } from "../src/errors.js";
+import type { PermissionMode, PermissionPolicy } from "../src/types.js";
 
 test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
   for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
@@ -523,6 +524,55 @@ test("AcpClient onPermissionRequest decision short-circuits the mode-based resol
     denied: 0,
     cancelled: 0,
   });
+});
+
+test("AcpClient onPermissionRequest receives the effective permission policy and mode", async () => {
+  const seen: { policy?: PermissionPolicy; mode?: PermissionMode }[] = [];
+  const client = makeClient({
+    permissionMode: "approve-reads",
+    permissionPolicy: { defer: ["execute"], defaultAction: "deny" },
+    onPermissionRequest: async (_req, ctx) => {
+      seen.push({ policy: ctx.policy, mode: ctx.mode });
+      return { outcome: "allow_once" };
+    },
+  });
+
+  await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-ctx-1", "execute"),
+  );
+
+  assert.deepEqual(seen, [
+    { policy: { defer: ["execute"], defaultAction: "deny" }, mode: "approve-reads" },
+  ]);
+});
+
+test("AcpClient onPermissionRequest ctx tracks runtime option updates", async () => {
+  const seen: { policy?: PermissionPolicy; mode?: PermissionMode }[] = [];
+  const client = makeClient({
+    permissionMode: "approve-reads",
+    onPermissionRequest: async (_req, ctx) => {
+      seen.push({ policy: ctx.policy, mode: ctx.mode });
+      return { outcome: "allow_once" };
+    },
+  });
+
+  await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-ctx-2", "execute"),
+  );
+
+  client.updateRuntimeOptions({
+    permissionMode: "deny-all",
+    permissionPolicy: { escalate: ["execute"] },
+  });
+
+  await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-ctx-3", "execute"),
+  );
+
+  assert.deepEqual(seen, [
+    { policy: undefined, mode: "approve-reads" },
+    { policy: { escalate: ["execute"] }, mode: "deny-all" },
+  ]);
 });
 
 test("AcpClient onPermissionRequest returning undefined falls through to mode-based resolver", async () => {
