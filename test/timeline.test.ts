@@ -180,13 +180,14 @@ test("partial timeline failure acknowledges committed events before a retry", as
     const pendingTimelineEvents = messages.map((message) =>
       captureAcpTimelineEvent("inbound", message, { turnId: "turn-1" }),
     );
+    const flush = sessionRuntimeTestInternals.createCapturedMessageQueueFlusher({
+      eventWriter: writer,
+      pendingMessages,
+      pendingTimelineEvents,
+    });
 
     await assert.rejects(
-      sessionRuntimeTestInternals.flushCapturedMessageQueue({
-        eventWriter: writer,
-        pendingMessages,
-        pendingTimelineEvents,
-      }),
+      flush(),
       (error: unknown) =>
         error instanceof SessionEventAppendError &&
         error.committedCount === 2 &&
@@ -195,12 +196,7 @@ test("partial timeline failure acknowledges committed events before a retry", as
     assert.equal(pendingMessages.length, 1);
     assert.equal(pendingTimelineEvents.length, 1);
 
-    await sessionRuntimeTestInternals.flushCapturedMessageQueue({
-      eventWriter: writer,
-      pendingMessages,
-      pendingTimelineEvents,
-      checkpoint: true,
-    });
+    await flush(true);
     await writer.close({ checkpoint: true });
 
     const page = await listSessionTimelinePage(record.acpxRecordId);
@@ -214,6 +210,106 @@ test("partial timeline failure acknowledges committed events before a retry", as
     );
     assert.equal(page.writeError, undefined);
   });
+});
+
+test("concurrent captured-message flushes append each event once and drain late additions", async () => {
+  const messages = ["one", "two", "three"].map((text) => updateMessage("acp-overlap", text));
+  const pendingMessages = messages.slice(0, 2);
+  const pendingTimelineEvents = pendingMessages.map((message) =>
+    captureAcpTimelineEvent("inbound", message, { turnId: "turn-overlap" }),
+  );
+  const appendedBatches: AcpJsonRpcMessage[][] = [];
+  let markFirstAppendStarted: (() => void) | undefined;
+  const firstAppendStarted = new Promise<void>((resolve) => {
+    markFirstAppendStarted = resolve;
+  });
+  let releaseFirstAppend: (() => void) | undefined;
+  const firstAppendBlocked = new Promise<void>((resolve) => {
+    releaseFirstAppend = resolve;
+  });
+  const eventWriter: Pick<SessionEventWriter, "appendCapturedMessages"> = {
+    appendCapturedMessages: async (captured) => {
+      appendedBatches.push(captured.map((event) => event.message));
+      if (appendedBatches.length === 1) {
+        markFirstAppendStarted?.();
+        await firstAppendBlocked;
+      }
+      return captured.length;
+    },
+  };
+  const flush = sessionRuntimeTestInternals.createCapturedMessageQueueFlusher({
+    eventWriter,
+    pendingMessages,
+    pendingTimelineEvents,
+  });
+
+  const firstFlush = flush();
+  await firstAppendStarted;
+  const secondFlush = flush();
+  pendingMessages.push(messages[2]);
+  pendingTimelineEvents.push(
+    captureAcpTimelineEvent("inbound", messages[2], { turnId: "turn-overlap" }),
+  );
+
+  await Promise.resolve();
+  assert.equal(appendedBatches.length, 1);
+  releaseFirstAppend?.();
+  await Promise.all([firstFlush, secondFlush]);
+
+  assert.deepEqual(appendedBatches, [messages.slice(0, 2), messages.slice(2)]);
+  assert.deepEqual(pendingMessages, []);
+  assert.deepEqual(pendingTimelineEvents, []);
+});
+
+test("a queued captured-message flush retries the uncommitted suffix after failure", async () => {
+  const messages = ["one", "two", "three"].map((text) => updateMessage("acp-retry", text));
+  const pendingMessages = [...messages];
+  const pendingTimelineEvents = messages.map((message) =>
+    captureAcpTimelineEvent("inbound", message, { turnId: "turn-retry" }),
+  );
+  const appendedBatches: AcpJsonRpcMessage[][] = [];
+  let markFirstAppendStarted: (() => void) | undefined;
+  const firstAppendStarted = new Promise<void>((resolve) => {
+    markFirstAppendStarted = resolve;
+  });
+  let releaseFirstAppend: (() => void) | undefined;
+  const firstAppendBlocked = new Promise<void>((resolve) => {
+    releaseFirstAppend = resolve;
+  });
+  const eventWriter: Pick<SessionEventWriter, "appendCapturedMessages"> = {
+    appendCapturedMessages: async (captured) => {
+      appendedBatches.push(captured.map((event) => event.message));
+      if (appendedBatches.length === 1) {
+        markFirstAppendStarted?.();
+        await firstAppendBlocked;
+        throw new SessionEventAppendError(new Error("timeline disk fault"), 1);
+      }
+      return captured.length;
+    },
+  };
+  const flush = sessionRuntimeTestInternals.createCapturedMessageQueueFlusher({
+    eventWriter,
+    pendingMessages,
+    pendingTimelineEvents,
+  });
+
+  const failedFlush = flush();
+  await firstAppendStarted;
+  const retryFlush = flush();
+  releaseFirstAppend?.();
+
+  await assert.rejects(
+    failedFlush,
+    (error: unknown) =>
+      error instanceof SessionEventAppendError &&
+      error.committedCount === 1 &&
+      error.message === "timeline disk fault",
+  );
+  await retryFlush;
+
+  assert.deepEqual(appendedBatches, [messages, messages.slice(1)]);
+  assert.deepEqual(pendingMessages, []);
+  assert.deepEqual(pendingTimelineEvents, []);
 });
 
 test("an authoritative append failure remains visible after cleanup checkpoints", async () => {

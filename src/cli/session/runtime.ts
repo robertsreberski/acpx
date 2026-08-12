@@ -675,7 +675,8 @@ function createPendingRequestSink(params: {
   };
 }
 
-async function flushCapturedMessageQueue(params: {
+/** Append one stable queue prefix; createCapturedMessageQueueFlusher owns serialization. */
+async function appendCapturedMessageQueueBatch(params: {
   eventWriter: Pick<SessionEventWriter, "appendCapturedMessages">;
   pendingMessages: AcpJsonRpcMessage[];
   pendingTimelineEvents: CapturedAcpTimelineEvent[];
@@ -702,6 +703,28 @@ async function flushCapturedMessageQueue(params: {
   }
   params.pendingMessages.splice(0, committedCount);
   params.pendingTimelineEvents.splice(0, committedCount);
+}
+
+function createCapturedMessageQueueFlusher(params: {
+  eventWriter: Pick<SessionEventWriter, "appendCapturedMessages">;
+  pendingMessages: AcpJsonRpcMessage[];
+  pendingTimelineEvents: CapturedAcpTimelineEvent[];
+}): (checkpoint?: boolean) => Promise<void> {
+  let flushTail = Promise.resolve();
+
+  return (checkpoint = false) => {
+    const flush = flushTail.then(async () => {
+      await appendCapturedMessageQueueBatch({
+        ...params,
+        checkpoint,
+      });
+    });
+    flushTail = flush.catch(() => {
+      // Keep the queue usable: the caller still observes this failure, while a
+      // later flush retries whichever suffix was not durably acknowledged.
+    });
+    return flush;
+  };
 }
 
 function buildQueuedTaskRunOptions(
@@ -881,14 +904,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await eventWriter.close({ checkpoint });
   };
 
+  const flushCapturedMessages = createCapturedMessageQueueFlusher({
+    eventWriter,
+    pendingMessages,
+    pendingTimelineEvents,
+  });
+
   const flushPendingMessages = async (checkpoint = false): Promise<void> => {
     await measurePerf("session.events.flush_pending", async () => {
-      await flushCapturedMessageQueue({
-        eventWriter,
-        pendingMessages,
-        pendingTimelineEvents,
-        checkpoint,
-      });
+      await flushCapturedMessages(checkpoint);
     });
   };
   const preserveClosedState = async (): Promise<void> => {
@@ -1474,5 +1498,5 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
 export const sessionRuntimeTestInternals = {
   shouldRetryRuntimePrompt,
   createPendingRequestSink,
-  flushCapturedMessageQueue,
+  createCapturedMessageQueueFlusher,
 };
