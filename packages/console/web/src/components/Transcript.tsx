@@ -128,6 +128,9 @@ const unsupportedFieldReason = (property: ElicitationProperty): string | undefin
   if (property.format != null && !SUPPORTED_ELICITATION_FORMATS.has(property.format)) {
     return `Unsupported field format “${property.format}”.`;
   }
+  if (typeof property.pattern === "string") {
+    return "Agent validation patterns are not supported safely in the console.";
+  }
   return undefined;
 };
 
@@ -234,7 +237,6 @@ function ElicitationField({
           max={property.maximum ?? undefined}
           minLength={property.minLength ?? undefined}
           maxLength={property.maxLength ?? undefined}
-          pattern={property.pattern ?? undefined}
           defaultValue={
             typeof property.default === "string" || typeof property.default === "number"
               ? property.default

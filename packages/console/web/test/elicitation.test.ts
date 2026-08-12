@@ -78,6 +78,14 @@ test("nullable ACP constraints are treated as absent", () => {
   );
 });
 
+test("agent-authored regular expressions are refused without compiling them", () => {
+  const catastrophic = "^(a+)+$";
+  assert.throws(
+    () => coerceElicitationValue({ type: "string", pattern: catastrophic }, `${"a".repeat(50)}!`),
+    /validation patterns are not supported safely/u,
+  );
+});
+
 test("optional blank scalar fields are omitted instead of fabricating values", () => {
   assert.deepEqual(booleanElicitationChoices(false), [
     { value: "", label: "No answer", disabled: false },

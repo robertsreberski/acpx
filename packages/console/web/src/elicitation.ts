@@ -52,15 +52,11 @@ export const validateElicitationValue = (
       throw new Error(`Enter at most ${property.maxLength} character(s).`);
     }
     if (typeof property.pattern === "string") {
-      let pattern: RegExp;
-      try {
-        pattern = new RegExp(property.pattern, "u");
-      } catch {
-        throw new Error("The agent supplied an invalid validation pattern.");
-      }
-      if (!pattern.test(value)) {
-        throw new Error("The answer does not match the requested format.");
-      }
+      // JSON Schema patterns are agent-authored JavaScript regular expressions.
+      // Running one in the browser can block the UI indefinitely (for example,
+      // through catastrophic backtracking), so the console refuses these forms
+      // instead of pretending it can validate them safely.
+      throw new Error("Agent validation patterns are not supported safely in the console.");
     }
     if (property.format === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value)) {
       throw new Error("Enter a valid email address.");
