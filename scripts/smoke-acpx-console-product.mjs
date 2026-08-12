@@ -448,6 +448,7 @@ async function main() {
         agentId: "mock",
         cwd: workspace,
         name: "product-smoke",
+        mode: "default",
         policy: "defer-risky",
       },
       201,
