@@ -118,7 +118,7 @@ async function main() {
         })
       ).stdout,
     );
-    assert.equal(packedConsoleManifest.dependencies.acpx, "0.13.0-fork.2");
+    assert.equal(packedConsoleManifest.dependencies.acpx, "0.13.0-fork.3");
     assert.doesNotMatch(JSON.stringify(packedConsoleManifest), /workspace:/);
     await run(
       "npm",

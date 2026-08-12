@@ -107,6 +107,8 @@ test("release workflow delegates tag and package selection to the tested release
   assert.match(workflow, /origin\/\$\{BASE_BRANCH\}/);
   assert.match(workflow, /npm publish --access public --provenance --tag fork/);
   assert.match(workflow, /Verify console's exact acpx dependency on npm/);
+  assert.match(workflow, /Smoke acpx-console against its exact registry dependency/);
+  assert.match(workflow, /import\("acpx\/sessions"\)/);
   assert.match(workflow, /working-directory: packages\/console/);
   assert.match(workflow, /bootstrap_console:/);
   assert.match(workflow, /scripts\/release-plan\.ts \\\n+\s+--console-auth/);

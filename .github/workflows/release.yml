@@ -184,6 +184,26 @@ jobs:
         if: steps.release_plan.outputs.publish_console == 'true'
         run: pnpm --filter acpx-console check
 
+      - name: Smoke acpx-console against its exact registry dependency
+        if: steps.release_plan.outputs.publish_console == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL=$(cd packages/console && npm pack --silent)
+          INSTALL_ROOT=$(mktemp -d)
+          trap 'rm -rf "${INSTALL_ROOT}" "packages/console/${TARBALL}"' EXIT
+          npm install --prefix "${INSTALL_ROOT}" "${GITHUB_WORKSPACE}/packages/console/${TARBALL}"
+          (
+            cd "${INSTALL_ROOT}"
+            node --input-type=module - <<'NODE'
+          const sessions = await import("acpx/sessions");
+          if (typeof sessions.createAcpxSessionService !== "function") {
+            throw new Error("The exact registry acpx dependency does not expose acpx/sessions");
+          }
+          NODE
+          )
+          "${INSTALL_ROOT}/node_modules/.bin/acpx-console" --help >/dev/null
+
       - name: Publish acpx-console with trusted publishing
         if: steps.release_plan.outputs.publish_console == 'true' && steps.console_auth.outputs.bootstrap == 'false'
         working-directory: packages/console

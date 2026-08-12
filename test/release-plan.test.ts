@@ -5,7 +5,7 @@ import { resolveConsoleAuthMode, resolveReleasePlan } from "../scripts/release-p
 const consolePackage = {
   name: "acpx-console",
   version: "0.1.0",
-  dependencies: { acpx: "0.13.0-fork.2" },
+  dependencies: { acpx: "0.13.0-fork.3" },
 };
 
 test("stable root releases preserve the latest dist-tag and do not publish console", () => {
@@ -30,15 +30,15 @@ test("stable root releases preserve the latest dist-tag and do not publish conso
 test("fork root releases use a non-latest dist-tag and do not republish console", () => {
   assert.deepEqual(
     resolveReleasePlan({
-      releaseTag: "v0.13.0-fork.2",
-      rootPackage: { name: "acpx", version: "0.13.0-fork.2" },
+      releaseTag: "v0.13.0-fork.3",
+      rootPackage: { name: "acpx", version: "0.13.0-fork.3" },
       consolePackage,
     }),
     {
       kind: "fork",
       baseBranch: "fork-main",
       packageName: "acpx",
-      version: "0.13.0-fork.2",
+      version: "0.13.0-fork.3",
       npmTag: "fork",
       publishRoot: true,
       publishConsole: false,
@@ -84,16 +84,16 @@ test("release tags must exactly match the selected package version", () => {
     () =>
       resolveReleasePlan({
         releaseTag: "v0.13.0",
-        rootPackage: { name: "acpx", version: "0.13.0-fork.2" },
+        rootPackage: { name: "acpx", version: "0.13.0-fork.3" },
         consolePackage,
       }),
-    /expected v0\.13\.0-fork\.2/,
+    /expected v0\.13\.0-fork\.3/,
   );
   assert.throws(
     () =>
       resolveReleasePlan({
         releaseTag: "console-v0.2.0",
-        rootPackage: { name: "acpx", version: "0.13.0-fork.2" },
+        rootPackage: { name: "acpx", version: "0.13.0-fork.3" },
         consolePackage,
       }),
     /expected console-v0\.1\.0/,
