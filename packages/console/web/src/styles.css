@@ -339,6 +339,9 @@ button:disabled {
   background: #c88b45;
   animation: pulse 1.2s infinite;
 }
+.connection-dot.is-offline {
+  background: var(--danger);
+}
 
 .session-workspace {
   display: flex;
@@ -782,6 +785,24 @@ fieldset.elicitation-field {
   width: min(800px, 100%);
   margin: 0 auto;
   padding: 10px 22px max(15px, env(safe-area-inset-bottom));
+}
+
+.queued-prompts {
+  margin: 12px auto;
+  padding: 12px 14px;
+  width: min(100% - 32px, 760px);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.queued-prompts p {
+  margin: 6px 0;
+  white-space: pre-wrap;
+}
+
+.queued-prompts small {
+  color: var(--muted);
 }
 .composer {
   border: 1px solid #cbd4cc;

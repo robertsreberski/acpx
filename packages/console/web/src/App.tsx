@@ -43,6 +43,7 @@ export default function App() {
   const [dialog, setDialog] = useState<"create" | "adopt" | null>(null);
   const session = store.selectedSession;
   const openDialog = (mode: "create" | "adopt") => {
+    setSidebarOpen(false);
     setFactsOpen(false);
     setDialog(mode);
   };
@@ -97,7 +98,10 @@ export default function App() {
                   type="button"
                   className="icon-button"
                   aria-label="Session details"
-                  onClick={() => setFactsOpen(true)}
+                  onClick={() => {
+                    setSidebarOpen(false);
+                    setFactsOpen(true);
+                  }}
                 >
                   <Icon name="info" />
                 </button>

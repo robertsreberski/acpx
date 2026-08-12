@@ -13,6 +13,15 @@ interface FocusTarget {
   focus(): void;
 }
 
+interface TabKeyEvent extends EscapeKeyEvent {
+  readonly shiftKey?: boolean;
+}
+
+interface FocusContainer {
+  contains(target: unknown): boolean;
+  querySelectorAll<T extends FocusTarget>(selector: string): ArrayLike<T>;
+}
+
 export const dismissOnEscape = (event: EscapeKeyEvent, dismiss: () => void): boolean => {
   if (event.key !== "Escape" || event.isComposing || event.defaultPrevented) {
     return false;
@@ -41,6 +50,68 @@ const FOCUSABLE_SELECTOR = [
   "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
+export const trapLayerTab = (
+  event: TabKeyEvent,
+  layer: FocusContainer,
+  activeElement: unknown,
+): boolean => {
+  if (event.key !== "Tab" || event.defaultPrevented) {
+    return false;
+  }
+  const targets = Array.from(layer.querySelectorAll<FocusTarget>(FOCUSABLE_SELECTOR)).filter(
+    (target) => target.isConnected !== false,
+  );
+  const first = targets[0];
+  const last = targets.at(-1);
+  if (!first || !last) {
+    event.preventDefault();
+    return true;
+  }
+  if (
+    event.shiftKey
+      ? activeElement === first || !layer.contains(activeElement)
+      : activeElement === last
+  ) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+    return true;
+  }
+  return false;
+};
+
+const layerStack: symbol[] = [];
+
+const inertOutsideLayer = (layer: HTMLElement): (() => void) => {
+  const changed: Array<{ element: HTMLElement; inert: boolean; ariaHidden: string | null }> = [];
+  let branch: HTMLElement | null = layer;
+  while (branch?.parentElement && branch.parentElement.id !== "root") {
+    for (const sibling of branch.parentElement.children) {
+      if (sibling !== branch && sibling instanceof HTMLElement) {
+        changed.push({
+          element: sibling,
+          inert: sibling.hasAttribute("inert"),
+          ariaHidden: sibling.getAttribute("aria-hidden"),
+        });
+        sibling.setAttribute("inert", "");
+        sibling.setAttribute("aria-hidden", "true");
+      }
+    }
+    branch = branch.parentElement;
+  }
+  return () => {
+    for (const { element, inert, ariaHidden } of changed) {
+      if (!inert) {
+        element.removeAttribute("inert");
+      }
+      if (ariaHidden === null) {
+        element.removeAttribute("aria-hidden");
+      } else {
+        element.setAttribute("aria-hidden", ariaHidden);
+      }
+    }
+  };
+};
+
 /** Escape-dismiss a transient layer and restore focus to the control that opened it. */
 export const useDismissibleLayer = (
   open: boolean,
@@ -48,6 +119,7 @@ export const useDismissibleLayer = (
   layerRef?: RefObject<HTMLElement | null>,
 ): void => {
   const onCloseRef = useRef(onClose);
+  const tokenRef = useRef(Symbol("dismissible-layer"));
   onCloseRef.current = onClose;
 
   useEffect(() => {
@@ -56,8 +128,19 @@ export const useDismissibleLayer = (
     }
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const layer = layerRef?.current ?? null;
+    const token = tokenRef.current;
+    layerStack.push(token);
+    const restoreInert = layer ? inertOutsideLayer(layer) : () => undefined;
     const onKeyDown = (event: KeyboardEvent) => {
-      dismissOnEscape(event, () => onCloseRef.current());
+      if (layerStack.at(-1) !== token) {
+        return;
+      }
+      if (dismissOnEscape(event, () => onCloseRef.current())) {
+        return;
+      }
+      if (layer) {
+        trapLayerTab(event, layer, document.activeElement);
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     queueMicrotask(() => {
@@ -67,6 +150,11 @@ export const useDismissibleLayer = (
     });
     return () => {
       document.removeEventListener("keydown", onKeyDown);
+      const index = layerStack.lastIndexOf(token);
+      if (index >= 0) {
+        layerStack.splice(index, 1);
+      }
+      restoreInert();
       queueMicrotask(() => {
         const active = document.activeElement;
         if (!active || active === document.body || !active.isConnected || layer?.contains(active)) {

@@ -187,3 +187,50 @@ test("an HTTP failure is not retried", async () => {
   );
   assert.equal(attempts, 1);
 });
+
+test("a stale CSRF 403 refreshes bootstrap once and preserves idempotency", async () => {
+  const client = new ConsoleApi();
+  client.setCsrfToken("csrf-old");
+  const mutations: Headers[] = [];
+  await withFetch(
+    async (input, init) => {
+      if (requestUrl(input).endsWith("/bootstrap")) {
+        return response({
+          version: 1,
+          csrfToken: "csrf-new",
+          agents: [],
+          sessions: [],
+          workspaceRoots: [],
+          server: { networkTrusted: false },
+        });
+      }
+      mutations.push(new Headers(init?.headers));
+      return mutations.length === 1
+        ? response({ error: { message: "stale CSRF" } }, 403)
+        : response({ pending: {} });
+    },
+    async () => {
+      await client.answerInteraction("record-1", "request-1", { type: "cancel" });
+    },
+  );
+  assert.equal(mutations.length, 2);
+  assert.equal(mutations[0]?.get("X-CSRF-Token"), "csrf-old");
+  assert.equal(mutations[1]?.get("X-CSRF-Token"), "csrf-new");
+  assert.equal(mutations[1]?.get("Idempotency-Key"), mutations[0]?.get("Idempotency-Key"));
+});
+
+test("preserves an unknown prompt admission for reconciliation", async () => {
+  const client = new ConsoleApi();
+  await withFetch(
+    async () => response({ turnId: "turn-unknown", admission: "unknown" }),
+    async () => {
+      const receipt = await client.sendPrompt("record-1", "hello");
+      assert.deepEqual(receipt, {
+        accepted: true,
+        sessionId: "record-1",
+        turnId: "turn-unknown",
+        state: "unknown",
+      });
+    },
+  );
+});

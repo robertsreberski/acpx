@@ -52,7 +52,8 @@ export function SessionSidebar({
   readonly onCreate: () => void;
   readonly onAdopt: () => void;
 }) {
-  const { bootstrap, loading, selectedSessionId, selectSession } = useSessionStore();
+  const { bootstrap, connectionState, loading, selectedSessionId, selectSession } =
+    useSessionStore();
   const sidebarRef = useRef<HTMLElement>(null);
   useDismissibleLayer(open, onClose, sidebarRef);
   const [query, setQuery] = useState("");
@@ -79,6 +80,8 @@ export function SessionSidebar({
       <aside
         ref={sidebarRef}
         className={`session-sidebar${open ? " is-open" : ""}`}
+        role={open ? "dialog" : undefined}
+        aria-modal={open ? "true" : undefined}
         aria-label="Coding sessions"
       >
         <header className="sidebar-header">
@@ -170,10 +173,14 @@ export function SessionSidebar({
           )}
         </nav>
         <footer className="sidebar-footer">
-          <span className={`connection-dot${loading ? " is-loading" : ""}`} />
-          {loading
-            ? "Refreshing…"
-            : `${bootstrap.sessions.length} local session${bootstrap.sessions.length === 1 ? "" : "s"}`}
+          <span
+            className={`connection-dot${loading || connectionState === "connecting" ? " is-loading" : connectionState === "offline" ? " is-offline" : ""}`}
+          />
+          {connectionState === "offline"
+            ? "Live updates disconnected"
+            : loading || connectionState === "connecting"
+              ? "Refreshing…"
+              : `${bootstrap.sessions.length} local session${bootstrap.sessions.length === 1 ? "" : "s"}`}
         </footer>
       </aside>
     </>

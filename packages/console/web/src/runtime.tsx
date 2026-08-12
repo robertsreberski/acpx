@@ -7,7 +7,12 @@ import {
 } from "@assistant-ui/react";
 import { type ReactNode, useCallback, useMemo } from "react";
 import { useSessionStore } from "./session-store";
-import { firstInteractionEventIds } from "./timeline-projector";
+import {
+  firstInteractionEventIds,
+  normalizeHistoricalStreamingEvent,
+  timelineActivityToolName,
+  timelineEventIsRunning,
+} from "./timeline-projector";
 import type { PendingInteraction, TranscriptEvent } from "./types";
 import { consumeUiAction } from "./ui-actions";
 
@@ -53,19 +58,6 @@ const record = (value: unknown): { readonly [key: string]: JsonValue } => {
     : { value: normalized };
 };
 
-const activityToolName = (event: TranscriptEvent): string => {
-  if (event.requestId) {
-    return `acpx:interaction:${event.requestId}`;
-  }
-  if (event.kind === "reasoning" || event.kind === "plan") {
-    return `acpx:${event.kind}`;
-  }
-  if (event.toolName) {
-    return event.toolName;
-  }
-  return `acpx:${event.kind}`;
-};
-
 const convertTimelineMessage = ({ event, interaction }: TimelineMessage): ThreadMessageLike => {
   const role = event.role === "user" ? "user" : "assistant";
   const hasActivity =
@@ -75,7 +67,7 @@ const convertTimelineMessage = ({ event, interaction }: TimelineMessage): Thread
         {
           type: "tool-call",
           toolCallId: event.requestId ?? event.id,
-          toolName: activityToolName(event),
+          toolName: timelineActivityToolName(event, interaction?.id),
           args: record(interaction ?? event.input ?? event.payload),
           argsText: JSON.stringify(interaction ?? event.input ?? event.payload ?? {}, null, 2),
           result: event.output,
@@ -83,18 +75,17 @@ const convertTimelineMessage = ({ event, interaction }: TimelineMessage): Thread
         },
       ]
     : [{ type: "text", text: event.text ?? "" }];
-  const incomplete =
-    event.status === "running" || event.status === "streaming"
-      ? { type: "running" as const }
-      : event.status === "failed"
-        ? {
-            type: "incomplete" as const,
-            reason: "error" as const,
-            error: event.text ?? "Activity failed",
-          }
-        : event.status === "cancelled" || event.status === "interrupted"
-          ? { type: "incomplete" as const, reason: "cancelled" as const }
-          : { type: "complete" as const, reason: "stop" as const };
+  const incomplete = timelineEventIsRunning(event)
+    ? { type: "running" as const }
+    : event.status === "failed"
+      ? {
+          type: "incomplete" as const,
+          reason: "error" as const,
+          error: event.text ?? "Activity failed",
+        }
+      : event.status === "cancelled" || event.status === "interrupted"
+        ? { type: "incomplete" as const, reason: "cancelled" as const }
+        : { type: "complete" as const, reason: "stop" as const };
 
   return {
     id: event.id,
@@ -165,14 +156,31 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
         left.sequence - right.sequence || left.occurredAt.localeCompare(right.occurredAt),
     );
     const firstByRequest = firstInteractionEventIds(allEvents);
-    return allEvents.map((event) => ({
-      event: !isRunning && event.status === "streaming" ? { ...event, status: "complete" } : event,
-      interaction:
+    return allEvents.map((event) => {
+      const interaction =
         event.requestId && firstByRequest.get(event.requestId) === event.id
           ? interactionById.get(event.requestId)
-          : undefined,
-    }));
-  }, [interactionById, isRunning, store.pending, store.timeline?.events]);
+          : undefined;
+      let normalized = normalizeHistoricalStreamingEvent(
+        event,
+        isRunning ? store.selectedSession?.activeTurnId : undefined,
+      );
+      if (
+        (event.kind === "permission" || event.kind === "elicitation") &&
+        (!interaction || interaction.state !== "pending") &&
+        timelineEventIsRunning(normalized)
+      ) {
+        normalized = { ...normalized, status: "complete" };
+      }
+      return { event: normalized, interaction };
+    });
+  }, [
+    interactionById,
+    isRunning,
+    store.pending,
+    store.selectedSession?.activeTurnId,
+    store.timeline?.events,
+  ]);
 
   const onNew = useCallback(
     async (message: AppendMessage) => {
@@ -189,16 +197,26 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
     () =>
       isRunning
         ? {
-            items: [],
+            items: store.queuedPrompts.map((prompt) => ({
+              id: prompt.id,
+              prompt: prompt.text,
+              parts: [{ type: "text" as const, text: prompt.text }],
+            })),
             steerItems: [],
             enqueue: (message) => consumeUiAction(onNew(message)),
             steer: (message) => consumeUiAction(onNew(message)),
-            move: () => undefined,
-            edit: () => undefined,
-            remove: () => undefined,
+            move: () => {
+              throw new Error("Reordering queued ACPX prompts is not supported.");
+            },
+            edit: () => {
+              throw new Error("Editing queued ACPX prompts is not supported.");
+            },
+            remove: () => {
+              throw new Error("Removing queued ACPX prompts is not supported.");
+            },
           }
         : undefined,
-    [isRunning, onNew],
+    [isRunning, onNew, store.queuedPrompts],
   );
 
   const runtime = useExternalStoreRuntime<TimelineMessage>({

@@ -68,11 +68,13 @@ export class ConsoleApi {
     path: string,
     body: unknown,
     method: "DELETE" | "PATCH" | "POST" | "PUT" = "POST",
+    key = idempotencyKey(),
+    allowCsrfRefresh = true,
   ): Promise<T> {
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Content-Type": "application/json",
-      "Idempotency-Key": idempotencyKey(),
+      "Idempotency-Key": key,
     };
     if (this.#csrfToken) {
       headers["X-CSRF-Token"] = this.#csrfToken;
@@ -91,6 +93,11 @@ export class ConsoleApi {
         throw error;
       }
       response = await request();
+    }
+    if (response.status === 403 && allowCsrfRefresh) {
+      const snapshot = await this.bootstrap();
+      this.setCsrfToken(snapshot.csrfToken);
+      return await this.mutate<T>(path, body, method, key, false);
     }
     return await json<T>(response);
   }
@@ -205,7 +212,7 @@ export class ConsoleApi {
       accepted: true,
       sessionId,
       turnId: receipt.turnId,
-      state: receipt.admission === "unknown" ? "known" : receipt.admission,
+      state: receipt.admission,
     }));
   }
 
@@ -333,6 +340,14 @@ const payloadRecord = (payload: unknown): Record<string, unknown> =>
 const pendingInteraction = (interaction: WirePendingInteraction): PendingInteraction => {
   const schema = payloadRecord(interaction.schema);
   const properties = payloadRecord(schema.properties);
+  const safeProperties = Object.fromEntries(
+    Object.entries(properties).map(([name, property]) => [
+      name,
+      property && typeof property === "object" && !Array.isArray(property)
+        ? property
+        : { type: "unsupported" },
+    ]),
+  );
   return {
     id: interaction.requestId,
     sessionId: interaction.acpxRecordId,
@@ -355,11 +370,7 @@ const pendingInteraction = (interaction: WirePendingInteraction): PendingInterac
             required: Array.isArray(schema.required)
               ? schema.required.filter((item): item is string => typeof item === "string")
               : [],
-            properties: properties as PendingInteraction["elicitation"] extends {
-              properties: infer T;
-            }
-              ? T
-              : never,
+            properties: safeProperties,
           }
         : undefined,
   };

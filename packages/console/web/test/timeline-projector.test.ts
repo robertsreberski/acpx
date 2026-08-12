@@ -3,7 +3,10 @@ import test from "node:test";
 import {
   coalesceTranscriptEvents,
   firstInteractionEventIds,
+  normalizeHistoricalStreamingEvent,
   projectTimelineEvent,
+  timelineActivityToolName,
+  timelineEventIsRunning,
   type WireTimelineEvent,
 } from "../src/timeline-projector";
 
@@ -19,6 +22,28 @@ const wire = (
   turn_id: "turn-1",
   payload,
   ...extra,
+});
+
+test("preserves tool identity and only streams activity from the active turn", () => {
+  const tool = projectTimelineEvent(
+    wire(
+      1,
+      update({
+        sessionUpdate: "tool_call",
+        toolCallId: "call-1",
+        kind: "execute",
+        status: "in_progress",
+      }),
+    ),
+  );
+  assert.equal(timelineActivityToolName(tool), "execute");
+  assert.equal(timelineActivityToolName(tool, "permission-1"), "acpx:interaction:permission-1");
+  assert.equal(timelineEventIsRunning(tool), true);
+  const chunk = projectTimelineEvent(
+    wire(2, update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } })),
+  );
+  assert.equal(normalizeHistoricalStreamingEvent(chunk, "turn-1").status, "streaming");
+  assert.equal(normalizeHistoricalStreamingEvent(chunk, "turn-2").status, "complete");
 });
 
 const update = (value: unknown): unknown => ({

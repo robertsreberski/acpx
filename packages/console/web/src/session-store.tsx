@@ -10,6 +10,7 @@ import {
 } from "react";
 import { api, ApiError } from "./api";
 import { listenForLiveInvalidations } from "./live-events";
+import { reconcileQueuedPrompts, type QueuedPrompt } from "./queued-prompts";
 import {
   mergeRefreshedTimelinePage,
   normalizeTimelinePage,
@@ -43,6 +44,8 @@ interface SessionStoreValue {
   readonly pending: readonly PendingInteraction[];
   readonly notices: readonly ConsoleNotice[];
   readonly actionBusy: boolean;
+  readonly connectionState: "connecting" | "online" | "offline";
+  readonly queuedPrompts: readonly QueuedPrompt[];
   readonly selectSession: (id: string | null) => void;
   readonly refresh: () => Promise<void>;
   readonly loadEarlier: () => Promise<void>;
@@ -69,8 +72,13 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   const [pending, setPending] = useState<readonly PendingInteraction[]>([]);
   const [notices, setNotices] = useState<readonly ConsoleNotice[]>([]);
   const [actionBusy, setActionBusy] = useState(false);
+  const [connectionState, setConnectionState] = useState<"connecting" | "online" | "offline">(
+    "connecting",
+  );
+  const [queuedPrompts, setQueuedPrompts] = useState<readonly QueuedPrompt[]>([]);
   const noticeId = useRef(0);
   const selectionGeneration = useRef(0);
+  const selectedSessionIdRef = useRef(selectedSessionId);
   const refreshTimer = useRef<number | undefined>(undefined);
 
   const notice = useCallback((message: string, tone: ConsoleNotice["tone"] = "error") => {
@@ -124,25 +132,35 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   );
 
   const refresh = useCallback(async () => {
+    const generation = selectionGeneration.current;
+    const id = selectedSessionIdRef.current;
     await refreshBootstrap();
-    if (selectedSessionId) {
-      await refreshSelection(selectedSessionId);
+    if (generation === selectionGeneration.current && id && id === selectedSessionIdRef.current) {
+      await refreshSelection(id);
     }
-  }, [refreshBootstrap, refreshSelection, selectedSessionId]);
+  }, [refreshBootstrap, refreshSelection]);
 
   useEffect(() => {
     void refreshBootstrap();
   }, [refreshBootstrap]);
 
   useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
     selectionGeneration.current += 1;
     setSelectedSession(null);
     setTimeline(null);
     setPending([]);
+    setQueuedPrompts((current) => current.filter((item) => item.sessionId === selectedSessionId));
     if (selectedSessionId) {
       void refreshSelection(selectedSessionId, false);
     }
   }, [refreshSelection, selectedSessionId]);
+
+  useEffect(() => {
+    if (timeline) {
+      setQueuedPrompts((current) => reconcileQueuedPrompts(current, timeline.events));
+    }
+  }, [timeline]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -162,8 +180,17 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       refreshTimer.current = window.setTimeout(() => void refresh(), 80);
     };
     const stopListening = listenForLiveInvalidations(events, invalidate);
+    const online = () => {
+      setConnectionState("online");
+      invalidate();
+    };
+    const offline = () => setConnectionState("offline");
+    events.addEventListener("open", online);
+    events.addEventListener("error", offline);
     return () => {
       stopListening();
+      events.removeEventListener("open", online);
+      events.removeEventListener("error", offline);
       events.close();
       if (refreshTimer.current !== undefined) {
         window.clearTimeout(refreshTimer.current);
@@ -172,6 +199,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [refresh]);
 
   const selectSession = useCallback((id: string | null) => {
+    selectedSessionIdRef.current = id;
     selectionGeneration.current += 1;
     setSelectedSessionId(id);
     window.history.pushState(null, "", id ? `/sessions/${encodeURIComponent(id)}` : "/");
@@ -209,13 +237,18 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   }, [notice, refreshSelection, selectedSessionId, timeline]);
 
   const runAction = useCallback(
-    async <T,>(action: () => Promise<T>, success?: string): Promise<T> => {
+    async <T,>(
+      action: () => Promise<T>,
+      success?: string,
+      beforeRefresh?: (result: T) => void,
+    ): Promise<T> => {
       setActionBusy(true);
       try {
         const result = await action();
         if (success) {
           notice(success, "success");
         }
+        beforeRefresh?.(result);
         await refresh();
         return result;
       } catch (error) {
@@ -233,12 +266,35 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       if (!selectedSessionId) {
         throw new Error("Select a session first.");
       }
-      return await runAction(
-        () => api.sendPrompt(selectedSessionId, text),
-        selectedSession?.turnState === "idle" ? "Prompt started." : "Follow-up queued.",
+      const sessionId = selectedSessionId;
+      const result = await runAction(
+        () => api.sendPrompt(sessionId, text),
+        undefined,
+        (receipt) => {
+          if (
+            receipt.state === "queued" &&
+            receipt.turnId &&
+            selectedSessionIdRef.current === sessionId
+          ) {
+            const turnId = receipt.turnId;
+            setQueuedPrompts((current) => [
+              ...current.filter((item) => item.id !== turnId),
+              { id: turnId, sessionId, text },
+            ]);
+          }
+        },
       );
+      notice(
+        result.state === "started"
+          ? "Prompt started."
+          : result.state === "queued"
+            ? "Follow-up queued."
+            : "Prompt admission is unknown. Check the transcript before retrying.",
+        result.state === "unknown" ? "info" : "success",
+      );
+      return result;
     },
-    [runAction, selectedSession?.turnState, selectedSessionId],
+    [notice, runAction, selectedSessionId],
   );
 
   const cancelTurn = useCallback(async () => {
@@ -300,6 +356,8 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       pending,
       notices,
       actionBusy,
+      connectionState,
+      queuedPrompts,
       selectSession,
       refresh,
       loadEarlier,
@@ -313,6 +371,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     }),
     [
       actionBusy,
+      connectionState,
       adoptSession,
       answerInteraction,
       bootstrap,
@@ -323,6 +382,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       loading,
       notices,
       pending,
+      queuedPrompts,
       refresh,
       selectSession,
       selectedSession,

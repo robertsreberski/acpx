@@ -26,7 +26,13 @@ export function SessionFacts({
     return null;
   }
   return (
-    <aside ref={drawerRef} className="facts-drawer is-open" aria-label="Session details">
+    <aside
+      ref={drawerRef}
+      className="facts-drawer is-open"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Session details"
+    >
       <header>
         <div>
           <span>Session details</span>

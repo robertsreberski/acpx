@@ -21,7 +21,38 @@ test("numeric form values accept JSON numbers and reject JavaScript-only spellin
 test("boolean and multi-select fields preserve explicit false and literal selections", () => {
   assert.equal(coerceElicitationValue({ type: "boolean" }, "false"), false);
   assert.equal(coerceElicitationValue({ type: "boolean" }, "true"), true);
-  assert.deepEqual(coerceElicitationValue({ type: "array" }, ["x,y", " z "]), ["x,y", " z "]);
+  assert.deepEqual(
+    coerceElicitationValue(
+      { type: "array", items: { anyOf: [{ const: "x,y" }, { const: " z " }] } },
+      ["x,y", " z "],
+    ),
+    ["x,y", " z "],
+  );
+});
+
+test("multi-select anyOf and scalar constraints fail closed", () => {
+  const multiselect = {
+    type: "array",
+    minItems: 1,
+    maxItems: 2,
+    items: { anyOf: [{ const: "one" }, { const: "two" }] },
+  } as const;
+  assert.deepEqual(coerceElicitationValue(multiselect, ["one", "two"]), ["one", "two"]);
+  assert.throws(() => coerceElicitationValue(multiselect, ["future"]), /did not offer/u);
+  assert.throws(() => coerceElicitationValue(multiselect, []), /at least 1/u);
+  assert.throws(
+    () => coerceElicitationValue({ type: "object" }, "{}"),
+    /Unsupported ACP elicitation field type/u,
+  );
+  assert.throws(
+    () => coerceElicitationValue({ type: "string", minLength: 3 }, "no"),
+    /at least 3/u,
+  );
+  assert.throws(() => coerceElicitationValue({ type: "number", maximum: 2 }, "3"), /at most 2/u);
+  assert.throws(
+    () => coerceElicitationValue({ type: "string", format: "email" }, "not-an-email"),
+    /valid email/u,
+  );
 });
 
 test("optional blank scalar fields are omitted instead of fabricating values", () => {

@@ -93,12 +93,22 @@ export interface PermissionOption {
 }
 
 export type ElicitationProperty = {
-  readonly type?: "string" | "number" | "integer" | "boolean" | "array";
+  readonly type?: string;
   readonly title?: string;
   readonly description?: string;
-  readonly enum?: readonly (string | number)[];
-  readonly oneOf?: readonly { readonly const: string | number; readonly title?: string }[];
+  readonly enum?: readonly string[];
+  readonly oneOf?: readonly { readonly const: string; readonly title?: string }[];
   readonly items?: ElicitationProperty;
+  readonly anyOf?: readonly { readonly const: string; readonly title?: string }[];
+  readonly minItems?: number;
+  readonly maxItems?: number;
+  readonly minLength?: number;
+  readonly maxLength?: number;
+  readonly pattern?: string;
+  readonly format?: "email" | "uri" | "date" | "date-time";
+  readonly minimum?: number;
+  readonly maximum?: number;
+  readonly default?: string | number | boolean | readonly string[];
 };
 
 export interface PendingInteraction {
@@ -155,7 +165,7 @@ export interface MutationReceipt {
   readonly accepted: boolean;
   readonly sessionId: string;
   readonly turnId?: string;
-  readonly state?: "started" | "queued" | "known";
+  readonly state?: "started" | "queued" | "unknown";
 }
 
 export interface ConsoleNotice {

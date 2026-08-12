@@ -90,23 +90,64 @@ function PermissionCard({ interaction }: { readonly interaction: PendingInteract
 const choicesFor = (property: ElicitationProperty): readonly { value: string; label: string }[] => {
   if (property.oneOf) {
     return property.oneOf.map((choice) => ({
-      value: String(choice.const),
-      label: choice.title ?? String(choice.const),
+      value: choice.const,
+      label: choice.title ?? choice.const,
     }));
   }
   if (property.enum) {
-    return property.enum.map((choice) => ({ value: String(choice), label: String(choice) }));
+    return property.enum.map((choice) => ({ value: choice, label: choice }));
   }
-  if (property.items?.oneOf) {
-    return property.items.oneOf.map((choice) => ({
-      value: String(choice.const),
-      label: choice.title ?? String(choice.const),
+  if (property.anyOf) {
+    return property.anyOf.map((choice) => ({
+      value: choice.const,
+      label: choice.title ?? choice.const,
+    }));
+  }
+  if (property.items?.anyOf) {
+    return property.items.anyOf.map((choice) => ({
+      value: choice.const,
+      label: choice.title ?? choice.const,
     }));
   }
   if (property.items?.enum) {
-    return property.items.enum.map((choice) => ({ value: String(choice), label: String(choice) }));
+    return property.items.enum.map((choice) => ({ value: choice, label: choice }));
   }
   return [];
+};
+
+const SUPPORTED_ELICITATION_TYPES = new Set(["string", "number", "integer", "boolean", "array"]);
+const SUPPORTED_ELICITATION_FORMATS = new Set(["email", "uri", "date", "date-time"]);
+
+const unsupportedFieldReason = (property: ElicitationProperty): string | undefined => {
+  if (property.type !== undefined && !SUPPORTED_ELICITATION_TYPES.has(property.type)) {
+    return `Unsupported field type “${property.type}”.`;
+  }
+  if (property.type === "array" && choicesFor(property).length === 0) {
+    return "This multi-select has no supported ACP choices.";
+  }
+  if (property.format !== undefined && !SUPPORTED_ELICITATION_FORMATS.has(property.format)) {
+    return `Unsupported field format “${property.format}”.`;
+  }
+  return undefined;
+};
+
+const inputTypeFor = (property: ElicitationProperty): string => {
+  if (property.type === "number" || property.type === "integer") {
+    return "number";
+  }
+  if (property.format === "email") {
+    return "email";
+  }
+  if (property.format === "uri") {
+    return "url";
+  }
+  if (property.format === "date") {
+    return "date";
+  }
+  if (property.format === "date-time") {
+    return "datetime-local";
+  }
+  return "text";
 };
 
 function ElicitationField({
@@ -127,7 +168,11 @@ function ElicitationField({
           {label}
           {required ? " *" : ""}
         </span>
-        <select name={name} required={required} defaultValue="">
+        <select
+          name={name}
+          required={required}
+          defaultValue={typeof property.default === "boolean" ? String(property.default) : ""}
+        >
           {booleanElicitationChoices(required).map((choice) => (
             <option key={choice.value} value={choice.value} disabled={choice.disabled}>
               {choice.label}
@@ -147,7 +192,14 @@ function ElicitationField({
         {property.description && <p>{property.description}</p>}
         {choices.map((choice) => (
           <label className="form-check" key={choice.value}>
-            <input type="checkbox" name={name} value={choice.value} />
+            <input
+              type="checkbox"
+              name={name}
+              value={choice.value}
+              defaultChecked={
+                Array.isArray(property.default) && property.default.includes(choice.value)
+              }
+            />
             <span>{choice.label}</span>
           </label>
         ))}
@@ -162,7 +214,7 @@ function ElicitationField({
       </span>
       {property.description && <small>{property.description}</small>}
       {choices.length > 0 ? (
-        <select name={name} required={required} defaultValue="">
+        <select name={name} required={required} defaultValue={String(property.default ?? "")}>
           <option value="" disabled>
             Select…
           </option>
@@ -176,8 +228,18 @@ function ElicitationField({
         <input
           name={name}
           required={required}
-          type={property.type === "number" || property.type === "integer" ? "number" : "text"}
+          type={inputTypeFor(property)}
           step={property.type === "integer" ? "1" : undefined}
+          min={property.minimum}
+          max={property.maximum}
+          minLength={property.minLength}
+          maxLength={property.maxLength}
+          pattern={property.pattern}
+          defaultValue={
+            typeof property.default === "string" || typeof property.default === "number"
+              ? property.default
+              : undefined
+          }
         />
       )}
     </label>
@@ -191,6 +253,12 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
   const fields = Object.entries(elicitation?.properties ?? {});
   const required = useMemo(() => new Set(elicitation?.required ?? []), [elicitation?.required]);
   const availability = interactionAvailability(interaction, selectedSession?.ownerState);
+  const unsupported = fields
+    .map(([name, property]) => {
+      const reason = unsupportedFieldReason(property);
+      return reason ? `${property.title ?? name}: ${reason}` : undefined;
+    })
+    .find((reason) => reason !== undefined);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -235,16 +303,22 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
           {availability.reason}
         </p>
       )}
+      {unsupported && (
+        <p className="interaction-unavailable" role="alert">
+          This form cannot be answered safely here. {unsupported} Decline or cancel it instead.
+        </p>
+      )}
       {interaction.state === "pending" && (
         <form onSubmit={submit}>
-          {fields.map(([name, property]) => (
-            <ElicitationField
-              key={name}
-              name={name}
-              property={property}
-              required={required.has(name)}
-            />
-          ))}
+          {!unsupported &&
+            fields.map(([name, property]) => (
+              <ElicitationField
+                key={name}
+                name={name}
+                property={property}
+                required={required.has(name)}
+              />
+            ))}
           {error && (
             <p className="form-error" role="alert">
               {error}
@@ -254,7 +328,7 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
             <button
               type="submit"
               className="approve-button"
-              disabled={actionBusy || !availability.answerable}
+              disabled={actionBusy || !availability.answerable || unsupported !== undefined}
             >
               Accept
             </button>
@@ -394,6 +468,17 @@ export function Transcript() {
           </div>
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
+        {store.queuedPrompts.length > 0 && (
+          <section className="queued-prompts" aria-label="Queued follow-ups">
+            <strong>Queued follow-ups</strong>
+            {store.queuedPrompts.map((prompt) => (
+              <p key={prompt.id}>{prompt.text}</p>
+            ))}
+            <small>
+              Accepted by ACPX; they will appear in the transcript when execution starts.
+            </small>
+          </section>
+        )}
         <ThreadPrimitive.ScrollToBottom className="scroll-to-latest">
           Jump to latest
         </ThreadPrimitive.ScrollToBottom>
