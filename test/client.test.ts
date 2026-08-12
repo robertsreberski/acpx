@@ -1611,6 +1611,11 @@ test("AcpClient survives a host escalation callback that throws", async () => {
     // The escalation metadata still rides along on the response; only the
     // observer failed.
     assert.deepEqual(response?.outcome, { outcome: "selected", optionId: "reject" });
+    assert.equal(
+      (response?._meta as { acpx?: { permissionEscalation?: { action?: string } } } | undefined)
+        ?.acpx?.permissionEscalation?.action,
+      "escalate",
+    );
     assert.deepEqual(client.getPermissionStats(), {
       requested: 1,
       approved: 0,
