@@ -1,6 +1,7 @@
 import { randomInt } from "node:crypto";
 import fs from "node:fs/promises";
 import { isProcessAlive } from "../../process-liveness.js";
+import { getAcpxVersion } from "../../version.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
 
 export { isProcessAlive } from "../../process-liveness.js";
@@ -16,6 +17,26 @@ const PROCESS_SIGKILL_GRACE_MS = 1_500;
 const PROCESS_POLL_MS = 50;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
 
+/**
+ * Version of the queue owner IPC contract this build speaks.
+ *
+ * A queue owner is a long-lived process that outlives the CLI invocation that
+ * spawned it, so an upgrade leaves an owner from the previous build serving
+ * requests from the new one. Bump this whenever the two builds could disagree
+ * about what a message *means*, as opposed to merely failing to parse it —
+ * a parse failure is loud, a semantic disagreement is silent.
+ *
+ * 1: implicit for owners written before this field existed.
+ * 2: permission policies carry `defer` rules and permission_escalation events
+ *    carry action "defer". A v1 owner drops unknown rule lists, so a request
+ *    the user asked to park is instead settled by the permission mode.
+ */
+export const QUEUE_PROTOCOL_VERSION = 2;
+/** Owners whose lease predates the queueProtocol field. */
+export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
+/** First protocol version that understands `defer` permission policies. */
+export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
+
 export type QueueOwnerRecord = {
   pid: number;
   sessionId: string;
@@ -26,6 +47,8 @@ export type QueueOwnerRecord = {
   queueDepth: number;
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
+  queueProtocol?: number;
+  acpxVersion?: string;
 };
 
 export type QueueOwnerLease = {
@@ -37,6 +60,11 @@ export type QueueOwnerLease = {
   mcpConfigPath?: string;
   mcpConfigFingerprint?: string;
 };
+
+/** Protocol version an owner speaks, defaulting to the pre-field behavior. */
+export function queueOwnerProtocolVersion(owner: QueueOwnerRecord): number {
+  return owner.queueProtocol ?? LEGACY_QUEUE_PROTOCOL_VERSION;
+}
 
 export type QueueOwnerStatus = {
   pid: number;
@@ -66,10 +94,24 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     heartbeatAt: record.heartbeatAt,
     ownerGeneration: record.ownerGeneration,
     queueDepth: record.queueDepth,
+    ...parseQueueOwnerRecordMetadata(record),
+  };
+}
+
+/** Optional lease metadata; absent fields simply stay off the record. */
+function parseQueueOwnerRecordMetadata(
+  record: Record<string, unknown>,
+): Pick<
+  QueueOwnerRecord,
+  "mcpConfigPath" | "mcpConfigFingerprint" | "queueProtocol" | "acpxVersion"
+> {
+  return {
     ...(typeof record.mcpConfigPath === "string" ? { mcpConfigPath: record.mcpConfigPath } : {}),
     ...(typeof record.mcpConfigFingerprint === "string"
       ? { mcpConfigFingerprint: record.mcpConfigFingerprint }
       : {}),
+    ...(isPositiveInteger(record.queueProtocol) ? { queueProtocol: record.queueProtocol } : {}),
+    ...(typeof record.acpxVersion === "string" ? { acpxVersion: record.acpxVersion } : {}),
   };
 }
 
@@ -304,6 +346,8 @@ export async function tryAcquireQueueOwnerLease(
       heartbeatAt: createdAt,
       ownerGeneration,
       queueDepth: 0,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      acpxVersion: getAcpxVersion(),
       ...mcpConfigMetadata,
     },
     null,
@@ -412,6 +456,8 @@ export async function refreshQueueOwnerLease(
       heartbeatAt: nowIsoFactory(),
       ownerGeneration: lease.ownerGeneration,
       queueDepth: Math.max(0, Math.round(options.queueDepth)),
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      acpxVersion: getAcpxVersion(),
       ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
       ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
     },

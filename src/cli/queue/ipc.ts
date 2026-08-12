@@ -18,7 +18,9 @@ import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
+  QUEUE_PROTOCOL_DEFER_VERSION,
   type QueueOwnerRecord,
+  queueOwnerProtocolVersion,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
 } from "./lease-store.js";
@@ -690,6 +692,45 @@ function queueOwnerMcpConfigMatches(
   );
 }
 
+/**
+ * Policy features a pre-v2 queue owner parses without honoring. It drops rule
+ * lists it does not know, so a `defer` rule silently degrades into whatever the
+ * permission mode says — which for `--approve-all` means auto-approving the
+ * exact tool call the user asked to park.
+ */
+function permissionPolicyNeedsDeferSupport(policy: PermissionPolicy | undefined): boolean {
+  return (policy?.defer?.length ?? 0) > 0 || policy?.defaultAction === "defer";
+}
+
+/**
+ * Gate only requests that actually depend on v2 semantics. A warm owner from a
+ * previous build handles a policy without `defer` identically, and refusing
+ * those would break every reusable session on upgrade for no safety gain.
+ */
+function assertQueueOwnerUnderstandsPolicy(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  if (!permissionPolicyNeedsDeferSupport(options.permissionPolicy)) {
+    return;
+  }
+  const ownerProtocol = queueOwnerProtocolVersion(owner);
+  if (ownerProtocol >= QUEUE_PROTOCOL_DEFER_VERSION) {
+    return;
+  }
+
+  const ownerBuild = owner.acpxVersion ? ` (owner acpx ${owner.acpxVersion})` : "";
+  throw new QueueConnectionError(
+    `Session queue owner speaks queue protocol v${ownerProtocol}${ownerBuild} and would ignore ` +
+      "the defer rules in this permission policy; close the session so a new owner can start",
+    {
+      detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
 function assertQueueOwnerMcpConfigMatches(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
@@ -717,6 +758,7 @@ export async function trySubmitToRunningOwner(
   if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
     return undefined;
   }
+  assertQueueOwnerUnderstandsPolicy(owner, options);
   assertQueueOwnerMcpConfigMatches(owner, options);
 
   let submitted: SessionSendOutcome | undefined;

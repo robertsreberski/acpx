@@ -60,6 +60,8 @@ export async function writeQueueOwnerLock(options: {
   mcpConfigFingerprint?: string;
   createdAt?: string;
   heartbeatAt?: string;
+  queueProtocol?: number;
+  acpxVersion?: string;
 }): Promise<void> {
   const now = new Date().toISOString();
   const createdAt = options.createdAt ?? now;
@@ -80,6 +82,8 @@ export async function writeQueueOwnerLock(options: {
       ...(options.mcpConfigFingerprint
         ? { mcpConfigFingerprint: options.mcpConfigFingerprint }
         : {}),
+      ...(options.queueProtocol !== undefined ? { queueProtocol: options.queueProtocol } : {}),
+      ...(options.acpxVersion ? { acpxVersion: options.acpxVersion } : {}),
     })}\n`,
     "utf8",
   );
