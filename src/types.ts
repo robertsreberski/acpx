@@ -265,6 +265,20 @@ export type SessionEventLog = {
   last_write_error?: string | null;
 };
 
+export const SESSION_TIMELINE_SCHEMA = "acpx.session_timeline.v1" as const;
+
+/** Durable metadata for the lossless, append-only session timeline. */
+export type SessionTimelineMetadata = {
+  schema: typeof SESSION_TIMELINE_SCHEMA;
+  epoch: string;
+  last_seq: number;
+  active_path: string;
+  created_at: string;
+  last_write_at?: string;
+  /** True when events existed before the lossless timeline was enabled. */
+  legacy_retained: boolean;
+};
+
 export type PerfMetricSummary = {
   count: number;
   totalMs: number;
@@ -516,6 +530,7 @@ export type SessionRecord = {
   lastSeq: number;
   lastRequestId?: string;
   eventLog: SessionEventLog;
+  timeline?: SessionTimelineMetadata;
   closed?: boolean;
   closedAt?: string;
   pid?: number;

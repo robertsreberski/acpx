@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { AcpClient } from "../../acp/client.js";
 import {
   extractAcpError,
@@ -55,6 +56,11 @@ import {
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
+import {
+  captureAcpTimelineEvent,
+  type CapturedAcpTimelineEvent,
+  type SessionTimelineLifecycleEvent,
+} from "../../session/timeline.js";
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
@@ -80,6 +86,36 @@ import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
 
+function completedTurnLifecycle(stopReason: string): SessionTimelineLifecycleEvent {
+  return stopReason === "cancelled"
+    ? { type: "turn_cancelled" }
+    : { type: "turn_completed", stop_reason: stopReason };
+}
+
+function stableTurnId(requested: string | undefined): string {
+  return requested ?? randomUUID();
+}
+
+async function appendImplicitSubmittedTimeline(params: {
+  eventWriter: SessionEventWriter;
+  callerTurnId?: string;
+  turnId: string;
+  requestId?: string;
+  capturedAt: string;
+}): Promise<void> {
+  if (params.callerTurnId) {
+    return;
+  }
+  await params.eventWriter.appendLifecycleEvent(
+    { type: "turn_submitted" },
+    {
+      capturedAt: params.capturedAt,
+      turnId: params.turnId,
+      requestId: params.requestId,
+    },
+  );
+}
+
 type RunSessionPromptOptions = Omit<
   SessionSendOptions,
   "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
@@ -95,6 +131,8 @@ type RunSessionPromptOptions = Omit<
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
+  turnId?: string;
+  requestId?: string;
 };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
@@ -611,9 +649,10 @@ function registerPendingRequestSink(
   output: OutputFormatter,
   pendingMessages: AcpJsonRpcMessage[],
   markSideEffect: () => void,
+  captureMessage?: (message: AcpJsonRpcMessage) => void,
 ): void {
   options.onPendingRequestSink?.(
-    createPendingRequestSink({ output, pendingMessages, markSideEffect }),
+    createPendingRequestSink({ output, pendingMessages, markSideEffect, captureMessage }),
   );
 }
 
@@ -621,6 +660,7 @@ function createPendingRequestSink(params: {
   output: OutputFormatter;
   pendingMessages: AcpJsonRpcMessage[];
   markSideEffect: () => void;
+  captureMessage?: (message: AcpJsonRpcMessage) => void;
 }): (event: PendingRequestEvent) => void {
   return (event) => {
     params.markSideEffect();
@@ -629,6 +669,7 @@ function createPendingRequestSink(params: {
       request: pendingRequestForEventLog(event.request),
     });
     params.pendingMessages.push(notification);
+    params.captureMessage?.(notification);
     // Attached --format json clients see park/answer transitions live.
     params.output.onAcpMessage(notification);
   };
@@ -663,6 +704,8 @@ function buildQueuedTaskRunOptions(
     onPendingRequestSink: options.onPendingRequestSink,
     handleProcessInterrupts: options.handleProcessInterrupts,
     client: options.sharedClient,
+    turnId: task.requestId,
+    requestId: task.requestId,
   };
 }
 
@@ -764,7 +807,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const eventWriter = await measurePerf("session.events.open", async () => {
     return await SessionEventWriter.open(record);
   });
+  const turnId = stableTurnId(options.turnId);
+  const requestId = options.requestId;
+  await appendImplicitSubmittedTimeline({
+    eventWriter,
+    callerTurnId: options.turnId,
+    turnId,
+    requestId,
+    capturedAt: promptStartedAt,
+  });
   const pendingMessages: AcpJsonRpcMessage[] = [];
+  const pendingTimelineEvents: CapturedAcpTimelineEvent[] = [];
   const pendingConnectOutputMessages: BufferedAcpOutputMessage[] = [];
   const sessionOptions = mergeSessionOptions(
     options.sessionOptions,
@@ -775,6 +828,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let promptTurnHadSideEffects = false;
   const acpErrors = new AcpErrorTracker();
   let eventWriterClosed = false;
+  let turnLifecycleSettled = false;
+  const settleFailedTimeline = async (error: unknown): Promise<void> => {
+    if (turnLifecycleSettled) {
+      return;
+    }
+    await eventWriter
+      .appendLifecycleEvent(
+        { type: "turn_failed", message: formatErrorMessage(error) },
+        { turnId, requestId },
+      )
+      .catch(() => {
+        // Preserve the original turn failure if timeline persistence also fails.
+      });
+    turnLifecycleSettled = true;
+  };
 
   const closeEventWriter = async (checkpoint: boolean): Promise<void> => {
     if (eventWriterClosed) {
@@ -789,10 +857,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return;
     }
 
-    const batch = pendingMessages.splice(0);
+    const messageCount = pendingMessages.length;
+    const capturedCount = pendingTimelineEvents.length;
+    const captured = pendingTimelineEvents.slice(0, capturedCount);
     await measurePerf("session.events.flush_pending", async () => {
-      await eventWriter.appendMessages(batch, { checkpoint });
+      await eventWriter.appendCapturedMessages(captured, { checkpoint });
     });
+    pendingMessages.splice(0, messageCount);
+    pendingTimelineEvents.splice(0, capturedCount);
   };
   const preserveClosedState = async (): Promise<void> => {
     const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
@@ -859,6 +931,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   client.setEventHandlers({
     onAcpMessage: (direction, message) => {
       pendingMessages.push(message);
+      pendingTimelineEvents.push(captureAcpTimelineEvent(direction, message, { turnId }));
       options.onAcpMessage?.(direction, message);
     },
     onAcpOutputMessage: (direction, message) => {
@@ -889,14 +962,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     onPermissionEscalation: (event) => {
       // Also land it in the durable event log. The formatter is discarded for
       // --no-wait turns, so without this an escalation leaves no trace at all.
-      pendingMessages.push(acpxExtensionNotification("_acpx/permission_escalation", event));
+      const notification = acpxExtensionNotification("_acpx/permission_escalation", event);
+      pendingMessages.push(notification);
+      pendingTimelineEvents.push(captureAcpTimelineEvent("internal", notification, { turnId }));
       output.onPermissionEscalation(event);
       options.onPermissionEscalation?.(event);
     },
   });
-  registerPendingRequestSink(options, output, pendingMessages, () => {
-    promptTurnHadSideEffects = true;
-  });
+  registerPendingRequestSink(
+    options,
+    output,
+    pendingMessages,
+    () => {
+      promptTurnHadSideEffects = true;
+    },
+    (message) => {
+      pendingTimelineEvents.push(captureAcpTimelineEvent("internal", message, { turnId }));
+    },
+  );
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
   const activeController: ActiveSessionController = {
@@ -978,6 +1061,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             // is not in force is the durable log plus the live JSON stream.
             const notification = acpxExtensionNotification("_acpx/warning", warning);
             pendingMessages.push(notification);
+            pendingTimelineEvents.push(
+              captureAcpTimelineEvent("internal", notification, { turnId }),
+            );
             output.onAcpMessage(notification);
           },
         });
@@ -1064,6 +1150,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.lastUsedAt = isoNow();
     applyConversation(record, conversation);
     record.acpx = acpxState;
+    await eventWriter
+      .appendLifecycleEvent(
+        { type: "turn_failed", message: normalizedError.message },
+        { turnId, requestId },
+      )
+      .catch(() => {
+        // Preserve the original prompt failure if timeline persistence also fails.
+      });
+    turnLifecycleSettled = true;
     const propagated = error instanceof Error ? error : new Error(formatErrorMessage(error));
     attachAcpErrorPayload(propagated, normalizedError.acp);
     (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted =
@@ -1074,6 +1169,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const runPromptWithRetries = async (sessionId: string) => {
     promptTurnActive = true;
+    await eventWriter.appendLifecycleEvent({ type: "turn_started" }, { turnId, requestId });
     for (let attempt = 0; ; attempt++) {
       try {
         return await runPromptAttempt(sessionId, attempt);
@@ -1097,6 +1193,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     record.acpx = acpxState;
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    await eventWriter.appendLifecycleEvent(completedTurnLifecycle(response.stopReason), {
+      turnId,
+      requestId,
+    });
+    turnLifecycleSettled = true;
     stopTotalTimer();
     return response;
   };
@@ -1139,6 +1240,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while process is being interrupted
     });
+    await eventWriter
+      .appendLifecycleEvent({ type: "turn_interrupted" }, { turnId, requestId })
+      .catch(() => {
+        // best effort while process is being interrupted
+      });
+    turnLifecycleSettled = true;
     if (ownClient) {
       await client.close();
     }
@@ -1154,6 +1261,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const matchedAcpError = acpErrors.match(error);
     attachAcpErrorPayload(error, matchedAcpError);
     markOutputAlreadyEmitted(error, matchedAcpError !== undefined && shouldMarkAcpErrorsEmitted);
+    await settleFailedTimeline(error);
     throw error;
   } finally {
     if (options.verbose) {
@@ -1307,6 +1415,8 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
   return await runSessionPrompt({
     sessionRecordId: options.sessionId,
+    turnId: options.turnId,
+    requestId: options.turnId,
     prompt: options.prompt,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,

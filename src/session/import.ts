@@ -279,6 +279,9 @@ function buildImportedRecord(
     lastAgentExitAt: undefined,
     lastAgentDisconnectReason: undefined,
     eventLog,
+    // The imported record gets its own timeline epoch on first write. Reusing
+    // the source metadata would point at another record's append-only ledger.
+    timeline: undefined,
     importedFrom: {
       recordId: parsed.session.record_id,
       cwdOriginal: parsed.session.cwd_original ?? parsed.session.cwd_relative,

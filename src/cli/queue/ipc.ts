@@ -395,6 +395,8 @@ async function runQueueOwnerRequest<TResult>(options: {
 
 export type SubmitToQueueOwnerOptions = {
   sessionId: string;
+  /** Stable caller-owned turn id used for queue admission and durable attribution. */
+  turnId?: string;
   message: string;
   prompt?: PromptInput;
   mcpConfigPath?: string;
@@ -483,7 +485,7 @@ async function submitToQueueOwner(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
-  const requestId = randomUUID();
+  const requestId = options.turnId ?? randomUUID();
   const request: QueueSubmitRequest = {
     type: "submit_prompt",
     requestId,

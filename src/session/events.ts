@@ -12,9 +12,14 @@ import {
   sessionEventSegmentPath as segmentEventPath,
 } from "./event-log.js";
 import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
+import {
+  captureAcpTimelineEvent,
+  type CapturedAcpTimelineEvent,
+  type SessionTimelineLifecycleEvent,
+  SessionTimelineWriter,
+} from "./timeline.js";
 
 const LOCK_RETRY_MS = 15;
-const EVENT_LOCK_STALE_MS = 15_000;
 
 async function ensureSessionDir(): Promise<void> {
   await fs.mkdir(sessionBaseDir(), { recursive: true });
@@ -111,6 +116,10 @@ type EventLockPayload = {
   created_at?: string;
 };
 
+function lockOwnerIsAlive(pid: number | undefined): boolean {
+  return pid === process.pid || isProcessAlive(pid);
+}
+
 function parseEventLockPayload(raw: string): EventLockPayload {
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -131,12 +140,10 @@ async function removeStaleEventLock(lockPath: string): Promise<boolean> {
   try {
     const payload = await fs.readFile(lockPath, "utf8");
     const parsed = parseEventLockPayload(payload);
-    const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
-    const lockAgeMs = Number.isFinite(createdAtMs)
-      ? Date.now() - createdAtMs
-      : Number.POSITIVE_INFINITY;
-    const pidAlive = isProcessAlive(parsed.pid);
-    if (pidAlive && lockAgeMs <= EVENT_LOCK_STALE_MS) {
+    const pidAlive = lockOwnerIsAlive(parsed.pid);
+    // A turn may legitimately hold this lock for hours while awaiting a human.
+    // Age never makes a lock stale while its owning process is alive.
+    if (pidAlive) {
       return false;
     }
     await fs.unlink(lockPath);
@@ -196,6 +203,8 @@ async function releaseEventsLock(lock: LockHandle): Promise<void> {
 type SessionEventWriterOptions = {
   maxSegmentBytes?: number;
   maxSegments?: number;
+  /** Test-only fault injection after the authoritative timeline append. */
+  afterTimelineAppend?: () => void | Promise<void>;
 };
 
 type AppendOptions = {
@@ -207,6 +216,8 @@ export class SessionEventWriter {
   private readonly lock: LockHandle;
   private readonly maxSegmentBytes: number;
   private readonly maxSegments: number;
+  private readonly timelineWriter: SessionTimelineWriter;
+  private readonly afterTimelineAppend?: () => void | Promise<void>;
   private activePath: string;
   private activeSizeBytes: number;
   private segmentCount: number;
@@ -216,6 +227,7 @@ export class SessionEventWriter {
     record: SessionRecord,
     lock: LockHandle,
     options: Required<SessionEventWriterOptions>,
+    timelineWriter: SessionTimelineWriter,
     state: {
       activePath: string;
       activeSizeBytes: number;
@@ -226,6 +238,8 @@ export class SessionEventWriter {
     this.lock = lock;
     this.maxSegmentBytes = options.maxSegmentBytes;
     this.maxSegments = options.maxSegments;
+    this.timelineWriter = timelineWriter;
+    this.afterTimelineAppend = options.afterTimelineAppend;
     this.activePath = state.activePath;
     this.activeSizeBytes = state.activeSizeBytes;
     this.segmentCount = state.segmentCount;
@@ -236,28 +250,36 @@ export class SessionEventWriter {
     options: SessionEventWriterOptions = {},
   ): Promise<SessionEventWriter> {
     const lock = await acquireEventsLock(record.acpxRecordId);
-    const maxSegmentBytes =
-      options.maxSegmentBytes ??
-      record.eventLog.max_segment_bytes ??
-      DEFAULT_EVENT_SEGMENT_MAX_BYTES;
-    const maxSegments =
-      options.maxSegments ?? record.eventLog.max_segments ?? DEFAULT_EVENT_MAX_SEGMENTS;
-    const activePath = activeEventPath(record.acpxRecordId);
-    const activeSizeBytes = await statSize(activePath);
-    const segmentCount = await resolveInitialSegmentCount(record, maxSegments);
-    return new SessionEventWriter(
-      record,
-      lock,
-      {
-        maxSegmentBytes,
-        maxSegments,
-      },
-      {
-        activePath,
-        activeSizeBytes,
-        segmentCount,
-      },
-    );
+    try {
+      const timelineWriter = await SessionTimelineWriter.open(record);
+      const maxSegmentBytes =
+        options.maxSegmentBytes ??
+        record.eventLog.max_segment_bytes ??
+        DEFAULT_EVENT_SEGMENT_MAX_BYTES;
+      const maxSegments =
+        options.maxSegments ?? record.eventLog.max_segments ?? DEFAULT_EVENT_MAX_SEGMENTS;
+      const activePath = activeEventPath(record.acpxRecordId);
+      const activeSizeBytes = await statSize(activePath);
+      const segmentCount = await resolveInitialSegmentCount(record, maxSegments);
+      return new SessionEventWriter(
+        record,
+        lock,
+        {
+          maxSegmentBytes,
+          maxSegments,
+          afterTimelineAppend: options.afterTimelineAppend ?? (() => {}),
+        },
+        timelineWriter,
+        {
+          activePath,
+          activeSizeBytes,
+          segmentCount,
+        },
+      );
+    } catch (error) {
+      await releaseEventsLock(lock);
+      throw error;
+    }
   }
 
   getRecord(): SessionRecord {
@@ -269,58 +291,93 @@ export class SessionEventWriter {
   }
 
   async appendMessages(messages: AcpJsonRpcMessage[], options: AppendOptions = {}): Promise<void> {
+    const captured = messages.map((message) => captureAcpTimelineEvent("internal", message));
+    await this.appendCapturedMessages(captured, options);
+  }
+
+  async appendCapturedMessages(
+    captured: CapturedAcpTimelineEvent[],
+    options: AppendOptions = {},
+  ): Promise<void> {
     if (this.closed) {
       throw new Error("SessionEventWriter is closed");
     }
 
-    if (messages.length === 0) {
+    if (captured.length === 0) {
       return;
     }
 
     await ensureSessionDir();
 
     await measurePerf("session.events.append_batch", async () => {
-      for (const message of messages) {
-        if (!isAcpJsonRpcMessage(message)) {
-          throw new Error("Attempted to persist invalid ACP JSON-RPC payload");
-        }
-
-        const line = `${JSON.stringify(message)}\n`;
-        const lineBytes = Buffer.byteLength(line);
-        if (this.activeSizeBytes > 0 && this.activeSizeBytes + lineBytes > this.maxSegmentBytes) {
-          await rotateSegments(this.record.acpxRecordId, this.maxSegments);
-          this.activePath = activeEventPath(this.record.acpxRecordId);
-          this.activeSizeBytes = 0;
-          this.segmentCount = Math.min(this.segmentCount + 1, this.maxSegments);
-          incrementPerfCounter("session.events.rotate");
-        }
-
-        await fs.appendFile(this.activePath, line, "utf8");
-        this.activeSizeBytes += lineBytes;
-
-        this.record.lastSeq += 1;
-        if (Object.hasOwn(message, "id")) {
-          const id = (message as { id?: unknown }).id;
-          if (typeof id === "string" || typeof id === "number") {
-            this.record.lastRequestId = String(id);
-          }
-        }
-        const writeTs = new Date().toISOString();
-        this.record.lastUsedAt = writeTs;
-        this.record.eventLog = {
-          active_path: this.activePath,
-          segment_count: this.segmentCount,
-          max_segment_bytes: this.maxSegmentBytes,
-          max_segments: this.maxSegments,
-          last_write_at: writeTs,
-          last_write_error: null,
-        };
+      for (const event of captured) {
+        await this.appendCapturedMessage(event);
       }
     });
 
     if (options.checkpoint === true) {
       await writeSessionRecord(this.record);
     }
+  }
+
+  private async appendCapturedMessage(event: CapturedAcpTimelineEvent): Promise<void> {
+    const message = event.message;
+    if (!isAcpJsonRpcMessage(message)) {
+      throw new Error("Attempted to persist invalid ACP JSON-RPC payload");
+    }
+    await this.timelineWriter.appendAcpEvents([event]);
+    try {
+      await this.afterTimelineAppend?.();
+      const line = `${JSON.stringify(message)}\n`;
+      await this.rotateCompatibilityStreamIfNeeded(Buffer.byteLength(line));
+      await fs.appendFile(this.activePath, line, "utf8");
+      this.activeSizeBytes += Buffer.byteLength(line);
+      this.updateCompatibilityMetadata(message);
+    } catch (error) {
+      this.record.eventLog.last_write_error =
+        error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private async rotateCompatibilityStreamIfNeeded(lineBytes: number): Promise<void> {
+    if (this.activeSizeBytes === 0 || this.activeSizeBytes + lineBytes <= this.maxSegmentBytes) {
+      return;
+    }
+    await rotateSegments(this.record.acpxRecordId, this.maxSegments);
+    this.activePath = activeEventPath(this.record.acpxRecordId);
+    this.activeSizeBytes = 0;
+    this.segmentCount = Math.min(this.segmentCount + 1, this.maxSegments);
+    incrementPerfCounter("session.events.rotate");
+  }
+
+  private updateCompatibilityMetadata(message: AcpJsonRpcMessage): void {
+    this.record.lastSeq += 1;
+    if (Object.hasOwn(message, "id")) {
+      const id = (message as { id?: unknown }).id;
+      if (typeof id === "string" || typeof id === "number") {
+        this.record.lastRequestId = String(id);
+      }
+    }
+    const writeTs = new Date().toISOString();
+    this.record.lastUsedAt = writeTs;
+    this.record.eventLog = {
+      active_path: this.activePath,
+      segment_count: this.segmentCount,
+      max_segment_bytes: this.maxSegmentBytes,
+      max_segments: this.maxSegments,
+      last_write_at: writeTs,
+      last_write_error: null,
+    };
+  }
+
+  async appendLifecycleEvent(
+    event: SessionTimelineLifecycleEvent,
+    association: { capturedAt?: string; turnId?: string; requestId?: string } = {},
+  ): Promise<void> {
+    if (this.closed) {
+      throw new Error("SessionEventWriter is closed");
+    }
+    await this.timelineWriter.appendLifecycleEvent(event, association);
   }
 
   async checkpoint(): Promise<void> {
@@ -341,7 +398,11 @@ export class SessionEventWriter {
       }
     } finally {
       this.closed = true;
-      await releaseEventsLock(this.lock);
+      try {
+        await this.timelineWriter.close();
+      } finally {
+        await releaseEventsLock(this.lock);
+      }
     }
   }
 }
@@ -380,3 +441,5 @@ export async function listSessionEvents(sessionId: string): Promise<AcpJsonRpcMe
 
   return events;
 }
+
+export const sessionEventTestInternals = { removeStaleEventLock };

@@ -84,6 +84,8 @@ export type SessionCreateOptions = {
 
 export type SessionSendOptions = {
   sessionId: string;
+  /** Stable caller-owned turn id, also used as the queue admission request id. */
+  turnId?: string;
   prompt: PromptInput;
   resumePolicy?: SessionResumePolicy;
   mcpServers?: McpServer[];

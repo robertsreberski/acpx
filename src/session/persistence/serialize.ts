@@ -22,6 +22,7 @@ export function serializeSessionRecordForDisk(record: SessionRecord): Record<str
     last_seq: canonical.lastSeq,
     last_request_id: canonical.lastRequestId,
     event_log: canonical.eventLog,
+    timeline: canonical.timeline,
     closed: canonical.closed,
     closed_at: canonical.closedAt,
     pid: canonical.pid,

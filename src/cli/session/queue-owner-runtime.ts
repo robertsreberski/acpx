@@ -67,6 +67,7 @@ async function submitToRunningOwner(
 ): Promise<SessionSendOutcome | undefined> {
   return await trySubmitToRunningOwner({
     sessionId: options.sessionId,
+    turnId: options.turnId,
     message: promptToDisplayText(options.prompt),
     prompt: options.prompt,
     mcpConfigPath: options.mcpConfigPath,

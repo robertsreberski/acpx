@@ -7,6 +7,7 @@ import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
 import { deletePendingRequestsForSession } from "../pending-requests.js";
+import { deleteSessionTimeline } from "../timeline.js";
 import { createAtomicWriteTempPath } from "./atomic-write.js";
 import {
   loadOrRebuildSessionIndex,
@@ -419,6 +420,7 @@ async function pruneSessionFiles(
     for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
     }
+    bytesFreed += await deleteSessionTimeline(record.acpxRecordId);
   }
   // Parked requests belong to the record; leaving them would strand entries
   // nothing can ever answer.

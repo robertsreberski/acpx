@@ -2,10 +2,12 @@ import { resolveAgentArgvForCommand } from "../../acp/builtin-command-migration.
 import type {
   SessionAcpxState,
   SessionEventLog,
+  SessionTimelineMetadata,
   SessionRecord,
   SessionConversation,
 } from "../../types.js";
 import { SESSION_RECORD_SCHEMA } from "../../types.js";
+import { SESSION_TIMELINE_SCHEMA } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
 
@@ -601,6 +603,58 @@ function parseEventLog(raw: unknown, sessionId: string): SessionEventLog {
   };
 }
 
+function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  const record = asRecord(raw);
+  if (!record || !hasValidTimelineCore(record)) {
+    return null;
+  }
+  return {
+    schema: SESSION_TIMELINE_SCHEMA,
+    epoch: record.epoch,
+    last_seq: record.last_seq,
+    active_path: record.active_path,
+    created_at: record.created_at,
+    last_write_at: typeof record.last_write_at === "string" ? record.last_write_at : undefined,
+    legacy_retained: record.legacy_retained,
+  };
+}
+
+function hasValidTimelineCore(record: Record<string, unknown>): record is Record<
+  string,
+  unknown
+> & {
+  epoch: string;
+  last_seq: number;
+  active_path: string;
+  created_at: string;
+  legacy_retained: boolean;
+} {
+  return [
+    record.schema === SESSION_TIMELINE_SCHEMA,
+    isNonEmptyString(record.epoch),
+    isNonNegativeInteger(record.last_seq),
+    typeof record.active_path === "string",
+    typeof record.created_at === "string",
+    typeof record.legacy_retained === "boolean",
+    isUndefinedOrString(record.last_write_at),
+  ].every(Boolean);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isUndefinedOrString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
 function hasValidEventLogCore(record: Record<string, unknown>): record is Record<
   string,
   unknown
@@ -771,10 +825,11 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   }
 
   const eventLog = parseEventLog(record.event_log, record.acpx_record_id);
-  const metadata = parseSessionRecordMetadata(record);
-  if (!metadata) {
+  const persistedMetadata = parsePersistedRecordMetadata(record);
+  if (!persistedMetadata) {
     return null;
   }
+  const { metadata, timeline } = persistedMetadata;
 
   return {
     schema: SESSION_RECORD_SCHEMA,
@@ -790,6 +845,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     lastSeq: record.last_seq,
     lastRequestId: metadata.lastRequestId,
     eventLog,
+    timeline,
     closed: optionals.closed,
     closedAt: optionals.closedAt,
     pid: optionals.pid,
@@ -811,6 +867,21 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     acpx: parseAcpxState(record.acpx),
     importedFrom: metadata.importedFrom,
   };
+}
+
+function parsePersistedRecordMetadata(record: Record<string, unknown>): {
+  metadata: NonNullable<ReturnType<typeof parseSessionRecordMetadata>>;
+  timeline: SessionTimelineMetadata | undefined;
+} | null {
+  const timeline = parseTimeline(record.timeline);
+  if (timeline === null) {
+    return null;
+  }
+  const metadata = parseSessionRecordMetadata(record);
+  if (!metadata) {
+    return null;
+  }
+  return { metadata, timeline };
 }
 
 function hasValidSessionRecordCore(record: Record<string, unknown>): record is Record<
