@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   ensureOwnerIsUsable,
   isProcessAlive,
+  readLiveQueueOwner,
   readQueueOwnerRecord,
   readQueueOwnerStatus,
   refreshQueueOwnerLease,
@@ -366,3 +367,66 @@ test("terminateProcess waits long enough for a process that delays 2s before exi
     }
   }
 });
+
+test("readLiveQueueOwner reports a live owner without retiring it", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "owner-alive-but-stale";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    try {
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: keeper.pid,
+        sessionId,
+        socketPath,
+        ownerGeneration: 4242,
+        // Older than the staleness window: a busy or suspended owner looks
+        // exactly like this, and it is alive.
+        heartbeatAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      });
+
+      const owner = await readLiveQueueOwner(sessionId);
+      assert.equal(owner?.ownerGeneration, 4242);
+      // The mutating read is what inspection paths must not use: it kills the
+      // process and deletes its lease.
+      assert.equal(keeper.exitCode, null);
+      assert.equal(await fs.stat(lockPath).then(() => true), true);
+
+      assert.equal(await readQueueOwnerStatus(sessionId), undefined);
+      assert.equal(await waitForExit(keeper), true);
+      assert.equal(
+        await fs.stat(lockPath).then(
+          () => true,
+          () => false,
+        ),
+        false,
+      );
+    } finally {
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("readLiveQueueOwner treats a dead pid as no owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "owner-dead-pid";
+    const keeper = await startKeeperProcess();
+    const pid = keeper.pid;
+    stopProcess(keeper);
+    await waitForExit(keeper);
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({ lockPath, pid, sessionId, socketPath, ownerGeneration: 7 });
+
+    assert.equal(await readLiveQueueOwner(sessionId), undefined);
+  });
+});
+
+async function waitForExit(child: ReturnType<typeof spawn>): Promise<boolean> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}

@@ -333,6 +333,24 @@ export async function ensureOwnerIsUsable(
   return false;
 }
 
+/**
+ * The recorded owner for a session, if its process is still alive.
+ *
+ * Non-mutating counterpart to `readQueueOwnerStatus`: it never retires, kills,
+ * or cleans anything up, so a read-only caller cannot destroy a live owner as a
+ * side effect of looking at it.
+ *
+ * Heartbeat staleness is deliberately not considered. A stale heartbeat is a
+ * symptom — a suspended process, a laptop that slept, an event loop under load
+ * — not proof of death, and inspection paths must not act on a symptom. Only
+ * paths that are about to take the session over (acquiring the lease, or
+ * submitting work) may escalate a stale heartbeat into retirement.
+ */
+export async function readLiveQueueOwner(sessionId: string): Promise<QueueOwnerRecord | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
+  return owner && isProcessAlive(owner.pid) ? owner : undefined;
+}
+
 export async function readQueueOwnerStatus(
   sessionId: string,
 ): Promise<QueueOwnerStatus | undefined> {
