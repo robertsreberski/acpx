@@ -5910,6 +5910,7 @@ type ParkedRequestFixture = {
  */
 async function withParkedRequest(
   run: (fixture: ParkedRequestFixture) => Promise<void>,
+  parkPrompt = "permission execute Bash",
 ): Promise<void> {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -5920,7 +5921,7 @@ async function withParkedRequest(
       const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
         .acpxRecordId;
 
-      await parkPermissionRequest(homeDir, deferArgs);
+      await parkPermissionRequest(homeDir, deferArgs, parkPrompt);
       await run({ homeDir, cwd, deferArgs, sessionId });
     } finally {
       await runCli([...deferArgs, "--format", "json", "sessions", "close"], homeDir).catch(
@@ -5931,7 +5932,11 @@ async function withParkedRequest(
   });
 }
 
-async function parkPermissionRequest(homeDir: string, deferArgs: string[]): Promise<void> {
+async function parkPermissionRequest(
+  homeDir: string,
+  deferArgs: string[],
+  parkPrompt: string,
+): Promise<void> {
   const submitted = await runCli(
     [
       ...deferArgs,
@@ -5943,7 +5948,7 @@ async function parkPermissionRequest(homeDir: string, deferArgs: string[]): Prom
       "60",
       "prompt",
       "--no-wait",
-      "permission execute Bash",
+      parkPrompt,
     ],
     homeDir,
     { timeoutMs: 30_000 },
@@ -6197,6 +6202,36 @@ test("integration: requests list surfaces a park whose durable record is missing
     );
     assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
   });
+});
+
+test("integration: respond --decline is refused when the agent offered no rejection", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs }) => {
+    const listed = await listRequestsJson(homeDir, deferArgs);
+    assert.deepEqual(listed[0]?.options, [
+      { option_id: "allow", name: "Allow", kind: "allow_once" },
+    ]);
+    const requestId = String(listed[0]?.request_id);
+
+    const declined = await runCli([...deferArgs, "respond", requestId, "--decline"], homeDir, {
+      timeoutMs: 30_000,
+    });
+    // Turning this into a cancel would report an outcome the agent never
+    // offered, so it is refused and the responder is told what it can send.
+    assert.equal(declined.code, 2, `${declined.stdout}${declined.stderr}`);
+    assert.match(
+      `${declined.stdout}${declined.stderr}`,
+      /offers no rejection option to decline with.*offered: allow/s,
+    );
+    assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+
+    const cancelled = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--cancel"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(cancelled.code, 0, `${cancelled.stdout}${cancelled.stderr}`);
+    assert.equal((JSON.parse(cancelled.stdout.trim()) as { state: string }).state, "cancelled");
+  }, 'permission-options [{"optionId":"allow","name":"Allow","kind":"allow_once"}] Bash');
 });
 
 test("integration: inspecting a session never retires a live queue owner", async () => {

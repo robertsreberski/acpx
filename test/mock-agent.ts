@@ -1307,6 +1307,35 @@ class MockAgent implements Agent {
       return `wrote ${filePath}`;
     }
 
+    // Lets a test drive an agent whose option list is not the usual
+    // allow/reject pair — a request with no rejection option, say.
+    if (text.startsWith("permission-options ")) {
+      const rest = text.slice("permission-options ".length).trim();
+      const firstSpace = rest.search(/\s/);
+
+      if (firstSpace <= 0) {
+        throw new Error("Usage: permission-options <options-json> <title>");
+      }
+
+      const options = JSON.parse(
+        rest.slice(0, firstSpace).trim(),
+      ) as RequestPermissionRequest["options"];
+      const response = await this.connection.requestPermission({
+        sessionId,
+        toolCall: {
+          toolCallId: randomUUID(),
+          title: rest.slice(firstSpace + 1).trim(),
+          kind: "execute",
+        },
+        options,
+      });
+
+      if (response.outcome.outcome === "selected") {
+        return `permission selected:${response.outcome.optionId}`;
+      }
+      return "permission cancelled";
+    }
+
     if (text.startsWith("permission ")) {
       const rest = text.slice("permission ".length).trim();
       const firstSpace = rest.search(/\s/);
