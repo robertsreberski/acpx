@@ -1841,8 +1841,20 @@ export class AcpClient {
   private emitPermissionEscalation(
     escalation: Parameters<NonNullable<AcpClientOptions["onPermissionEscalation"]>>[0] | undefined,
   ): void {
-    if (escalation) {
+    if (!escalation) {
+      return;
+    }
+    try {
       this.eventHandlers.onPermissionEscalation?.(escalation);
+    } catch (error) {
+      // Report-only channel, and the decision is already resolved. A host
+      // observer failing must not rewrite that decision or turn the request
+      // into a JSON-RPC error for the agent.
+      this.log(
+        `onPermissionEscalation threw, keeping the resolved decision: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

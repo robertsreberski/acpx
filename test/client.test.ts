@@ -21,6 +21,7 @@ import {
   UnsupportedPromptContentError,
 } from "../src/errors.js";
 import type { PermissionMode, PermissionPolicy, ReadonlyPermissionPolicy } from "../src/types.js";
+import { withTtyState } from "./tty-test-helpers.js";
 
 test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
   for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
@@ -50,6 +51,7 @@ type ClientInternals = {
   handlePermissionRequest?: (
     params: RequestPermissionRequest,
   ) => Promise<RequestPermissionResponse>;
+  log?: (message: string) => void;
   handleReadTextFile?: (params: {
     sessionId: string;
     path: string;
@@ -1581,3 +1583,44 @@ function restoreDescriptor(
     delete (target as Record<string, unknown>)[key];
   }
 }
+
+test("AcpClient survives a host escalation callback that throws", async () => {
+  await withTtyState({ stdin: false, stderr: false }, async () => {
+    const logs: string[] = [];
+    let calls = 0;
+    const client = makeClient({
+      permissionMode: "approve-all",
+      permissionPolicy: { escalate: ["execute"] },
+      verbose: true,
+      onPermissionEscalation: () => {
+        calls += 1;
+        throw new Error("review queue is full");
+      },
+    });
+    asInternals(client).log = (message: string) => {
+      logs.push(message);
+    };
+
+    // The decision was already resolved before the observer ran, so a failing
+    // observer must not change it or turn the request into a JSON-RPC error.
+    const response = await asInternals(client).handlePermissionRequest?.(
+      makePermissionRequest("session-escalation-throw", "execute"),
+    );
+
+    assert.equal(calls, 1);
+    // The escalation metadata still rides along on the response; only the
+    // observer failed.
+    assert.deepEqual(response?.outcome, { outcome: "selected", optionId: "reject" });
+    assert.deepEqual(client.getPermissionStats(), {
+      requested: 1,
+      approved: 0,
+      denied: 1,
+      cancelled: 0,
+    });
+    assert.equal(
+      logs.some((line) => line.includes("onPermissionEscalation threw")),
+      true,
+      `expected a logged escalation-callback failure, got: ${JSON.stringify(logs)}`,
+    );
+  });
+});
