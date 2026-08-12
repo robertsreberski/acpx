@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { tryListRequestsOnRunningOwner, tryRespondOnRunningOwner } from "../src/cli/queue/ipc.js";
+import { PendingRequestAnswerTimeoutError } from "../src/errors.js";
 import {
   cleanupOwnerArtifacts,
   closeServer,
@@ -216,6 +217,76 @@ test("the parked-request client verbs report no owner rather than an empty resul
         answer: { type: "cancel" },
       }),
       undefined,
+    );
+  });
+});
+
+/**
+ * A live lease whose socket refuses every connect: the owner process is alive,
+ * so the caller gets past the liveness read, and then every connect attempt
+ * fails with a retryable error. This is what a wedged owner looks like from the
+ * outside — a suspended process whose listen backlog has filled up refuses
+ * connects exactly this way.
+ */
+async function withUnreachableOwner(
+  run: (context: { sessionId: string }) => Promise<void>,
+): Promise<void> {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "unreachable-owner";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath });
+    try {
+      await run({ sessionId });
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+}
+
+test("an asked-for respond bound covers connecting, not just the reply", async () => {
+  await withUnreachableOwner(async ({ sessionId }) => {
+    const started = Date.now();
+    await assert.rejects(
+      async () =>
+        await tryRespondOnRunningOwner({
+          sessionId,
+          pendingRequestId: "pending-1",
+          answer: { type: "cancel" },
+          responseTimeoutMs: 200,
+        }),
+      (error: unknown) => {
+        // Exit 3 with its own detail code is the whole point of the bound: a
+        // caller has to be able to tell "I stopped waiting" from "delivery
+        // failed". A connect that outruns the budget must not degrade it.
+        assert.equal(error instanceof PendingRequestAnswerTimeoutError, true, String(error));
+        return true;
+      },
+    );
+    const elapsedMs = Date.now() - started;
+    // The unbounded connect loop is 40 attempts x 50 ms = ~2 s, so anything at
+    // or past that is the bound being armed only after the socket is up.
+    assert.equal(elapsedMs < 1_500, true, `respond took ${elapsedMs}ms against a 200ms bound`);
+  });
+});
+
+test("an unbounded respond still reports an unreachable owner instead of a timeout", async () => {
+  await withUnreachableOwner(async ({ sessionId }) => {
+    // The budget is opt-in. Without one, exhausting the connect retries still
+    // means "could not reach the owner", which is a different answer than
+    // "you told me to stop waiting" and keeps its own exit code.
+    await assert.rejects(
+      async () =>
+        await tryRespondOnRunningOwner({
+          sessionId,
+          pendingRequestId: "pending-1",
+          answer: { type: "cancel" },
+        }),
+      (error: unknown) => {
+        assert.equal(error instanceof PendingRequestAnswerTimeoutError, false, String(error));
+        return true;
+      },
     );
   });
 });

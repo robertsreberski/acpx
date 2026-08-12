@@ -24,7 +24,7 @@ import {
   probeQueueOwnerHealth,
   type QueueOwnerHealth,
 } from "./ipc-health.js";
-import { connectToQueueOwner } from "./ipc-transport.js";
+import { connectToQueueOwner, type QueueRequestBudget } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
   QUEUE_PROTOCOL_DEFER_VERSION,
@@ -215,11 +215,51 @@ function parseQueueOwnerResponseLine(
   return message;
 }
 
+function queueTimeoutError(timeoutMs: number, phase: "connect" | "reply"): QueueConnectionError {
+  // Separate detail codes because the two phases make different promises about
+  // the request: nothing was written in the connect phase, so the caller can
+  // retry knowing the owner never saw it.
+  return phase === "connect"
+    ? new QueueConnectionError(`Queue owner could not be reached within ${timeoutMs}ms`, {
+        detailCode: "QUEUE_CONNECT_TIMEOUT",
+        origin: "queue",
+        retryable: true,
+      })
+    : new QueueConnectionError(`Queue owner did not respond within ${timeoutMs}ms`, {
+        detailCode: "QUEUE_RESPONSE_TIMEOUT",
+        origin: "queue",
+        retryable: true,
+      });
+}
+
+type QueueOwnerRequestBudget = QueueRequestBudget & {
+  /** The error to raise when the budget runs out waiting for the reply. */
+  replyExpired: () => Error;
+};
+
+/**
+ * One deadline for connecting and for waiting, taken when the request starts.
+ *
+ * The bound used to be armed only once the socket was up, which left the
+ * connect retry loop — 40 attempts, each up to 5 s — entirely outside it. An
+ * owner that cannot be connected to at all is precisely the owner a caller
+ * asked to be protected from.
+ */
+function createQueueOwnerRequestBudget(timeoutMs: number): QueueOwnerRequestBudget {
+  const deadline = Date.now() + timeoutMs;
+  return {
+    remainingMs: () => deadline - Date.now(),
+    expired: () => queueTimeoutError(timeoutMs, "connect"),
+    replyExpired: () => queueTimeoutError(timeoutMs, "reply"),
+  };
+}
+
 async function runQueueOwnerRequest<TResult>(options: {
   owner: QueueOwnerRecord;
   request: QueueRequest;
   /**
-   * Give up waiting for the owner's reply after this long. Only for requests
+   * Give up on the owner after this long, counted from the start of the request
+   * and covering both connecting and waiting for the reply. Only for requests
    * whose caller must stay responsive: a connected but suspended owner never
    * answers, and the socket stays open, so nothing else ends the wait.
    */
@@ -228,7 +268,11 @@ async function runQueueOwnerRequest<TResult>(options: {
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
 }): Promise<TResult | undefined> {
-  const socket = await connectToQueueOwner(options.owner);
+  const budget =
+    options.responseTimeoutMs === undefined
+      ? undefined
+      : createQueueOwnerRequestBudget(options.responseTimeoutMs);
+  const socket = await connectToQueueOwner(options.owner, undefined, budget);
   if (!socket) {
     return undefined;
   }
@@ -276,19 +320,15 @@ async function runQueueOwnerRequest<TResult>(options: {
       reject(error);
     };
 
-    if (options.responseTimeoutMs !== undefined) {
-      responseTimer = setTimeout(() => {
-        finishReject(
-          new QueueConnectionError(
-            `Queue owner did not respond within ${options.responseTimeoutMs}ms`,
-            {
-              detailCode: "QUEUE_RESPONSE_TIMEOUT",
-              origin: "queue",
-              retryable: true,
-            },
-          ),
-        );
-      }, options.responseTimeoutMs);
+    if (budget) {
+      // What is left of the one budget, not a fresh copy of it: time spent
+      // connecting is time the caller already spent waiting.
+      responseTimer = setTimeout(
+        () => {
+          finishReject(budget.replyExpired());
+        },
+        Math.max(0, budget.remainingMs()),
+      );
       responseTimer.unref?.();
     }
 
@@ -1121,35 +1161,58 @@ export async function tryListRequestsOnRunningOwner(options: {
 }
 
 /**
- * Wait for the owner's reply, turning an asked-for bound into its own error.
+ * Give up on the owner after the asked-for bound, turning it into its own error.
  *
  * A generic queue timeout would report as a runtime failure, which is the one
- * thing this is not: the answer was delivered and may still be applied, so the
- * caller has to be able to tell the two apart.
+ * thing this is not: giving up is a decision the caller asked for, so it keeps
+ * its own exit code whichever phase ran out of budget. The two phases say
+ * different things about the answer, though, and only the owner-side one leaves
+ * it in flight — so the message distinguishes them even though the error does
+ * not.
  */
+function pendingRequestAnswerTimeout(
+  error: QueueConnectionError,
+  options: { pendingRequestId: string; responseTimeoutMs: number },
+): PendingRequestAnswerTimeoutError {
+  if (error.detailCode === "QUEUE_CONNECT_TIMEOUT") {
+    return new PendingRequestAnswerTimeoutError(
+      `Queue owner could not be reached within ${options.responseTimeoutMs}ms; the answer to ` +
+        `request ${options.pendingRequestId} was not delivered`,
+    );
+  }
+  return new PendingRequestAnswerTimeoutError(
+    `Queue owner did not confirm the answer to request ${options.pendingRequestId} within ` +
+      `${options.responseTimeoutMs}ms; it may still be applied`,
+  );
+}
+
+function isQueueBudgetTimeout(error: unknown): error is QueueConnectionError {
+  return (
+    error instanceof QueueConnectionError &&
+    (error.detailCode === "QUEUE_RESPONSE_TIMEOUT" || error.detailCode === "QUEUE_CONNECT_TIMEOUT")
+  );
+}
+
 async function submitRespondRequest(
   owner: QueueOwnerRecord,
   request: QueueRespondRequest,
   options: { pendingRequestId: string; responseTimeoutMs?: number },
 ): Promise<QueueOwnerRespondResultMessage | undefined> {
+  const responseTimeoutMs = options.responseTimeoutMs;
   try {
     return await submitControlToQueueOwner(
       owner,
       request,
       (message): message is QueueOwnerRespondResultMessage =>
         message.type === "respond_request_result",
-      options.responseTimeoutMs,
+      responseTimeoutMs,
     );
   } catch (error) {
-    if (
-      error instanceof QueueConnectionError &&
-      error.detailCode === "QUEUE_RESPONSE_TIMEOUT" &&
-      options.responseTimeoutMs !== undefined
-    ) {
-      throw new PendingRequestAnswerTimeoutError(
-        `Queue owner did not confirm the answer to request ${options.pendingRequestId} within ` +
-          `${options.responseTimeoutMs}ms; it may still be applied`,
-      );
+    if (isQueueBudgetTimeout(error) && responseTimeoutMs !== undefined) {
+      throw pendingRequestAnswerTimeout(error, {
+        pendingRequestId: options.pendingRequestId,
+        responseTimeoutMs,
+      });
     }
     throw error;
   }

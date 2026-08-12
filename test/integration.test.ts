@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -6353,6 +6354,87 @@ test("integration: respond --timeout gives up on an owner that cannot answer", a
       timeoutMs: 30_000,
     });
     assert.equal(again.code, 2, `${again.stdout}${again.stderr}`);
+  });
+});
+
+/**
+ * Saturate a suspended owner's listen backlog.
+ *
+ * A SIGSTOPped process still has connects completed for it by the kernel, up to
+ * the backlog depth — which is why the plain suspended-owner case connects fine
+ * and only the reply never comes. Once the backlog is full the kernel refuses
+ * instead, and ECONNREFUSED is exactly what the connect retry loop retries. This
+ * is the shape a genuinely wedged owner has, and the shape under which a bound
+ * armed after the connect is no bound at all.
+ */
+async function holdQueueOwnerBacklog(
+  socketPath: string,
+  count = 400,
+): Promise<() => Promise<void>> {
+  const held: net.Socket[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const socket = net.createConnection(socketPath);
+    // A refused connect is the point of the exercise, not a test failure.
+    socket.on("error", () => {});
+    held.push(socket);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  return async () => {
+    for (const socket of held) {
+      socket.destroy();
+    }
+  };
+}
+
+test("integration: respond --timeout holds its budget when the owner cannot be connected to", async () => {
+  await withParkedRequest(async ({ homeDir, deferArgs, sessionId }) => {
+    const requestId = (await readStoredPendingRequests(homeDir))[0]?.request_id ?? "";
+    const { pid } = await readQueueOwnerLock(homeDir, sessionId);
+    const { socketPath } = queuePaths(homeDir, sessionId);
+    process.kill(pid, "SIGSTOP");
+    const release = await holdQueueOwnerBacklog(socketPath);
+    try {
+      const startedAt = Date.now();
+      const timedOut = await runCli(
+        [...deferArgs, "--format", "json", "--timeout", "0.3", "respond", requestId, "--cancel"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      // The same answer the reply-phase timeout gives: giving up is a timeout
+      // whichever phase ran out of budget, and it keeps its own exit code
+      // rather than degrading into a generic delivery failure.
+      assert.equal(timedOut.code, 3, `${timedOut.stdout}${timedOut.stderr}`);
+      const payload = JSON.parse(timedOut.stdout.trim()) as {
+        error: { data: { acpxCode: string; detailCode: string } };
+      };
+      assert.equal(payload.error.data.acpxCode, "TIMEOUT");
+      assert.equal(payload.error.data.detailCode, "PENDING_REQUEST_ANSWER_TIMEOUT");
+      // The connect retry loop is 40 attempts x 50 ms, so an unbounded connect
+      // cannot come back before ~2 s however small the asked-for budget is.
+      assert.equal(
+        elapsedMs < 2_000,
+        true,
+        `respond took ${elapsedMs}ms against a 300ms bound: ${timedOut.stdout}`,
+      );
+
+      assert.equal(isPidAlive(pid), true);
+      assert.equal((await readStoredPendingRequests(homeDir))[0]?.state, "pending");
+    } finally {
+      await release();
+      process.kill(pid, "SIGCONT");
+    }
+
+    // Nothing was ever written to the owner, so unlike the reply-phase timeout
+    // there is no answer in flight to land later: the request is still parked
+    // and still answerable.
+    const answered = await runCli(
+      [...deferArgs, "--format", "json", "respond", requestId, "--cancel"],
+      homeDir,
+      { timeoutMs: 30_000 },
+    );
+    assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
   });
 });
 
