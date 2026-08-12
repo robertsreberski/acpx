@@ -1,6 +1,7 @@
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { withTimeout } from "../../async-control.js";
+import { PendingRequestNotAnswerableError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { setPerfGauge } from "../../perf-metrics.js";
 import { matchPermissionPolicy } from "../../permissions.js";
@@ -596,6 +597,18 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           await turnController.setSessionModel(modelId, timeoutMs),
         setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
           return await turnController.setSessionConfigOption(configId, value, timeoutMs);
+        },
+        listPendingRequests: async () => (await parking?.manager.listPending()) ?? [],
+        respondToPendingRequest: async (pendingRequestId, answer) => {
+          if (!parking) {
+            // An owner started without --defer parks nothing, so there is
+            // nothing here to answer. Saying so beats a bare "not found".
+            throw new PendingRequestNotAnswerableError(
+              `No pending request ${pendingRequestId} is awaiting an answer on this session: ` +
+                "its queue owner was started without --defer and parks nothing",
+            );
+          }
+          return await parking.manager.respond(pendingRequestId, answer);
         },
       },
       {

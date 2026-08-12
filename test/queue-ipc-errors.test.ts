@@ -20,6 +20,7 @@ import {
   createSingleRequestServer,
   listenServer,
   nextJsonLine,
+  noParkedRequestControlHandlers,
   queuePaths,
   startKeeperProcess,
   stopProcess,
@@ -517,6 +518,7 @@ test("SessionQueueOwner emits typed invalid request payload errors", async () =>
     assert(lease);
 
     const owner = await SessionQueueOwner.start(lease, {
+      ...noParkedRequestControlHandlers,
       cancelPrompt: async () => false,
       closeSession: async () => false,
       setSessionMode: async () => {
@@ -564,6 +566,7 @@ test("SessionQueueOwner emits typed shutdown errors for pending prompts", async 
     assert(lease);
 
     const owner = await SessionQueueOwner.start(lease, {
+      ...noParkedRequestControlHandlers,
       cancelPrompt: async () => false,
       closeSession: async () => false,
       setSessionMode: async () => {
@@ -631,6 +634,7 @@ test("SessionQueueOwner preserves request ids for clients arriving during shutdo
     assert(lease);
 
     const owner = await SessionQueueOwner.start(lease, {
+      ...noParkedRequestControlHandlers,
       cancelPrompt: async () => false,
       closeSession: async () => false,
       setSessionMode: async () => {
@@ -691,6 +695,7 @@ test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the lim
     const owner = await SessionQueueOwner.start(
       lease,
       {
+        ...noParkedRequestControlHandlers,
         cancelPrompt: async () => false,
         closeSession: async () => false,
         setSessionMode: async () => {

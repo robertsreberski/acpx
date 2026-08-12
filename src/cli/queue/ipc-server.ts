@@ -3,6 +3,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { recordPerfDuration } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import type { PendingRequest, PendingRequestAnswer } from "../../session/pending-requests.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -12,6 +13,7 @@ import type {
 } from "../../types.js";
 import {
   parseQueueRequest,
+  toQueueOwnerWireMessage,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
   type QueueRequest,
@@ -75,7 +77,7 @@ function writeQueueMessage(socket: net.Socket, message: QueueOwnerMessage): void
   if (socket.destroyed || !socket.writable) {
     return;
   }
-  socket.write(`${JSON.stringify(message)}\n`);
+  socket.write(`${JSON.stringify(toQueueOwnerWireMessage(message))}\n`);
 }
 
 export type QueueTask = {
@@ -109,6 +111,13 @@ export type QueueOwnerControlHandlers = {
     value: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse>;
+  /** Parked requests this owner is blocked on right now. */
+  listPendingRequests: () => Promise<PendingRequest[]>;
+  /** Answer one parked request; resolves to the entry in its terminal state. */
+  respondToPendingRequest: (
+    pendingRequestId: string,
+    answer: PendingRequestAnswer,
+  ) => Promise<PendingRequest>;
 };
 
 type SessionQueueOwnerOptions = {
@@ -504,6 +513,41 @@ export class SessionQueueOwner {
             request.configId,
             request.value,
             request.timeoutMs,
+          ),
+        }),
+      });
+      return true;
+    }
+    return this.handlePendingRequestQueueRequest(socket, request);
+  }
+
+  /**
+   * Served like every other control request, which is what lets an operator
+   * answer a parked request while the turn that parked it is still blocked.
+   */
+  private handlePendingRequestQueueRequest(socket: net.Socket, request: QueueRequest): boolean {
+    if (request.type === "list_requests") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "list_requests_result",
+          requestId: request.requestId,
+          requests: await this.controlHandlers.listPendingRequests(),
+        }),
+      });
+      return true;
+    }
+    if (request.type === "respond_request") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "respond_request_result",
+          requestId: request.requestId,
+          request: await this.controlHandlers.respondToPendingRequest(
+            request.pendingRequestId,
+            request.answer,
           ),
         }),
       });

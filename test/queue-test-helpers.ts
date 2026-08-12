@@ -5,6 +5,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
+import { PendingRequestNotAnswerableError } from "../src/errors.js";
+import type { PendingRequest } from "../src/session/pending-requests.js";
 
 export type QueuePaths = {
   lockPath: string;
@@ -186,3 +188,17 @@ export async function nextJsonLine(
 
   return await Promise.race([next, timeout]);
 }
+
+/**
+ * Control handlers for the parked-request verbs, for owners under test that
+ * park nothing. Kept here so adding a control verb stays one compile error per
+ * real owner rather than one per test.
+ */
+export const noParkedRequestControlHandlers = {
+  listPendingRequests: async (): Promise<PendingRequest[]> => [],
+  respondToPendingRequest: async (pendingRequestId: string): Promise<PendingRequest> => {
+    throw new PendingRequestNotAnswerableError(
+      `No pending request ${pendingRequestId} is awaiting an answer on this session`,
+    );
+  },
+};

@@ -3,6 +3,13 @@ import { toAcpErrorPayload } from "../../acp/error-shapes.js";
 import { isAcpJsonRpcMessage } from "../../acp/jsonrpc.js";
 import { isPromptInput, textPrompt } from "../../prompt-content.js";
 import {
+  parsePendingRequest,
+  parsePendingRequestAnswer,
+  serializePendingRequestForDisk,
+  type PendingRequest,
+  type PendingRequestAnswer,
+} from "../../session/pending-requests.js";
+import {
   OUTPUT_ERROR_CODES,
   OUTPUT_ERROR_ORIGINS,
   PERMISSION_ESCALATION_ACTIONS,
@@ -83,13 +90,31 @@ export type QueueCloseSessionRequest = {
   timeoutMs?: number;
 };
 
+/** Ask the owner which parked requests it is actually blocked on right now. */
+export type QueueListRequestsRequest = {
+  type: "list_requests";
+  requestId: string;
+  ownerGeneration?: number;
+};
+
+export type QueueRespondRequest = {
+  type: "respond_request";
+  requestId: string;
+  ownerGeneration?: number;
+  /** Id of the parked request being answered, not of this queue request. */
+  pendingRequestId: string;
+  answer: PendingRequestAnswer;
+};
+
 export type QueueRequest =
   | QueueSubmitRequest
   | QueueCancelRequest
   | QueueSetModeRequest
   | QueueSetModelRequest
   | QueueSetConfigOptionRequest
-  | QueueCloseSessionRequest;
+  | QueueCloseSessionRequest
+  | QueueListRequestsRequest
+  | QueueRespondRequest;
 
 export type QueueOwnerAcceptedMessage = {
   type: "accepted";
@@ -154,6 +179,21 @@ export type QueueOwnerCloseSessionResultMessage = {
   closed: boolean;
 };
 
+export type QueueOwnerListRequestsResultMessage = {
+  type: "list_requests_result";
+  requestId: string;
+  ownerGeneration?: number;
+  requests: PendingRequest[];
+};
+
+export type QueueOwnerRespondResultMessage = {
+  type: "respond_request_result";
+  requestId: string;
+  ownerGeneration?: number;
+  /** The parked request in its terminal state, as the owner just wrote it. */
+  request: PendingRequest;
+};
+
 export type QueueOwnerErrorMessage = {
   type: "error";
   requestId: string;
@@ -177,6 +217,8 @@ export type QueueOwnerMessage =
   | QueueOwnerSetModelResultMessage
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
+  | QueueOwnerListRequestsResultMessage
+  | QueueOwnerRespondResultMessage
   | QueueOwnerErrorMessage;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -184,6 +226,24 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   return value as Record<string, unknown>;
+}
+
+/**
+ * Encode an owner message for the wire.
+ *
+ * Pending requests travel in the persisted store shape, which is the one
+ * versioned contract for them: the sender serializes with the store's own
+ * serializer and the receiver parses with the store's own parser, so the wire
+ * cannot drift away from the durable form.
+ */
+export function toQueueOwnerWireMessage(message: QueueOwnerMessage): unknown {
+  if (message.type === "list_requests_result") {
+    return { ...message, requests: message.requests.map(serializePendingRequestForDisk) };
+  }
+  if (message.type === "respond_request_result") {
+    return { ...message, request: serializePendingRequestForDisk(message.request) };
+  }
+  return message;
 }
 
 function isPermissionMode(value: unknown): value is PermissionMode {
@@ -448,8 +508,43 @@ function parseTypedQueueRequest(
     case "set_config_option":
       return parseSetConfigOptionRequest(request, context);
     default:
-      return null;
+      return parsePendingRequestQueueRequest(request, context);
   }
+}
+
+function parsePendingRequestQueueRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueRequest | null {
+  if (request.type === "list_requests") {
+    return {
+      type: "list_requests",
+      requestId: context.requestId,
+      ownerGeneration: context.ownerGeneration,
+    };
+  }
+  if (request.type === "respond_request") {
+    return parseRespondRequest(request, context);
+  }
+  return null;
+}
+
+function parseRespondRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueRespondRequest | null {
+  const pendingRequestId = parseNonEmptyString(request.pendingRequestId);
+  const answer = parsePendingRequestAnswer(request.answer);
+  if (!pendingRequestId || !answer) {
+    return null;
+  }
+  return {
+    type: "respond_request",
+    requestId: context.requestId,
+    ownerGeneration: context.ownerGeneration,
+    pendingRequestId,
+    answer,
+  };
 }
 
 function parseSubmitRequest(
@@ -682,6 +777,8 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
     parseStringResultOwnerMessage(message, context, "set_mode_result", "modeId"),
   set_model_result: parseSetModelOwnerMessage,
   set_config_option_result: parseSetConfigOptionOwnerMessage,
+  list_requests_result: parseListRequestsOwnerMessage,
+  respond_request_result: parseRespondResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
 
@@ -784,6 +881,37 @@ function parseSetConfigOptionOwnerMessage(
     ...context,
     response: response as SetSessionConfigOptionResponse,
   };
+}
+
+/**
+ * Pending requests cross the wire in their persisted shape, so both sides parse
+ * them with the store's own parser instead of trusting a second hand-rolled
+ * shape that could drift from the durable one.
+ */
+function parseListRequestsOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerListRequestsResultMessage | null {
+  if (!Array.isArray(message.requests)) {
+    return null;
+  }
+  const requests: PendingRequest[] = [];
+  for (const raw of message.requests) {
+    const parsed = parsePendingRequest(raw);
+    if (!parsed) {
+      return null;
+    }
+    requests.push(parsed);
+  }
+  return { type: "list_requests_result", ...context, requests };
+}
+
+function parseRespondResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerRespondResultMessage | null {
+  const request = parsePendingRequest(message.request);
+  return request ? { type: "respond_request_result", ...context, request } : null;
 }
 
 function parseErrorOwnerMessage(

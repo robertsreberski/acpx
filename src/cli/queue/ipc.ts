@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import type { PendingRequest, PendingRequestAnswer } from "../../session/pending-requests.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -28,13 +29,17 @@ import {
   parseQueueOwnerMessage,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
+  type QueueListRequestsRequest,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
+  type QueueOwnerListRequestsResultMessage,
   type QueueOwnerMessage,
+  type QueueOwnerRespondResultMessage,
   type QueueOwnerSetConfigOptionResultMessage,
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueRequest,
+  type QueueRespondRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetModelRequest,
   type QueueSetModeRequest,
@@ -1001,6 +1006,98 @@ export async function trySetModelOnRunningOwner(
       retryable: true,
     },
   );
+}
+
+async function requireAcceptingOwner<T>(
+  sessionId: string,
+  response: T | undefined,
+  verb: string,
+): Promise<T | undefined> {
+  if (response !== undefined) {
+    return response;
+  }
+
+  const health = await probeQueueOwnerHealth(sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    `Session queue owner is running but not accepting ${verb} requests`,
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+/**
+ * The parked requests the owner is blocked on right now.
+ *
+ * `undefined` means there is no owner to ask, which is not the same as "no
+ * parked requests": the durable store still holds whatever the last owner
+ * parked, and callers are expected to read it separately.
+ */
+export async function tryListRequestsOnRunningOwner(options: {
+  sessionId: string;
+  verbose?: boolean;
+}): Promise<PendingRequest[] | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const request: QueueListRequestsRequest = {
+    type: "list_requests",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerListRequestsResultMessage =>
+      message.type === "list_requests_result",
+  );
+  if (options.verbose && response) {
+    process.stderr.write(
+      `[acpx] listed ${response.requests.length} parked request(s) on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+    );
+  }
+  return (await requireAcceptingOwner(options.sessionId, response, "list_requests"))?.requests;
+}
+
+/** Answer a parked request on the owner that parked it. */
+export async function tryRespondOnRunningOwner(options: {
+  sessionId: string;
+  pendingRequestId: string;
+  answer: PendingRequestAnswer;
+  verbose?: boolean;
+}): Promise<PendingRequest | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const request: QueueRespondRequest = {
+    type: "respond_request",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    pendingRequestId: options.pendingRequestId,
+    answer: options.answer,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerRespondResultMessage =>
+      message.type === "respond_request_result",
+  );
+  if (options.verbose && response) {
+    process.stderr.write(
+      `[acpx] answered pending request ${options.pendingRequestId} on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+    );
+  }
+  return (await requireAcceptingOwner(options.sessionId, response, "respond_request"))?.request;
 }
 
 export async function trySetConfigOptionOnRunningOwner(

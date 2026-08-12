@@ -661,3 +661,152 @@ test("parseQueueRequest rejects a permission policy with a bad defer list or def
     null,
   );
 });
+
+test("parseQueueRequest accepts a list_requests control request", () => {
+  assert.deepEqual(
+    parseQueueRequest({
+      type: "list_requests",
+      requestId: "req-list",
+      ownerGeneration: 7,
+    }),
+    {
+      type: "list_requests",
+      requestId: "req-list",
+      ownerGeneration: 7,
+    },
+  );
+});
+
+test("parseQueueRequest accepts every respond_request answer arm", () => {
+  assert.deepEqual(
+    parseQueueRequest({
+      type: "respond_request",
+      requestId: "req-respond",
+      ownerGeneration: 7,
+      pendingRequestId: "pending-1",
+      answer: { type: "select", option_id: "allow" },
+    }),
+    {
+      type: "respond_request",
+      requestId: "req-respond",
+      ownerGeneration: 7,
+      pendingRequestId: "pending-1",
+      answer: { type: "select", option_id: "allow" },
+    },
+  );
+
+  for (const answer of [{ type: "decline" }, { type: "cancel" }]) {
+    const parsed = parseQueueRequest({
+      type: "respond_request",
+      requestId: "req-respond",
+      pendingRequestId: "pending-1",
+      answer,
+    });
+    assert.deepEqual(parsed?.type === "respond_request" ? parsed.answer : undefined, answer);
+  }
+});
+
+test("parseQueueRequest rejects a respond_request without an answerable payload", () => {
+  for (const request of [
+    { type: "respond_request", requestId: "req-1", answer: { type: "cancel" } },
+    {
+      type: "respond_request",
+      requestId: "req-1",
+      pendingRequestId: "  ",
+      answer: { type: "cancel" },
+    },
+    { type: "respond_request", requestId: "req-1", pendingRequestId: "pending-1" },
+    {
+      type: "respond_request",
+      requestId: "req-1",
+      pendingRequestId: "pending-1",
+      answer: { option_id: "allow" },
+    },
+    {
+      type: "respond_request",
+      requestId: "req-1",
+      pendingRequestId: "pending-1",
+      answer: { type: "select" },
+    },
+    {
+      type: "respond_request",
+      requestId: "req-1",
+      pendingRequestId: "pending-1",
+      answer: "cancel",
+    },
+  ]) {
+    assert.equal(parseQueueRequest(request), null, JSON.stringify(request));
+  }
+});
+
+test("parseQueueOwnerMessage validates every listed pending request", () => {
+  const entry = {
+    schema: "acpx.pending_request.v1",
+    request_id: "pending-1",
+    session_id: "session-1",
+    acp_session_id: "acp-1",
+    agent_command: "node ./test/mock-agent.js",
+    cwd: "/workspace",
+    kind: "permission",
+    state: "pending",
+    created_at: "2026-08-12T00:00:00.000Z",
+    updated_at: "2026-08-12T00:00:00.000Z",
+    owner_pid: 4242,
+    owner_generation: 7,
+    task_request_id: "task-1",
+    tool_call: { tool_call_id: "tool-1", title: "Bash" },
+    options: [{ option_id: "allow", name: "Allow", kind: "allow_once" }],
+  };
+
+  const parsed = parseQueueOwnerMessage({
+    type: "list_requests_result",
+    requestId: "req-list",
+    ownerGeneration: 7,
+    requests: [entry],
+  });
+  assert.equal(parsed?.type, "list_requests_result");
+  assert.deepEqual(
+    parsed?.type === "list_requests_result" ? parsed.requests.map((item) => item.requestId) : [],
+    ["pending-1"],
+  );
+  // The wire carries the persisted shape, so it goes through the store parser
+  // rather than being trusted as-is.
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "list_requests_result",
+      requestId: "req-list",
+      requests: [entry, { ...entry, state: "unknown" }],
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({ type: "list_requests_result", requestId: "req-list" }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "list_requests_result",
+      requestId: "req-list",
+      requests: { "0": entry },
+    }),
+    null,
+  );
+
+  const responded = parseQueueOwnerMessage({
+    type: "respond_request_result",
+    requestId: "req-respond",
+    request: { ...entry, state: "answered" },
+  });
+  assert.equal(
+    responded?.type === "respond_request_result" ? responded.request.state : undefined,
+    "answered",
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "respond_request_result",
+      requestId: "req-respond",
+      request: { ...entry, schema: "acpx.pending_request.v2" },
+    }),
+    null,
+  );
+});
