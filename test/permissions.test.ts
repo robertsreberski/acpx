@@ -10,6 +10,11 @@ import {
   resolvePermissionRequest,
   resolvePermissionRequestWithDetails,
 } from "../src/permissions.js";
+import {
+  PERMISSION_POLICY_RULE_KEYS,
+  type PermissionPolicy,
+  type ReadonlyPermissionPolicy,
+} from "../src/types.js";
 import { withMockedReadline, withTtyState } from "./tty-test-helpers.js";
 
 const BASE_OPTIONS = [
@@ -575,4 +580,32 @@ test("inferToolKind classifies titles when toolCall.kind is missing", () => {
   assert.equal(inferToolKind(makeRequestWithTitle("patch: foo.ts", undefined)), "edit");
   assert.equal(inferToolKind(makeRequestWithTitle("cat README", undefined)), "read");
   assert.equal(inferToolKind(makeRequestWithTitle("totally unknown", undefined)), "other");
+});
+
+test("ReadonlyPermissionPolicy and PERMISSION_POLICY_RULE_KEYS stay in sync with PermissionPolicy", () => {
+  // These records fail to compile if a PermissionPolicy field is added without
+  // a matching readonly projection, or vice versa. That drift is exactly how
+  // `defer` could have been honored by the parser but ignored by a guard.
+  const writableKeys: Record<keyof PermissionPolicy, true> = {
+    autoApprove: true,
+    autoDeny: true,
+    escalate: true,
+    defer: true,
+    defaultAction: true,
+  };
+  const readonlyKeys: Record<keyof ReadonlyPermissionPolicy, true> = {
+    autoApprove: true,
+    autoDeny: true,
+    escalate: true,
+    defer: true,
+    defaultAction: true,
+  };
+
+  assert.deepEqual(Object.keys(writableKeys).toSorted(), Object.keys(readonlyKeys).toSorted());
+  assert.deepEqual(
+    PERMISSION_POLICY_RULE_KEYS.toSorted(),
+    Object.keys(writableKeys)
+      .filter((key) => key !== "defaultAction")
+      .toSorted(),
+  );
 });

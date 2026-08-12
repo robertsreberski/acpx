@@ -7,6 +7,7 @@ import {
   OUTPUT_ERROR_ORIGINS,
   PERMISSION_ESCALATION_ACTIONS,
   PERMISSION_POLICY_ACTIONS,
+  PERMISSION_POLICY_RULE_KEYS,
   type AcpClientOptions,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
@@ -206,8 +207,7 @@ function isPermissionPolicy(value: unknown): value is PermissionPolicy {
 }
 
 function hasValidPermissionRuleLists(record: Record<string, unknown>): boolean {
-  const stringListKeys = ["autoApprove", "autoDeny", "escalate", "defer"] as const;
-  for (const key of stringListKeys) {
+  for (const key of PERMISSION_POLICY_RULE_KEYS) {
     if (!isOptionalStringList(record[key])) {
       return false;
     }

@@ -22,13 +22,21 @@ export type AcpPermissionRequest = {
 /**
  * Context handed to a host permission hook. `policy` and `mode` describe what
  * acpx would do with the request on its own, so a host can defer to, or
- * deliberately override, the configured behavior. Both are optional: a hook
- * written against an older contract still compiles, and `policy` is absent
- * whenever no permission policy is configured.
+ * deliberately override, the configured behavior.
+ *
+ * Presence convention: a field is present exactly when acpx has a value for it.
+ * `mode` is therefore always present (a client always has an effective mode),
+ * and `policy` is present only when a permission policy is configured. Both are
+ * typed optional so hooks written against the original `{ signal }` contract
+ * keep compiling.
+ *
+ * Both values are a snapshot taken when the request arrived, and the same
+ * snapshot settles the request if the hook declines it. `policy` is a frozen
+ * clone: mutating it neither affects this request nor the client's live policy.
  */
 export type AcpPermissionRequestContext = {
   signal: AbortSignal;
-  policy?: PermissionPolicy;
+  policy?: ReadonlyPermissionPolicy;
   mode?: PermissionMode;
 };
 
@@ -69,10 +77,27 @@ export type PermissionPolicyAction = (typeof PERMISSION_POLICY_ACTIONS)[number];
 
 /**
  * Policy actions that hand the request back to a human or orchestrator instead
- * of settling it. Both surface a `PermissionEscalationEvent`.
+ * of settling it. Both surface a `PermissionEscalationEvent`. The `satisfies`
+ * clause pins this as a strict subset of PERMISSION_POLICY_ACTIONS.
  */
-export const PERMISSION_ESCALATION_ACTIONS = ["escalate", "defer"] as const;
+export const PERMISSION_ESCALATION_ACTIONS = [
+  "escalate",
+  "defer",
+] as const satisfies readonly PermissionPolicyAction[];
 export type PermissionEscalationAction = (typeof PERMISSION_ESCALATION_ACTIONS)[number];
+
+/**
+ * Every rule-list key on PermissionPolicy. Single source of truth for the
+ * parser, the queue IPC guard, and snapshot cloning, so a new rule list cannot
+ * be honored in one place and silently ignored in another.
+ */
+export const PERMISSION_POLICY_RULE_KEYS = [
+  "autoApprove",
+  "autoDeny",
+  "escalate",
+  "defer",
+] as const satisfies readonly (keyof PermissionPolicy)[];
+export type PermissionPolicyRuleKey = (typeof PERMISSION_POLICY_RULE_KEYS)[number];
 
 export type PermissionPolicy = {
   autoApprove?: string[];
@@ -80,6 +105,19 @@ export type PermissionPolicy = {
   escalate?: string[];
   defer?: string[];
   defaultAction?: PermissionPolicyAction;
+};
+
+/**
+ * Read-only projection of PermissionPolicy. Handed to host permission hooks and
+ * accepted everywhere acpx only reads a policy. Keep in sync with
+ * PermissionPolicy — `test/permissions.test.ts` fails to compile otherwise.
+ */
+export type ReadonlyPermissionPolicy = {
+  readonly autoApprove?: readonly string[];
+  readonly autoDeny?: readonly string[];
+  readonly escalate?: readonly string[];
+  readonly defer?: readonly string[];
+  readonly defaultAction?: PermissionPolicyAction;
 };
 
 export type PermissionEscalationEvent = {

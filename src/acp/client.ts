@@ -56,13 +56,15 @@ import {
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
+import { PERMISSION_POLICY_RULE_KEYS } from "../types.js";
 import type {
   AcpClientOptions,
-  AcpPermissionRequestContext,
   NonInteractivePermissionPolicy,
   PermissionMode,
+  PermissionPolicy,
   PermissionStats,
   PromptInput,
+  ReadonlyPermissionPolicy,
 } from "../types.js";
 import { getAcpxVersion } from "../version.js";
 import {
@@ -300,6 +302,34 @@ function cancelledPermissionResponse(): RequestPermissionResponse {
       outcome: "cancelled",
     },
   };
+}
+
+/** Permission settings pinned for the lifetime of one permission request. */
+type PermissionSettingsSnapshot = {
+  mode: PermissionMode;
+  nonInteractive: NonInteractivePermissionPolicy;
+  policy?: ReadonlyPermissionPolicy;
+};
+
+/**
+ * Clone a policy into a frozen read-only view. Rule arrays are copied, not
+ * aliased, so neither the hook nor a later mutation of the caller's policy
+ * object can change what this request was judged against.
+ */
+function freezePermissionPolicy(policy: PermissionPolicy): ReadonlyPermissionPolicy {
+  const snapshot: {
+    -readonly [K in keyof ReadonlyPermissionPolicy]: ReadonlyPermissionPolicy[K];
+  } = {};
+  for (const key of PERMISSION_POLICY_RULE_KEYS) {
+    const rules = policy[key];
+    if (rules) {
+      snapshot[key] = Object.freeze([...rules]);
+    }
+  }
+  if (policy.defaultAction) {
+    snapshot.defaultAction = policy.defaultAction;
+  }
+  return Object.freeze(snapshot);
 }
 
 function shouldSuppressSdkConsoleError(args: unknown[]): boolean {
@@ -1692,12 +1722,17 @@ export class AcpClient {
       return cancelledPermissionResponse();
     }
 
-    const hostResponse = await this.tryHandlePermissionRequestWithHost(params);
+    // One snapshot per request. The host hook and the fallback resolver must
+    // agree on what acpx would have done, even if a concurrent
+    // updateRuntimeOptions re-tunes this warm client while the hook is awaited.
+    const settings = this.permissionSettingsSnapshot();
+
+    const hostResponse = await this.tryHandlePermissionRequestWithHost(params, settings);
     if (hostResponse) {
       return hostResponse;
     }
 
-    const { response, recorded } = await this.resolvePermissionRequestFromMode(params);
+    const { response, recorded } = await this.resolvePermissionRequestFromMode(params, settings);
     if (!recorded) {
       const decision = classifyPermissionDecision(params, response);
       this.recordPermissionDecision(decision);
@@ -1708,6 +1743,7 @@ export class AcpClient {
 
   private async tryHandlePermissionRequestWithHost(
     params: RequestPermissionRequest,
+    settings: PermissionSettingsSnapshot,
   ): Promise<RequestPermissionResponse | undefined> {
     if (!this.options.onPermissionRequest) {
       return undefined;
@@ -1720,7 +1756,11 @@ export class AcpClient {
           raw: params,
           inferredKind: inferToolKind(params),
         },
-        this.hostPermissionContext(signal),
+        {
+          signal,
+          ...(settings.policy ? { policy: settings.policy } : {}),
+          mode: settings.mode,
+        },
       );
       return this.hostPermissionDecisionResponse(params, signal, decision);
     } catch (error) {
@@ -1729,14 +1769,18 @@ export class AcpClient {
   }
 
   /**
-   * Read from `this.options` per request so the context tracks
-   * `updateRuntimeOptions` rather than freezing the construction-time values.
+   * Capture the permission settings that govern one request. Read from
+   * `this.options` at request time so the snapshot reflects any
+   * `updateRuntimeOptions` that landed before the request, then stays fixed for
+   * the rest of the request. The policy is a frozen clone, so a host hook
+   * cannot reach through `ctx.policy` and rewrite the live client policy.
    */
-  private hostPermissionContext(signal: AbortSignal): AcpPermissionRequestContext {
+  private permissionSettingsSnapshot(): PermissionSettingsSnapshot {
+    const policy = this.options.permissionPolicy;
     return {
-      signal,
-      ...(this.options.permissionPolicy ? { policy: this.options.permissionPolicy } : {}),
       mode: this.options.permissionMode,
+      nonInteractive: this.options.nonInteractivePermissions ?? "deny",
+      ...(policy ? { policy: freezePermissionPolicy(policy) } : {}),
     };
   }
 
@@ -1778,13 +1822,14 @@ export class AcpClient {
 
   private async resolvePermissionRequestFromMode(
     params: RequestPermissionRequest,
+    settings: PermissionSettingsSnapshot,
   ): Promise<{ response: RequestPermissionResponse; recorded: boolean }> {
     try {
       const result = await resolvePermissionRequestWithDetails(
         params,
-        this.options.permissionMode,
-        this.options.nonInteractivePermissions ?? "deny",
-        this.options.permissionPolicy,
+        settings.mode,
+        settings.nonInteractive,
+        settings.policy,
       );
       this.emitPermissionEscalation(result.escalation);
       return { response: result.response, recorded: false };

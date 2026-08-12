@@ -2,8 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   PERMISSION_POLICY_ACTIONS,
+  PERMISSION_POLICY_RULE_KEYS,
   type PermissionPolicy,
   type PermissionPolicyAction,
+  type PermissionPolicyRuleKey,
 } from "./types.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -54,7 +56,7 @@ function parseDefaultAction(
 
 function assignRuleList(
   policy: PermissionPolicy,
-  key: "autoApprove" | "autoDeny" | "escalate" | "defer",
+  key: PermissionPolicyRuleKey,
   value: string[] | undefined,
 ): void {
   if (value) {
@@ -72,10 +74,9 @@ export function parsePermissionPolicy(
   }
 
   const policy: PermissionPolicy = {};
-  assignRuleList(policy, "autoApprove", parseRuleList(record.autoApprove, "autoApprove", source));
-  assignRuleList(policy, "autoDeny", parseRuleList(record.autoDeny, "autoDeny", source));
-  assignRuleList(policy, "escalate", parseRuleList(record.escalate, "escalate", source));
-  assignRuleList(policy, "defer", parseRuleList(record.defer, "defer", source));
+  for (const key of PERMISSION_POLICY_RULE_KEYS) {
+    assignRuleList(policy, key, parseRuleList(record[key], key, source));
+  }
 
   const defaultAction = parseDefaultAction(record.defaultAction, source);
   if (defaultAction) {

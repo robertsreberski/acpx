@@ -12,8 +12,8 @@ import type {
   PermissionEscalationAction,
   PermissionEscalationEvent,
   PermissionMode,
-  PermissionPolicy,
   PermissionPolicyAction,
+  ReadonlyPermissionPolicy,
 } from "./types.js";
 
 type PermissionDecision = "approved" | "denied" | "cancelled";
@@ -179,7 +179,7 @@ function permissionMatchTokens(params: RequestPermissionRequest): string[] {
 }
 
 function findPolicyRule(
-  rules: string[] | undefined,
+  rules: readonly string[] | undefined,
   params: RequestPermissionRequest,
 ): string | undefined {
   if (!rules || rules.length === 0) {
@@ -203,7 +203,7 @@ function findPolicyRule(
  */
 export function matchPermissionPolicy(
   params: RequestPermissionRequest,
-  policy: PermissionPolicy | undefined,
+  policy: ReadonlyPermissionPolicy | undefined,
 ): PermissionPolicyMatch | undefined {
   if (!policy) {
     return undefined;
@@ -383,7 +383,7 @@ export async function resolvePermissionRequest(
   params: RequestPermissionRequest,
   mode: PermissionMode,
   nonInteractivePolicy: NonInteractivePermissionPolicy = "deny",
-  policy?: PermissionPolicy,
+  policy?: ReadonlyPermissionPolicy,
 ): Promise<RequestPermissionResponse> {
   const result = await resolvePermissionRequestWithDetails(
     params,
@@ -398,7 +398,7 @@ export async function resolvePermissionRequestWithDetails(
   params: RequestPermissionRequest,
   mode: PermissionMode,
   nonInteractivePolicy: NonInteractivePermissionPolicy = "deny",
-  policy?: PermissionPolicy,
+  policy?: ReadonlyPermissionPolicy,
 ): Promise<ResolvedPermissionRequest> {
   const options = params.options ?? [];
   if (options.length === 0) {

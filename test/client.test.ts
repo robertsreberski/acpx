@@ -20,7 +20,7 @@ import {
   PermissionPromptUnavailableError,
   UnsupportedPromptContentError,
 } from "../src/errors.js";
-import type { PermissionMode, PermissionPolicy } from "../src/types.js";
+import type { PermissionMode, PermissionPolicy, ReadonlyPermissionPolicy } from "../src/types.js";
 
 test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
   for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
@@ -527,7 +527,7 @@ test("AcpClient onPermissionRequest decision short-circuits the mode-based resol
 });
 
 test("AcpClient onPermissionRequest receives the effective permission policy and mode", async () => {
-  const seen: { policy?: PermissionPolicy; mode?: PermissionMode }[] = [];
+  const seen: { policy?: ReadonlyPermissionPolicy; mode?: PermissionMode }[] = [];
   const client = makeClient({
     permissionMode: "approve-reads",
     permissionPolicy: { defer: ["execute"], defaultAction: "deny" },
@@ -547,7 +547,7 @@ test("AcpClient onPermissionRequest receives the effective permission policy and
 });
 
 test("AcpClient onPermissionRequest ctx tracks runtime option updates", async () => {
-  const seen: { policy?: PermissionPolicy; mode?: PermissionMode }[] = [];
+  const seen: { policy?: ReadonlyPermissionPolicy; mode?: PermissionMode }[] = [];
   const client = makeClient({
     permissionMode: "approve-reads",
     onPermissionRequest: async (_req, ctx) => {
@@ -573,6 +573,90 @@ test("AcpClient onPermissionRequest ctx tracks runtime option updates", async ()
     { policy: undefined, mode: "approve-reads" },
     { policy: { escalate: ["execute"] }, mode: "deny-all" },
   ]);
+});
+
+test("AcpClient onPermissionRequest ctx.policy is a frozen clone of the live policy", async () => {
+  const livePolicy: PermissionPolicy = { autoApprove: ["read"], defer: ["execute"] };
+  let mutationError: unknown;
+  const client = makeClient({
+    permissionMode: "deny-all",
+    permissionPolicy: livePolicy,
+    onPermissionRequest: async (_req, ctx) => {
+      assert.notEqual(ctx.policy, livePolicy, "ctx.policy must not alias the live policy");
+      try {
+        (ctx.policy?.autoApprove as string[] | undefined)?.push("execute");
+      } catch (error) {
+        mutationError = error;
+      }
+      return { outcome: "allow_once" };
+    },
+  });
+
+  await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-frozen-1", "execute"),
+  );
+
+  assert.equal(mutationError instanceof TypeError, true, "expected a frozen-array TypeError");
+  assert.deepEqual(livePolicy, { autoApprove: ["read"], defer: ["execute"] });
+});
+
+test("AcpClient settles a request with the policy snapshot taken when it arrived", async () => {
+  const client = makeClient({
+    permissionMode: "approve-all",
+    permissionPolicy: { autoDeny: ["execute"] },
+    onPermissionRequest: async (_req, ctx) => {
+      // Re-tune the client mid-request, exactly as a concurrent control command
+      // would. The fallback resolver must still use the entry snapshot.
+      assert.deepEqual(ctx.policy, { autoDeny: ["execute"] });
+      client.updateRuntimeOptions({ permissionPolicy: { autoApprove: ["execute"] } });
+      return undefined;
+    },
+  });
+
+  const response = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-snapshot-1", "execute"),
+  );
+
+  assert.deepEqual(response, { outcome: { outcome: "selected", optionId: "reject" } });
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 0,
+    denied: 1,
+    cancelled: 0,
+  });
+});
+
+test("AcpClient records a select decision against the option it actually chose", async () => {
+  const client = makeClient({
+    permissionMode: "deny-all",
+    onPermissionRequest: async () => ({ outcome: "select", optionId: "allow" }),
+  });
+
+  const approved = await asInternals(client).handlePermissionRequest?.(
+    makePermissionRequest("session-select-1", "execute"),
+  );
+  assert.deepEqual(approved, { outcome: { outcome: "selected", optionId: "allow" } });
+  assert.deepEqual(client.getPermissionStats(), {
+    requested: 1,
+    approved: 1,
+    denied: 0,
+    cancelled: 0,
+  });
+
+  const missingClient = makeClient({
+    permissionMode: "approve-all",
+    onPermissionRequest: async () => ({ outcome: "select", optionId: "not-offered" }),
+  });
+  const cancelled = await asInternals(missingClient).handlePermissionRequest?.(
+    makePermissionRequest("session-select-2", "execute"),
+  );
+  assert.deepEqual(cancelled, { outcome: { outcome: "cancelled" } });
+  assert.deepEqual(missingClient.getPermissionStats(), {
+    requested: 1,
+    approved: 0,
+    denied: 0,
+    cancelled: 1,
+  });
 });
 
 test("AcpClient onPermissionRequest returning undefined falls through to mode-based resolver", async () => {
