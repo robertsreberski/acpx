@@ -207,6 +207,21 @@ export class AuthPolicyError extends AcpxOperationalError {
   }
 }
 
+/**
+ * A pending request cannot take the answer it was given: unknown id, an option
+ * the agent never offered, or a request that has already settled.
+ */
+export class PendingRequestNotAnswerableError extends AcpxOperationalError {
+  constructor(message: string, options?: AcpxErrorOptions) {
+    super(message, {
+      outputCode: "USAGE",
+      detailCode: "PENDING_REQUEST_NOT_ANSWERABLE",
+      origin: "cli",
+      ...options,
+    });
+  }
+}
+
 export class QueueConnectionError extends AcpxOperationalError {}
 
 export class QueueProtocolError extends AcpxOperationalError {}
