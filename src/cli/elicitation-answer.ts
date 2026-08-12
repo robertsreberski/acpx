@@ -260,23 +260,119 @@ function assertKnownField(entry: PendingElicitationRequest, field: string): void
 }
 
 /**
- * The single field `--text` answers.
+ * Marks a field as the free-text companion of another field.
  *
- * Sugar for the one-question case only. Guessing which of several fields a bare
- * string belongs to would be answering a question the operator did not answer,
- * so more than one field is refused with the names they would have to choose
- * between.
+ * An AskUserQuestion bridge renders one question as two properties: the offered
+ * options, and an "Other" box for typing an answer instead of picking one. The
+ * marker is deliberately un-namespaced by the adapter that emits it, "so ACP
+ * clients can recognize the same marker across Codex, Claude, and other
+ * AskUserQuestion bridges" — so it is matched structurally. Matching field
+ * names instead would work for one agent and silently fail for the next.
  */
-function soleFieldName(entry: PendingElicitationRequest): string {
+const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
+
+/** The question a field is the free-text companion of, if it is one. */
+function customAnswerTarget(entry: PendingElicitationRequest, field: string): string | undefined {
+  const meta = asRecord(asRecord(elicitationSchemaProperties(entry)[field])?._meta);
+  const marker = asRecord(meta?.[CUSTOM_ANSWER_META_KEY]);
+  const questionId = marker?.questionId;
+  return typeof questionId === "string" ? questionId : undefined;
+}
+
+/**
+ * The one question a form asks, when the form is exactly that question and its
+ * free-text companion. Anything else — two questions, an unmarked pair, a
+ * marker pointing at a field the form does not have — reduces to nothing.
+ */
+function soleMarkedQuestion(
+  entry: PendingElicitationRequest,
+): { question: string; custom: string } | undefined {
+  const fields = elicitationFieldNames(entry);
+  if (fields.length !== 2) {
+    return undefined;
+  }
+  for (const custom of fields) {
+    const question = customAnswerTarget(entry, custom);
+    if (question !== undefined && question !== custom && fields.includes(question)) {
+      return { question, custom };
+    }
+  }
+  return undefined;
+}
+
+/** The options a field offers, single-select or multi-select alike. */
+function offeredOptions(
+  entry: PendingElicitationRequest,
+  field: string,
+): Array<{ value: string; title?: string }> {
+  const property = asRecord(elicitationSchemaProperties(entry)[field]);
+  const items = asRecord(property?.items);
+  const listed: unknown[] = [
+    ...(Array.isArray(property?.oneOf) ? (property.oneOf as unknown[]) : []),
+    ...(Array.isArray(items?.anyOf) ? (items.anyOf as unknown[]) : []),
+  ];
+  const options = listed.flatMap((option) => {
+    const record = asRecord(option);
+    const value = record?.const;
+    if (typeof value !== "string") {
+      return [];
+    }
+    const title = record?.title;
+    return [{ value, ...(typeof title === "string" ? { title } : {}) }];
+  });
+  const enumerated = Array.isArray(items?.enum)
+    ? items.enum.filter((value): value is string => typeof value === "string")
+    : [];
+  return [...options, ...enumerated.map((value) => ({ value }))];
+}
+
+/**
+ * The value behind an option the answer names, by value or by the title shown
+ * for it. The two differ whenever a bridge titles an option differently from
+ * the value it records, and the value is what the agent reads back.
+ */
+function offeredOptionValue(
+  entry: PendingElicitationRequest,
+  field: string,
+  answer: string,
+): string | undefined {
+  return offeredOptions(entry, field).find(
+    (option) => option.value === answer || option.title === answer,
+  )?.value;
+}
+
+/**
+ * Where a bare `--text` answer belongs.
+ *
+ * A one-field form takes it directly. A question paired with its free-text
+ * companion takes it too, and which half depends on what was typed: an answer
+ * that names one of the offered options is that option, and anything else is
+ * the operator declining to pick one and writing their own — which is what the
+ * companion field exists for. Any other shape is refused, because guessing
+ * which of several fields a bare string belongs to would be answering a
+ * question the operator did not answer.
+ */
+function textAssignment(
+  entry: PendingElicitationRequest,
+  text: string,
+): { field: string; value: string } {
   const fields = elicitationFieldNames(entry);
   const [only] = fields;
-  if (fields.length !== 1 || only === undefined) {
-    throw new InvalidArgumentError(
-      `--text answers a form with exactly one field, but request ${entry.requestId} has ` +
-        `${fields.length} (fields: ${fieldNameList(entry)}); name one with --field <key>=<value>`,
-    );
+  if (fields.length === 1 && only !== undefined) {
+    return { field: only, value: text };
   }
-  return only;
+  const marked = soleMarkedQuestion(entry);
+  if (marked) {
+    const option = offeredOptionValue(entry, marked.question, text);
+    return option === undefined
+      ? { field: marked.custom, value: text }
+      : { field: marked.question, value: option };
+  }
+  throw new InvalidArgumentError(
+    `--text answers a one-field form, or a question paired with its free-text field, but ` +
+      `request ${entry.requestId} has ${fields.length} (fields: ${fieldNameList(entry)}); ` +
+      `name one with --field <key>=<value>`,
+  );
 }
 
 function assertRequiredFieldsPresent(
@@ -313,10 +409,11 @@ export function elicitationContentFromFlags(
   entry: PendingElicitationRequest,
   flags: { field?: string[]; text?: string; accept?: boolean },
 ): Record<string, PendingRequestContentValue> {
-  const grouped =
-    flags.text === undefined
-      ? groupFieldAssignments(flags.field ?? [])
-      : new Map([[soleFieldName(entry), [flags.text]]]);
+  const grouped = groupFieldAssignments(flags.field ?? []);
+  if (flags.text !== undefined) {
+    const { field, value } = textAssignment(entry, flags.text);
+    grouped.set(field, [value]);
+  }
 
   const content: Record<string, PendingRequestContentValue> = {};
   for (const [field, values] of grouped) {

@@ -28,7 +28,7 @@ const sections = [
   ["Start", ["index.md", "install.md", "quickstart.md"]],
   ["Agents", ["agents.md", "custom-agents.md"]],
   ["Sessions", ["sessions.md", "prompting.md", "session-control.md"]],
-  ["Output & Policy", ["output-formats.md", "permissions.md", "config.md"]],
+  ["Output & Policy", ["output-formats.md", "permissions.md", "deferred-requests.md", "config.md"]],
   ["Flows", ["flows.md"]],
   ["Reference", ["CLI.md", "exit-codes.md", "VISION.md"]],
 ];

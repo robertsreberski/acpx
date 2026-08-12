@@ -150,7 +150,7 @@ test("--text fills in a single-field form and refuses to guess for more", () => 
   // a one-question form has two properties and --text cannot pick between them.
   assert.throws(
     () => elicitationContentFromFlags(TYPED_FIELDS, { text: "which one?" }),
-    /--text answers a form with exactly one field, but request req-1 has 6/,
+    /--text answers a one-field form, or a question paired with its free-text field, but request req-1 has 6/,
   );
   assert.throws(
     () => elicitationContentFromFlags(makeEntry({}), { text: "nothing to fill" }),
@@ -364,5 +364,105 @@ test("--accept still cannot skip a required field", () => {
   assert.throws(() => elicitationContentFromFlags(required, { accept: true }), /requires who/);
   assert.deepEqual(elicitationContentFromFlags(required, { accept: true, field: ["who=a"] }), {
     who: "a",
+  });
+});
+
+/**
+ * The free-text companion an AskUserQuestion bridge pairs with each question.
+ *
+ * Field names here are deliberately NOT claude's `question_0` /
+ * `question_0_custom`: the link is the `_meta` marker, which the adapter
+ * documents as shared across bridges, and matching on names would work for one
+ * agent and silently fail for the next.
+ */
+function customAnswerMeta(questionField: string): Record<string, unknown> {
+  return { _askUserQuestionCustomAnswer: { questionId: questionField, isCustomAnswer: true } };
+}
+
+const ASK_WITH_CUSTOM = makeEntry({
+  q_main: {
+    type: "string",
+    title: "Greeting",
+    oneOf: [
+      { const: "Greeting A", title: "Greeting A" },
+      { const: "greeting-b", title: "Greeting B" },
+    ],
+  },
+  q_free: { type: "string", title: "Other", _meta: customAnswerMeta("q_main") },
+});
+
+test("--text picks the question field when it names an offered option", () => {
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { text: "Greeting A" }), {
+    q_main: "Greeting A",
+  });
+  // Naming the option by its title answers with the value behind it, which is
+  // what the agent reads back — the two differ whenever a bridge titles an
+  // option differently from the value it records.
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { text: "Greeting B" }), {
+    q_main: "greeting-b",
+  });
+});
+
+test("--text falls to the marked free-text field when it names no option", () => {
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { text: "Something else" }), {
+    q_free: "Something else",
+  });
+  // Near-misses are answers in their own right, not failed option matches.
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { text: "greeting a" }), {
+    q_free: "greeting a",
+  });
+});
+
+test("--text routes a multi-select question the same way", () => {
+  const multi = makeEntry({
+    q_main: {
+      type: "array",
+      items: {
+        anyOf: [
+          { const: "a", title: "Option A" },
+          { const: "b", title: "Option B" },
+        ],
+      },
+    },
+    q_free: { type: "string", _meta: customAnswerMeta("q_main") },
+  });
+  assert.deepEqual(elicitationContentFromFlags(multi, { text: "Option A" }), { q_main: ["a"] });
+  assert.deepEqual(elicitationContentFromFlags(multi, { text: "neither" }), { q_free: "neither" });
+});
+
+test("--text still refuses a form the marker cannot reduce to one question", () => {
+  // Two questions, each with its own companion: which one a bare string answers
+  // is exactly the guess --text must not make.
+  const twoQuestions = makeEntry({
+    q1: { type: "string" },
+    q1_free: { type: "string", _meta: customAnswerMeta("q1") },
+    q2: { type: "string" },
+    q2_free: { type: "string", _meta: customAnswerMeta("q2") },
+  });
+  assert.throws(
+    () => elicitationContentFromFlags(twoQuestions, { text: "x" }),
+    /--text answers a one-field form, .*but request req-1 has 4/,
+  );
+
+  // Two plain fields with no marker between them stay ambiguous too.
+  assert.throws(
+    () => elicitationContentFromFlags(makeEntry({ a: {}, b: {} }), { text: "x" }),
+    /has 2 \(fields: a, b\)/,
+  );
+
+  // A marker that points at a field the form does not have links nothing.
+  const dangling = makeEntry({
+    q_main: { type: "string" },
+    q_free: { type: "string", _meta: customAnswerMeta("missing") },
+  });
+  assert.throws(() => elicitationContentFromFlags(dangling, { text: "x" }), /has 2 /);
+});
+
+test("--field still reaches both halves of a marked pair directly", () => {
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { field: ["q_free=typed"] }), {
+    q_free: "typed",
+  });
+  assert.deepEqual(elicitationContentFromFlags(ASK_WITH_CUSTOM, { field: ["q_main=Greeting A"] }), {
+    q_main: "Greeting A",
   });
 });

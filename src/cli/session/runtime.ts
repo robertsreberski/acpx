@@ -597,20 +597,41 @@ function pendingRequestForEventLog(request: PendingRequest): Record<string, unkn
   return { ...request, toolCall };
 }
 
+/**
+ * Report a parked request's transitions, and mark the turn as having done
+ * something.
+ *
+ * Parking writes a durable record an operator can list and answer, so a turn
+ * that parked is a turn that touched the outside world. Retrying it would ask a
+ * second time while the first request is still sitting there waiting — which is
+ * exactly what the side-effect guard on prompt retries exists to prevent.
+ */
 function registerPendingRequestSink(
   options: RunSessionPromptOptions,
   output: OutputFormatter,
   pendingMessages: AcpJsonRpcMessage[],
+  markSideEffect: () => void,
 ): void {
-  options.onPendingRequestSink?.((event) => {
+  options.onPendingRequestSink?.(
+    createPendingRequestSink({ output, pendingMessages, markSideEffect }),
+  );
+}
+
+function createPendingRequestSink(params: {
+  output: OutputFormatter;
+  pendingMessages: AcpJsonRpcMessage[];
+  markSideEffect: () => void;
+}): (event: PendingRequestEvent) => void {
+  return (event) => {
+    params.markSideEffect();
     const notification = acpxExtensionNotification("_acpx/pending_request", {
       ...event,
       request: pendingRequestForEventLog(event.request),
     });
-    pendingMessages.push(notification);
+    params.pendingMessages.push(notification);
     // Attached --format json clients see park/answer transitions live.
-    output.onAcpMessage(notification);
-  });
+    params.output.onAcpMessage(notification);
+  };
 }
 
 function buildQueuedTaskRunOptions(
@@ -873,7 +894,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       options.onPermissionEscalation?.(event);
     },
   });
-  registerPendingRequestSink(options, output, pendingMessages);
+  registerPendingRequestSink(options, output, pendingMessages, () => {
+    promptTurnHadSideEffects = true;
+  });
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
   const activeController: ActiveSessionController = {
@@ -1299,3 +1322,8 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
     client: options.client,
   });
 }
+
+export const sessionRuntimeTestInternals = {
+  shouldRetryRuntimePrompt,
+  createPendingRequestSink,
+};

@@ -6010,6 +6010,12 @@ async function readPendingRequestEvents(
   return events;
 }
 
+/** The content the mock agent echoed back from an accepted elicitation. */
+async function readAcceptedElicitationContent(homeDir: string): Promise<string | undefined> {
+  const unescaped = (await readSessionStream(homeDir)).replaceAll('\\"', '"');
+  return /elicitation accepted:(\{[^}]*\})/.exec(unescaped)?.[1];
+}
+
 async function readSessionStream(homeDir: string): Promise<string> {
   const sessionsDir = path.join(homeDir, ".acpx", "sessions");
   let contents = "";
@@ -6647,7 +6653,7 @@ test("integration: --text answers a single-field form and refuses a multi-field 
     assert.equal(refused.code, 2, `${refused.stdout}${refused.stderr}`);
     assert.match(
       `${refused.stdout}${refused.stderr}`,
-      /--text answers a form with exactly one field/,
+      /--text answers a one-field form, or a question paired with its free-text field/,
     );
     assert.match(`${refused.stdout}${refused.stderr}`, /fields: question_0, question_0_custom/);
     // Refusing to answer leaves the request answerable.
@@ -6939,5 +6945,76 @@ test("integration: a comma-bearing option is refused as a list and reachable whe
       }, 25_000);
     },
     elicitPrompt(commaSchema, "Pick some"),
+  );
+});
+
+/**
+ * One question rendered the way an AskUserQuestion bridge renders it: the
+ * offered options, plus the free-text companion marked with the shared
+ * `_askUserQuestionCustomAnswer` meta key.
+ */
+const MARKED_QUESTION_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    q_main: {
+      type: "string",
+      title: "Greeting",
+      oneOf: [
+        { const: "Hello from A", title: "Greeting A" },
+        { const: "Hello from B", title: "Greeting B" },
+      ],
+    },
+    q_free: {
+      type: "string",
+      title: "Other",
+      _meta: { _askUserQuestionCustomAnswer: { questionId: "q_main", isCustomAnswer: true } },
+    },
+  },
+});
+
+test("integration: --text picks an offered option on a marked question pair", async () => {
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+      // Named by its title; the value behind it is what the agent receives.
+      const answered = await runCli(
+        [...deferArgs, "--format", "json", "respond", requestId, "--text", "Greeting B"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+
+      // Asserted on the exact accepted payload, because the schema echoed in the
+      // prompt mentions both field names too.
+      await waitFor(async () => {
+        const accepted = await readAcceptedElicitationContent(homeDir);
+        return accepted === undefined ? null : accepted;
+      }, 25_000);
+      assert.equal(await readAcceptedElicitationContent(homeDir), '{"q_main":"Hello from B"}');
+    },
+    elicitPrompt(MARKED_QUESTION_SCHEMA, "Which greeting?"),
+  );
+});
+
+test("integration: --text writes its own answer into the marked free-text field", async () => {
+  await withParkedElicitation(
+    async ({ homeDir, deferArgs }) => {
+      const requestId = String((await listRequestsJson(homeDir, deferArgs))[0]?.request_id);
+      const answered = await runCli(
+        [...deferArgs, "--format", "json", "respond", requestId, "--text", "Hello from Zed"],
+        homeDir,
+        { timeoutMs: 30_000 },
+      );
+      assert.equal(answered.code, 0, `${answered.stdout}${answered.stderr}`);
+
+      // Not one of the offered options, so it is the operator writing their own
+      // answer — which is exactly what the companion field is for.
+      await waitFor(async () => {
+        const accepted = await readAcceptedElicitationContent(homeDir);
+        return accepted === undefined ? null : accepted;
+      }, 25_000);
+      assert.equal(await readAcceptedElicitationContent(homeDir), '{"q_free":"Hello from Zed"}');
+    },
+    elicitPrompt(MARKED_QUESTION_SCHEMA, "Which greeting?"),
   );
 });

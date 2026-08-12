@@ -83,6 +83,8 @@ acpx codex respond <request-id> --field question_0='Greeting A'
 - Expiry **declines**; it never accepts. Nobody filled the form in, and synthesizing content would put words in the operator's mouth.
 - A hook or client failure also declines rather than inventing content, and says so in the log.
 
+For the full lifecycle, the external-controller recipe and the state machine, see [Deferred requests](deferred-requests.md).
+
 ## What counts as a "read"
 
 Read/search requests in `--approve-reads`:
