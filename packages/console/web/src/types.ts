@@ -18,8 +18,6 @@ export type ModeState = "unmanaged" | "stored" | "unverified" | "conflict";
 export interface AgentSummary {
   readonly id: string;
   readonly label: string;
-  readonly modes?: readonly { readonly id: string; readonly label: string }[];
-  readonly models?: readonly { readonly id: string; readonly label: string }[];
   readonly canBrowseSessions?: boolean;
 }
 

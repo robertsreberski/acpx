@@ -1,23 +1,18 @@
 import type { AgentSummary } from "./types";
 
-const SAFE_DEFAULT_AGENTS = new Set(["codex", "claude"]);
+const SAFE_DEFAULT_MODES: Readonly<Record<string, string>> = {
+  codex: "read-only",
+  claude: "default",
+};
 
-export type ModeControlType = "none" | "select" | "input";
+export function safeDefaultMode(agent: AgentSummary | undefined): string | undefined {
+  return agent ? SAFE_DEFAULT_MODES[agent.id] : undefined;
+}
 
 export function requiresExplicitMode(agent: AgentSummary | undefined): boolean {
-  return agent !== undefined && !SAFE_DEFAULT_AGENTS.has(agent.id);
+  return agent !== undefined && safeDefaultMode(agent) === undefined;
 }
 
-export function modeControlType(agent: AgentSummary | undefined): ModeControlType {
-  if (!agent) {
-    return "none";
-  }
-  if (agent.modes?.length) {
-    return "select";
-  }
-  return requiresExplicitMode(agent) ? "input" : "none";
-}
-
-export function normalizeSessionMode(value: string): string | undefined {
+export function normalizeExactId(value: string): string | undefined {
   return value.trim() || undefined;
 }

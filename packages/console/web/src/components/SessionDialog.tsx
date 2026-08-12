@@ -1,7 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { useDismissibleLayer } from "../dismissible-layer";
-import { modeControlType, normalizeSessionMode, requiresExplicitMode } from "../session-mode";
+import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
 import type { AgentSummary, ProviderSession } from "../types";
 import { Icon } from "./Icon";
@@ -31,9 +31,10 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   useDismissibleLayer(mode !== null, onClose, dialogRef);
 
   const agent = store.bootstrap.agents.find((item) => item.id === agentId);
-  const modeControl = modeControlType(agent);
   const modeRequired = requiresExplicitMode(agent);
-  const normalizedMode = normalizeSessionMode(sessionMode);
+  const defaultMode = safeDefaultMode(agent);
+  const normalizedMode = normalizeExactId(sessionMode);
+  const normalizedModel = normalizeExactId(model);
 
   useEffect(() => {
     if (!mode) {
@@ -121,7 +122,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             cwd,
             name: name.trim() || undefined,
             mode: normalizedMode,
-            model: model || undefined,
+            model: normalizedModel,
             permissionPolicy: "defer-risky",
           })
         : store.adoptSession({
@@ -203,57 +204,55 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
               placeholder="e.g. Fix checkout regression"
             />
           </label>
-          {modeControl === "input" && (
+          {mode === "create" ? (
+            <div className="form-columns">
+              <label className="form-field">
+                <span>Mode {!modeRequired && <em>optional</em>}</span>
+                <input
+                  value={sessionMode}
+                  onChange={(event) => setSessionMode(event.target.value)}
+                  placeholder={defaultMode ? `Safe default: ${defaultMode}` : "Exact agent mode ID"}
+                  autoComplete="off"
+                  required={modeRequired}
+                />
+                <small>
+                  {defaultMode
+                    ? `Leave blank to use the safe ${defaultMode} default.`
+                    : "Enter an exact mode ID. ACPX will not guess one."}
+                </small>
+              </label>
+              <label className="form-field">
+                <span>
+                  Model <em>optional</em>
+                </span>
+                <input
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder="Exact agent model ID"
+                  autoComplete="off"
+                />
+                <small>Leave blank to use the agent default.</small>
+              </label>
+            </div>
+          ) : (
             <label className="form-field">
-              <span>Mode</span>
+              <span>Mode {!modeRequired && <em>optional</em>}</span>
               <input
                 value={sessionMode}
                 onChange={(event) => setSessionMode(event.target.value)}
-                placeholder="Exact agent mode ID"
+                placeholder={defaultMode ? `Safe default: ${defaultMode}` : "Exact agent mode ID"}
                 autoComplete="off"
-                required
+                required={modeRequired}
               />
-              <small>This agent has no advertised modes. ACPX will not guess one.</small>
+              <small>
+                {defaultMode
+                  ? `Leave blank to use the safe ${defaultMode} default.`
+                  : "Enter an exact mode ID. ACPX will not guess one."}
+              </small>
             </label>
           )}
           {mode === "create" && (
             <>
-              {(modeControl === "select" || agent?.models?.length) && (
-                <div className="form-columns">
-                  {modeControl === "select" && agent?.modes?.length && (
-                    <label className="form-field">
-                      <span>Mode</span>
-                      <select
-                        value={sessionMode}
-                        onChange={(event) => setSessionMode(event.target.value)}
-                        required={modeRequired}
-                      >
-                        <option value="">
-                          {modeRequired ? "Choose a mode" : "Safe agent default"}
-                        </option>
-                        {agent.modes.map((item) => (
-                          <option value={item.id} key={item.id}>
-                            {item.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  )}
-                  {agent?.models?.length && (
-                    <label className="form-field">
-                      <span>Model</span>
-                      <select value={model} onChange={(event) => setModel(event.target.value)}>
-                        <option value="">Agent default</option>
-                        {agent.models.map((item) => (
-                          <option value={item.id} key={item.id}>
-                            {item.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  )}
-                </div>
-              )}
               <div className="policy-callout">
                 <strong>Review risky operations</strong>
                 <p>
@@ -262,23 +261,6 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
                 </p>
               </div>
             </>
-          )}
-          {mode === "adopt" && modeControl === "select" && agent?.modes?.length && (
-            <label className="form-field">
-              <span>Mode</span>
-              <select
-                value={sessionMode}
-                onChange={(event) => setSessionMode(event.target.value)}
-                required={modeRequired}
-              >
-                <option value="">{modeRequired ? "Choose a mode" : "Safe agent default"}</option>
-                {agent.modes.map((item) => (
-                  <option value={item.id} key={item.id}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-            </label>
           )}
           {mode === "adopt" && (
             <label className="form-field">

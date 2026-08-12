@@ -1,30 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { modeControlType, normalizeSessionMode, requiresExplicitMode } from "../src/session-mode";
+import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../src/session-mode";
 
-test("built-in agents retain safe defaults when no mode catalog is advertised", () => {
-  for (const id of ["codex", "claude"]) {
-    const agent = { id, label: id };
-    assert.equal(requiresExplicitMode(agent), false);
-    assert.equal(modeControlType(agent), "none");
-    assert.equal(normalizeSessionMode("  "), undefined);
-  }
+test("built-in agents expose their safe defaults without requiring a mode", () => {
+  const codex = { id: "codex", label: "Codex" };
+  const claude = { id: "claude", label: "Claude" };
+  assert.equal(safeDefaultMode(codex), "read-only");
+  assert.equal(safeDefaultMode(claude), "default");
+  assert.equal(requiresExplicitMode(codex), false);
+  assert.equal(requiresExplicitMode(claude), false);
 });
 
-test("custom agents require a free-form mode when no catalog is advertised", () => {
+test("custom agents require an exact free-form mode", () => {
   const agent = { id: "mock", label: "Mock" };
+  assert.equal(safeDefaultMode(agent), undefined);
   assert.equal(requiresExplicitMode(agent), true);
-  assert.equal(modeControlType(agent), "input");
-  assert.equal(normalizeSessionMode("  review  "), "review");
-  assert.equal(normalizeSessionMode("  "), undefined);
 });
 
-test("advertised mode catalogs keep a select control without weakening custom validation", () => {
-  const agent = {
-    id: "mock",
-    label: "Mock",
-    modes: [{ id: "review", label: "Review" }],
-  };
-  assert.equal(requiresExplicitMode(agent), true);
-  assert.equal(modeControlType(agent), "select");
+test("exact mode and model IDs are trimmed and blank values are omitted", () => {
+  assert.equal(normalizeExactId("  review  "), "review");
+  assert.equal(normalizeExactId("  gpt-custom  "), "gpt-custom");
+  assert.equal(normalizeExactId("  "), undefined);
 });

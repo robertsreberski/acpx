@@ -111,21 +111,24 @@ Choose **New session**, then select:
 - a registered ACP agent
 - a workspace under one of the server's allowed workspace roots
 - an optional session name
-- a supported mode and model, when advertised
-- the permission policy
+- an exact mode ID
+- an optional exact model ID
 
 Creating a session sends ACP `session/new` but does not automatically send a
 prompt. Browser-created sessions use a conservative default policy: read and
 search operations may proceed, while writes, command execution, and mode
 changes are deferred for a person. Codex starts in `read-only`; Claude starts
-in `default`. Unknown agents require an explicit choice rather than inheriting
-an `approve-all` project setting silently.
+in `default`. Those two mode fields may be left blank to use the safe default.
+Other agents require an explicit mode rather than inheriting an `approve-all`
+project setting silently. The console does not invent mode or model catalogs;
+enter exact IDs understood by the selected agent.
 
 ## Adopt an existing provider session
 
 Choose **Adopt session**, select an agent, and browse the provider sessions it
 advertises. If the adapter cannot list sessions, enter the exact provider
-session ID manually.
+session ID manually. Enter the exact mode ID to apply; Codex and Claude may use
+the same safe defaults as fresh sessions.
 
 Adoption uses ACP `session/resume` or `session/load`. It never falls back to a
 fresh `session/new`, because that would present an empty conversation as the
