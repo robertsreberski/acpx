@@ -268,6 +268,17 @@ export type SessionEventLog = {
 
 export const SESSION_TIMELINE_SCHEMA = "acpx.session_timeline.v1" as const;
 
+export type SessionTimelineLegacyImportSource = {
+  /** Stable filesystem identity (`device:inode`) so rotations do not duplicate history. */
+  source_identity: string;
+  /** First byte not yet consumed from this compatibility stream. */
+  offset: number;
+  /** True while bounded reads are discarding an over-large malformed line. */
+  discarding_line?: boolean;
+  /** A bounded scan reached EOF with a newline-less fragment to retry if it grows. */
+  trailing_fragment?: boolean;
+};
+
 /** Durable metadata for the lossless, append-only session timeline. */
 export type SessionTimelineMetadata = {
   schema: typeof SESSION_TIMELINE_SCHEMA;
@@ -280,8 +291,10 @@ export type SessionTimelineMetadata = {
   last_write_error?: string | null;
   /** True when events existed before the lossless timeline was enabled. */
   legacy_retained: boolean;
-  /** False only while retained compatibility-stream messages are being imported. */
+  /** True when every compatibility stream was caught up at the last bounded scan. */
   legacy_import_complete?: boolean;
+  /** Resumable compatibility-stream cursors, keyed by filesystem identity. */
+  legacy_import_sources?: SessionTimelineLegacyImportSource[];
   /** True when corruption or truncation made the authoritative history incomplete. */
   history_incomplete?: boolean;
 };

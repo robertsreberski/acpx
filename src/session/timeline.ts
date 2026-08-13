@@ -7,6 +7,7 @@ import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
   SessionRecord,
+  SessionTimelineLegacyImportSource,
   SessionTimelineMetadata,
 } from "../types.js";
 import { SESSION_TIMELINE_SCHEMA } from "../types.js";
@@ -25,6 +26,9 @@ const DEFAULT_PAGE_LIMIT = 200;
 const MAX_PAGE_LIMIT = 1_000;
 const REVERSE_READ_CHUNK_BYTES = 16 * 1024;
 const LOCK_RETRY_MS = 15;
+const LEGACY_READ_CHUNK_BYTES = 64 * 1024;
+export const LEGACY_IMPORT_MAX_BYTES_PER_READ = 4 * 1024 * 1024;
+export const LEGACY_IMPORT_MAX_MESSAGES_PER_READ = 2_048;
 
 export type SessionTimelineDirection = AcpMessageDirection | "internal";
 
@@ -36,8 +40,18 @@ export type SessionTimelineLifecycleEvent =
   | { type: "turn_cancelled" }
   | { type: "turn_interrupted" };
 
+export type SessionTimelineLegacyCursor = {
+  source_identity: string;
+  end_offset: number;
+};
+
 export type SessionTimelinePayload =
-  | { kind: "acp"; message: AcpJsonRpcMessage; source?: "legacy_stream" }
+  | {
+      kind: "acp";
+      message: AcpJsonRpcMessage;
+      source?: "legacy_stream";
+      legacy_cursor?: SessionTimelineLegacyCursor;
+    }
   | { kind: "lifecycle"; event: SessionTimelineLifecycleEvent };
 
 export type SessionTimelineEvent = {
@@ -80,6 +94,8 @@ export type SessionTimelinePage = {
   previousCursor?: string;
   hasMore: boolean;
   coverage: SessionTimelineCoverage;
+  /** True when another bounded compatibility-stream import pass is required. */
+  legacyImportPending?: true;
   /** Present when the last authoritative append failed and history may be incomplete. */
   writeError?: string;
 };
@@ -110,6 +126,8 @@ type TimelineCursor = {
 };
 
 type TimelineLock = { filePath: string };
+const timelineLockQueues = new Map<string, Promise<void>>();
+const timelineLockQueueDepths = new Map<string, number>();
 
 function timelinePath(sessionId: string, epoch: string): string {
   return path.join(
@@ -158,29 +176,157 @@ async function legacyCompatibilityFiles(record: SessionRecord): Promise<string[]
   return files;
 }
 
-function parseLegacyCompatibilityPayload(payload: string): AcpJsonRpcMessage[] {
-  const messages: AcpJsonRpcMessage[] = [];
-  for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
+type LegacyCompatibilitySource = {
+  filePath: string;
+  identity: string;
+  size: number;
+};
+
+type LegacyCompatibilityMessage = {
+  message: AcpJsonRpcMessage;
+  endOffset: number;
+};
+
+type LegacySourceRead = {
+  messages: LegacyCompatibilityMessage[];
+  offset: number;
+  bytesRead: number;
+  discardingLine: boolean;
+  trailingFragment: boolean;
+};
+
+async function legacyCompatibilitySources(
+  record: SessionRecord,
+): Promise<LegacyCompatibilitySource[]> {
+  const result: LegacyCompatibilitySource[] = [];
+  const identities = new Set<string>();
+  for (const filePath of await legacyCompatibilityFiles(record)) {
     try {
-      const parsed = JSON.parse(line) as unknown;
-      if (isAcpJsonRpcMessage(parsed)) {
-        messages.push(parsed);
+      const stat = await fs.stat(filePath);
+      const identity = `${String(stat.dev)}:${String(stat.ino)}`;
+      if (!identities.has(identity)) {
+        identities.add(identity);
+        result.push({ filePath, identity, size: stat.size });
       }
-    } catch {
-      // The compatibility stream has historically tolerated corrupt lines.
-      // The gap marker discloses that retained legacy history is incomplete.
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
     }
   }
-  return messages;
+  return result;
 }
 
-async function* readLegacyCompatibilityMessages(
-  record: SessionRecord,
-): AsyncGenerator<AcpJsonRpcMessage> {
-  const files = await legacyCompatibilityFiles(record);
-  for (const filePath of files) {
-    const payload = await fs.readFile(filePath, "utf8");
-    yield* parseLegacyCompatibilityPayload(payload);
+function parseLegacyCompatibilityLine(line: Buffer): AcpJsonRpcMessage | undefined {
+  if (line.length === 0) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(line.toString("utf8")) as unknown;
+    return isAcpJsonRpcMessage(parsed) ? parsed : undefined;
+  } catch {
+    // Compatibility streams historically tolerate corrupt lines. Their byte
+    // cursor still advances so one malformed entry cannot stall every read.
+    return undefined;
+  }
+}
+
+function consumeLegacyLines(input: {
+  data: Buffer;
+  dataStart: number;
+  messages: LegacyCompatibilityMessage[];
+  messageBudget: number;
+  discardingLine: boolean;
+}): { consumedBytes: number; discardingLine: boolean } {
+  let lineStart = 0;
+  let discardingLine = input.discardingLine;
+  for (let index = 0; index < input.data.length; index += 1) {
+    if (input.data[index] !== 0x0a) {
+      continue;
+    }
+    const endOffset = input.dataStart + index + 1;
+    if (discardingLine) {
+      discardingLine = false;
+    } else {
+      const parsed = parseLegacyCompatibilityLine(input.data.subarray(lineStart, index));
+      if (parsed) {
+        input.messages.push({ message: parsed, endOffset });
+      }
+    }
+    lineStart = index + 1;
+    if (input.messages.length >= input.messageBudget) {
+      return { consumedBytes: lineStart, discardingLine };
+    }
+  }
+  return { consumedBytes: lineStart, discardingLine };
+}
+
+// oxlint-disable-next-line eslint/complexity -- Bounded streaming distinguishes EOF, budget, and malformed-line progress.
+async function readLegacySource(input: {
+  source: LegacyCompatibilitySource;
+  cursor: SessionTimelineLegacyImportSource;
+  byteBudget: number;
+  messageBudget: number;
+}): Promise<LegacySourceRead> {
+  const handle = await fs.open(input.source.filePath, "r");
+  try {
+    let position = Math.min(input.cursor.offset, input.source.size);
+    let committedOffset = position;
+    let carry = Buffer.alloc(0);
+    let carryStart = position;
+    let bytesReadTotal = 0;
+    let discardingLine = input.cursor.discarding_line === true;
+    const messages: LegacyCompatibilityMessage[] = [];
+    while (
+      position < input.source.size &&
+      bytesReadTotal < input.byteBudget &&
+      messages.length < input.messageBudget
+    ) {
+      const bytesToRead = Math.min(
+        LEGACY_READ_CHUNK_BYTES,
+        input.source.size - position,
+        input.byteBudget - bytesReadTotal,
+      );
+      if (bytesToRead <= 0) {
+        break;
+      }
+      const chunk = Buffer.allocUnsafe(bytesToRead);
+      const { bytesRead } = await handle.read(chunk, 0, bytesToRead, position);
+      if (bytesRead === 0) {
+        break;
+      }
+      position += bytesRead;
+      bytesReadTotal += bytesRead;
+      const data = Buffer.concat([carry, chunk.subarray(0, bytesRead)]);
+      const consumed = consumeLegacyLines({
+        data,
+        dataStart: carryStart,
+        messages,
+        messageBudget: input.messageBudget,
+        discardingLine,
+      });
+      discardingLine = consumed.discardingLine;
+      committedOffset = carryStart + consumed.consumedBytes;
+      carry = Buffer.from(data.subarray(consumed.consumedBytes));
+      carryStart = committedOffset;
+    }
+    if (committedOffset === input.cursor.offset && bytesReadTotal >= input.byteBudget) {
+      // An entry larger than the per-read budget is malformed for the retained
+      // compatibility surface. Advance in bounded chunks and discard through
+      // its newline on later calls instead of allocating it or stalling.
+      committedOffset = position;
+      discardingLine = true;
+    }
+    return {
+      messages,
+      offset: committedOffset,
+      bytesRead: bytesReadTotal,
+      discardingLine,
+      trailingFragment:
+        position === input.source.size && carry.length > 0 && messages.length < input.messageBudget,
+    };
+  } finally {
+    await handle.close();
   }
 }
 
@@ -248,6 +394,45 @@ async function releaseTimelineLock(lock: TimelineLock): Promise<void> {
   });
 }
 
+/**
+ * Serialize every timeline mutation for one session in-process and across
+ * processes. The local FIFO also makes prune/read ordering deterministic while
+ * the filesystem lock remains the authority between independent acpx builds.
+ */
+export async function withSessionTimelineLock<T>(
+  sessionId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  timelineLockQueueDepths.set(sessionId, (timelineLockQueueDepths.get(sessionId) ?? 0) + 1);
+  const previous = timelineLockQueues.get(sessionId) ?? Promise.resolve();
+  let releaseLocal!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseLocal = resolve;
+  });
+  const tail = previous.then(() => current);
+  timelineLockQueues.set(sessionId, tail);
+  await previous;
+  let lock: TimelineLock | undefined;
+  try {
+    lock = await acquireTimelineLock(sessionId);
+    return await operation();
+  } finally {
+    if (lock) {
+      await releaseTimelineLock(lock);
+    }
+    releaseLocal();
+    if (timelineLockQueues.get(sessionId) === tail) {
+      timelineLockQueues.delete(sessionId);
+    }
+    const depth = (timelineLockQueueDepths.get(sessionId) ?? 1) - 1;
+    if (depth === 0) {
+      timelineLockQueueDepths.delete(sessionId);
+    } else {
+      timelineLockQueueDepths.set(sessionId, depth);
+    }
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -301,10 +486,19 @@ function hasValidTimelinePayload(payload: Record<string, unknown> | undefined): 
     return false;
   }
   const validators: Record<string, () => boolean> = {
-    acp: () => isAcpJsonRpcMessage(payload.message),
+    acp: () =>
+      isAcpJsonRpcMessage(payload.message) &&
+      (payload.legacy_cursor === undefined || isLegacyCursor(payload.legacy_cursor)),
     lifecycle: () => isLifecycleEvent(payload.event),
   };
   return typeof payload.kind === "string" && (validators[payload.kind]?.() ?? false);
+}
+
+function isLegacyCursor(value: unknown): value is SessionTimelineLegacyCursor {
+  const cursor = asRecord(value);
+  return Boolean(
+    cursor && typeof cursor.source_identity === "string" && isPositiveInteger(cursor.end_offset),
+  );
 }
 
 export function parseSessionTimelineEvent(value: unknown): SessionTimelineEvent | undefined {
@@ -368,33 +562,50 @@ async function checkpointTimelineMetadata(
   record: SessionRecord,
   metadata: SessionTimelineMetadata,
 ): Promise<void> {
+  const latest = await resolveSessionRecord(record.acpxRecordId);
+  latest.timeline = metadata;
+  await writeSessionRecord(latest);
   record.timeline = metadata;
-  const latest = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
-  if (latest && latest !== record) {
-    latest.timeline = metadata;
-    await writeSessionRecord(latest);
+}
+
+function legacyCursorFromLatestEvent(
+  event: SessionTimelineEvent | undefined,
+): SessionTimelineLegacyCursor | undefined {
+  return event?.payload.kind === "acp" ? event.payload.legacy_cursor : undefined;
+}
+
+function mergeCrashSafeLegacyCursor(
+  metadata: SessionTimelineMetadata,
+  latestEvent: SessionTimelineEvent | undefined,
+): void {
+  const latest = legacyCursorFromLatestEvent(latestEvent);
+  if (!latest) {
     return;
   }
-  await writeSessionRecord(record);
+  const sources = metadata.legacy_import_sources ?? [];
+  const current = sources.find((source) => source.source_identity === latest.source_identity);
+  if (current) {
+    current.offset = Math.max(current.offset, latest.end_offset);
+    current.discarding_line = false;
+  } else {
+    sources.push({ source_identity: latest.source_identity, offset: latest.end_offset });
+  }
+  metadata.legacy_import_sources = sources;
 }
 
 async function initializeMetadata(record: SessionRecord): Promise<SessionTimelineMetadata> {
-  const persisted = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
-  if (persisted?.timeline) {
+  const persisted = await resolveSessionRecord(record.acpxRecordId);
+  if (persisted.timeline) {
     // Disk is authoritative across writers. A caller may retain a record from
     // before another writer isolated a corrupt epoch; trusting that stale
     // object here would resurrect the abandoned epoch and hide newer events.
     record.timeline = persisted.timeline;
     return record.timeline;
   }
-  if (record.timeline) {
-    return record.timeline;
-  }
   const createdAt = isoNow();
   const epoch = randomUUID();
-  const retainedFiles = await legacyCompatibilityFiles(persisted ?? record);
-  const legacyRetained =
-    retainedFiles.length > 0 || (await sessionHasLegacyEvents(persisted ?? record));
+  const retainedFiles = await legacyCompatibilityFiles(persisted);
+  const legacyRetained = retainedFiles.length > 0 || (await sessionHasLegacyEvents(persisted));
   const metadata: SessionTimelineMetadata = {
     schema: SESSION_TIMELINE_SCHEMA,
     epoch,
@@ -404,12 +615,13 @@ async function initializeMetadata(record: SessionRecord): Promise<SessionTimelin
     last_write_error: null,
     legacy_retained: legacyRetained,
     legacy_import_complete: !legacyRetained,
+    legacy_import_sources: [],
   };
   record.timeline = metadata;
   // The epoch must be discoverable before its first append. A process crash
   // after append but before close must not strand an orphan timeline file and
   // cause the next writer to create another epoch.
-  await checkpointTimelineMetadata(persisted ?? record, metadata);
+  await checkpointTimelineMetadata(record, metadata);
   return metadata;
 }
 
@@ -438,6 +650,7 @@ async function reconcileTimelineMetadata(
     // The file is authoritative when a process died after append but before
     // checkpointing its session record.
     metadata.last_seq = latestSeq;
+    mergeCrashSafeLegacyCursor(metadata, latest);
   }
   record.timeline = metadata;
   return metadata;
@@ -452,6 +665,7 @@ function mergeLocalTimelineAnnotations(
   }
   latest.legacy_retained = local.legacy_retained;
   latest.legacy_import_complete = local.legacy_import_complete;
+  latest.legacy_import_sources = local.legacy_import_sources;
   latest.history_incomplete =
     latest.history_incomplete === true || local.history_incomplete === true;
   if (local.last_write_error != null) {
@@ -465,8 +679,7 @@ function mergeLocalTimelineAnnotations(
  * that another writer committed while this caller held a long-lived record.
  */
 export async function writeSessionRecordWithLatestTimeline(record: SessionRecord): Promise<void> {
-  const lock = await acquireTimelineLock(record.acpxRecordId);
-  try {
+  await withSessionTimelineLock(record.acpxRecordId, async () => {
     const localMetadata = record.timeline;
     const persisted = await resolveSessionRecord(record.acpxRecordId).catch(() => undefined);
     if (!localMetadata && !persisted?.timeline) {
@@ -481,9 +694,7 @@ export async function writeSessionRecordWithLatestTimeline(record: SessionRecord
     );
     record.timeline = metadata;
     await writeSessionRecord(record);
-  } finally {
-    await releaseTimelineLock(lock);
-  }
+  });
 }
 
 export class SessionTimelineWriter {
@@ -497,16 +708,31 @@ export class SessionTimelineWriter {
   }
 
   static async open(record: SessionRecord): Promise<SessionTimelineWriter> {
-    const lock = await acquireTimelineLock(record.acpxRecordId);
-    try {
-      const metadata = await reconcileTimelineMetadata(record, await initializeMetadata(record));
-      const writer = new SessionTimelineWriter(record, metadata);
-      await writer.importLegacyCompatibilityMessagesIfNeeded();
+    return await withSessionTimelineLock(record.acpxRecordId, async () => {
+      const writer = await SessionTimelineWriter.openWhileLocked(record);
+      while (await writer.importLegacyCompatibilityMessagesBounded()) {
+        // A mutating writer preserves chronological activation semantics by
+        // finishing retained history before it appends a new live event. Read
+        // paths use the one-pass public refresh and expose continuation.
+      }
       await checkpointTimelineMetadata(record, writer.metadata);
       return writer;
-    } finally {
-      await releaseTimelineLock(lock);
-    }
+    });
+  }
+
+  private static async openWhileLocked(record: SessionRecord): Promise<SessionTimelineWriter> {
+    const metadata = await reconcileTimelineMetadata(record, await initializeMetadata(record));
+    return new SessionTimelineWriter(record, metadata);
+  }
+
+  static async refreshLegacyCompatibility(sessionId: string): Promise<boolean> {
+    return await withSessionTimelineLock(sessionId, async () => {
+      const record = await resolveSessionRecord(sessionId);
+      const writer = await SessionTimelineWriter.openWhileLocked(record);
+      const pending = await writer.importLegacyCompatibilityMessagesBounded();
+      await checkpointTimelineMetadata(record, writer.metadata);
+      return pending;
+    });
   }
 
   getRecord(): SessionRecord {
@@ -545,28 +771,86 @@ export class SessionTimelineWriter {
     this.metadata.last_write_error = error instanceof Error ? error.message : String(error);
   }
 
-  private async importLegacyCompatibilityMessagesIfNeeded(): Promise<void> {
-    if (this.metadata.legacy_import_complete !== false) {
-      return;
+  // oxlint-disable-next-line eslint/complexity -- Rotation, truncation, and two independent budgets are explicit states.
+  private async importLegacyCompatibilityMessagesBounded(): Promise<boolean> {
+    const sources = await legacyCompatibilitySources(this.record);
+    if (sources.length === 0) {
+      this.metadata.legacy_import_complete = true;
+      this.metadata.legacy_import_sources ??= [];
+      return false;
     }
-    // A pending import is the first operation in a freshly persisted epoch, so
-    // last_seq is also the number of legacy messages durably appended before a
-    // crash. Resume at that boundary instead of duplicating its prefix.
-    let legacyIndex = 0;
-    for await (const message of readLegacyCompatibilityMessages(this.record)) {
-      legacyIndex += 1;
-      if (legacyIndex <= this.metadata.last_seq) {
+    this.metadata.legacy_retained = true;
+    const cursors = this.metadata.legacy_import_sources ?? [];
+    this.metadata.legacy_import_sources = cursors;
+    const activeIdentities = new Set(sources.map((source) => source.identity));
+    for (let index = cursors.length - 1; index >= 0; index -= 1) {
+      if (!activeIdentities.has(cursors[index]?.source_identity ?? "")) {
+        cursors.splice(index, 1);
+      }
+    }
+    let bytesRemaining = LEGACY_IMPORT_MAX_BYTES_PER_READ;
+    let messagesRemaining = LEGACY_IMPORT_MAX_MESSAGES_PER_READ;
+    for (const source of sources) {
+      if (bytesRemaining <= 0 || messagesRemaining <= 0) {
+        break;
+      }
+      let cursor = cursors.find((entry) => entry.source_identity === source.identity);
+      if (!cursor) {
+        cursor = { source_identity: source.identity, offset: 0 };
+        cursors.push(cursor);
+      } else if (source.size < cursor.offset) {
+        cursor.offset = 0;
+        cursor.discarding_line = false;
+        cursor.trailing_fragment = false;
+      }
+      if (cursor.offset >= source.size && cursor.discarding_line !== true) {
         continue;
       }
-      await this.appendWithoutLock({
-        direction: "internal",
-        capturedAt: this.metadata.created_at,
-        requestId: requestIdFromMessage(message),
-        payload: { kind: "acp", message, source: "legacy_stream" },
+      const read = await readLegacySource({
+        source,
+        cursor,
+        byteBudget: bytesRemaining,
+        messageBudget: messagesRemaining,
       });
+      bytesRemaining -= read.bytesRead;
+      for (const imported of read.messages) {
+        await this.appendWithoutLock({
+          direction: "internal",
+          capturedAt: this.metadata.created_at,
+          requestId: requestIdFromMessage(imported.message),
+          payload: {
+            kind: "acp",
+            message: imported.message,
+            source: "legacy_stream",
+            legacy_cursor: {
+              source_identity: source.identity,
+              end_offset: imported.endOffset,
+            },
+          },
+        });
+        cursor.offset = imported.endOffset;
+        cursor.discarding_line = false;
+        messagesRemaining -= 1;
+      }
+      cursor.offset = Math.max(cursor.offset, read.offset);
+      cursor.discarding_line = read.discardingLine || undefined;
+      cursor.trailing_fragment = read.trailingFragment || undefined;
+      // Every imported event carries its source end offset. If the process
+      // exits before this batched checkpoint, reconcile recovers the newest
+      // committed cursor from the append-only timeline.
+      await checkpointTimelineMetadata(this.record, this.metadata);
     }
-    this.metadata.legacy_import_complete = true;
-    await checkpointTimelineMetadata(this.record, this.metadata);
+    const latestSources = await legacyCompatibilitySources(this.record);
+    const pending = latestSources.some((source) => {
+      const cursor = cursors.find((entry) => entry.source_identity === source.identity);
+      return (
+        !cursor ||
+        (cursor.offset < source.size && cursor.trailing_fragment !== true) ||
+        (cursor.discarding_line === true && cursor.trailing_fragment !== true)
+      );
+    });
+    this.metadata.legacy_import_complete = !pending;
+    return pending;
   }
 
   private async append(input: {
@@ -579,8 +863,7 @@ export class SessionTimelineWriter {
     if (this.closed) {
       throw new Error("SessionTimelineWriter is closed");
     }
-    const lock = await acquireTimelineLock(this.record.acpxRecordId);
-    try {
+    await withSessionTimelineLock(this.record.acpxRecordId, async () => {
       this.metadata = await reconcileTimelineMetadata(
         this.record,
         await initializeMetadata(this.record),
@@ -594,9 +877,7 @@ export class SessionTimelineWriter {
         // duplicate an event that was durably committed.
         this.recordWriteError(error);
       }
-    } finally {
-      await releaseTimelineLock(lock);
-    }
+    });
   }
 
   private async appendWithoutLock(input: {
@@ -639,17 +920,14 @@ export class SessionTimelineWriter {
     }
 
     const localMetadata = this.metadata;
-    const lock = await acquireTimelineLock(this.record.acpxRecordId);
-    try {
+    await withSessionTimelineLock(this.record.acpxRecordId, async () => {
       const latest = await reconcileTimelineMetadata(
         this.record,
         await initializeMetadata(this.record),
       );
       this.metadata = mergeLocalTimelineAnnotations(latest, localMetadata);
       await checkpointTimelineMetadata(this.record, this.metadata);
-    } finally {
-      await releaseTimelineLock(lock);
-    }
+    });
   }
 }
 
@@ -1179,7 +1457,8 @@ function historyGaps(record: SessionRecord, observedCorrupt = false): SessionTim
   ];
 }
 
-export async function deleteSessionTimeline(sessionId: string): Promise<number> {
+/** Delete timeline data while the caller holds `withSessionTimelineLock`. */
+export async function deleteSessionTimelineWhileLocked(sessionId: string): Promise<number> {
   const directory = sessionBaseDir();
   const prefix = `${safeSessionId(sessionId)}.timeline.`;
   let names: string[];
@@ -1193,7 +1472,7 @@ export async function deleteSessionTimeline(sessionId: string): Promise<number> 
   }
   let bytes = 0;
   for (const name of names) {
-    if (!name.startsWith(prefix) || (!name.endsWith(".ndjson") && name !== `${prefix}lock`)) {
+    if (!name.startsWith(prefix) || !name.endsWith(".ndjson")) {
       continue;
     }
     const filePath = path.join(directory, name);
@@ -1207,4 +1486,9 @@ export async function deleteSessionTimeline(sessionId: string): Promise<number> 
   return bytes;
 }
 
-export const sessionTimelineTestInternals = { removeStaleLock, readTimelineEventsBackward };
+export const sessionTimelineTestInternals = {
+  removeStaleLock,
+  readTimelineEventsBackward,
+  timelineLockQueueDepth: (sessionId: string): number =>
+    timelineLockQueueDepths.get(sessionId) ?? 0,
+};

@@ -7,7 +7,7 @@ import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
 import { deletePendingRequestsForSession } from "../pending-requests.js";
-import { deleteSessionTimeline } from "../timeline.js";
+import { deleteSessionTimelineWhileLocked, withSessionTimelineLock } from "../timeline.js";
 import { createAtomicWriteTempPath } from "./atomic-write.js";
 import {
   loadOrRebuildSessionIndex,
@@ -467,18 +467,24 @@ async function pruneSessionFiles(
   dirEntries: string[],
   includeHistory: boolean,
 ): Promise<number> {
-  const safeId = encodeURIComponent(record.acpxRecordId);
-  let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
-  if (includeHistory) {
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
-      bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
+  return await withSessionTimelineLock(record.acpxRecordId, async () => {
+    const safeId = encodeURIComponent(record.acpxRecordId);
+    let bytesFreed = 0;
+    if (includeHistory) {
+      for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+        bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
+      }
+      bytesFreed += await deleteSessionTimelineWhileLocked(record.acpxRecordId);
     }
-    bytesFreed += await deleteSessionTimeline(record.acpxRecordId);
-  }
-  // Parked requests belong to the record; leaving them would strand entries
-  // nothing can ever answer.
-  await deletePendingRequestsForSession(record.acpxRecordId).catch(() => undefined);
-  return bytesFreed;
+    // Parked requests belong to the record; leaving them would strand entries
+    // nothing can ever answer.
+    await deletePendingRequestsForSession(record.acpxRecordId).catch(() => undefined);
+    // The primary record is the existence boundary and is deleted last. A
+    // transcript read that waited behind this prune therefore fails closed
+    // instead of checkpointing a stale record and resurrecting the session.
+    bytesFreed += await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
+    return bytesFreed;
+  });
 }
 
 async function unlinkCountingBytes(filePath: string): Promise<number> {

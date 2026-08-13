@@ -29,6 +29,7 @@ import {
   SessionTimelineCursorError,
   SessionTimelineWriter,
   sessionTimelineTestInternals,
+  withSessionTimelineLock,
 } from "../src/session/timeline.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../src/types.js";
 
@@ -749,6 +750,44 @@ test("timeline files survive close and are deleted only by history pruning", asy
     );
     await assert.rejects(fs.access(activePath));
     assert.equal(result.bytesFreed > 0, true);
+  });
+});
+
+test("a transcript read waiting behind prune cannot resurrect the primary record", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-prune-read-race", cwd);
+    record.closed = true;
+    record.closedAt = "2026-08-12T10:01:00.000Z";
+    record.lastSeq = 1;
+    record.eventLog.last_write_at = "2026-08-12T10:00:00.000Z";
+    await writeSessionRecord(record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${JSON.stringify(updateMessage(record.acpSessionId, "retained"))}\n`,
+      "utf8",
+    );
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const blocker = withSessionTimelineLock(record.acpxRecordId, async () => await gate);
+    while (sessionTimelineTestInternals.timelineLockQueueDepth(record.acpxRecordId) < 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    }
+    const prune = pruneSessions({ includeHistory: true });
+    while (sessionTimelineTestInternals.timelineLockQueueDepth(record.acpxRecordId) < 2) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    }
+    const waitingRead = SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId);
+    release();
+    await blocker;
+    await prune;
+    await assert.rejects(waitingRead, /Session not found/i);
+    await assert.rejects(resolveSessionRecord(record.acpxRecordId), /Session not found/i);
+    assert.equal(sessionTimelineTestInternals.timelineLockQueueDepth(record.acpxRecordId), 0);
   });
 });
 

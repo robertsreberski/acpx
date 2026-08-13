@@ -228,6 +228,8 @@ export type AcpxTranscriptPage = {
   previousCursor?: string;
   hasMore: boolean;
   coverage: SessionTimelineCoverage;
+  /** True when another bounded compatibility-stream import pass is required. */
+  legacyImportPending?: true;
   /** Present when the durable append-only transcript could not persist its latest write. */
   writeError?: string;
 };

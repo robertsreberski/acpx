@@ -630,9 +630,39 @@ function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined
     // compatibility messages after newer lossless events.
     legacy_import_complete:
       typeof record.legacy_import_complete === "boolean" ? record.legacy_import_complete : true,
+    legacy_import_sources: parseLegacyImportSources(record.legacy_import_sources),
     history_incomplete:
       typeof record.history_incomplete === "boolean" ? record.history_incomplete : undefined,
   };
+}
+
+// oxlint-disable-next-line eslint/complexity -- Persisted cursor fields fail closed independently.
+function parseLegacyImportSources(raw: unknown): SessionTimelineMetadata["legacy_import_sources"] {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  // oxlint-disable-next-line eslint/complexity -- Each persisted cursor field is validated independently.
+  const parsed = raw.flatMap((value) => {
+    const source = asRecord(value);
+    if (
+      !source ||
+      !isNonEmptyString(source.source_identity) ||
+      !isNonNegativeInteger(source.offset) ||
+      (source.discarding_line !== undefined && typeof source.discarding_line !== "boolean") ||
+      (source.trailing_fragment !== undefined && typeof source.trailing_fragment !== "boolean")
+    ) {
+      return [];
+    }
+    return [
+      {
+        source_identity: source.source_identity,
+        offset: source.offset,
+        ...(source.discarding_line === true ? { discarding_line: true } : {}),
+        ...(source.trailing_fragment === true ? { trailing_fragment: true } : {}),
+      },
+    ];
+  });
+  return parsed.length === raw.length ? parsed : undefined;
 }
 
 function hasValidTimelineCore(record: Record<string, unknown>): record is Record<
@@ -658,6 +688,7 @@ function hasValidTimelineCore(record: Record<string, unknown>): record is Record
       typeof record.last_write_error === "string",
     record.legacy_import_complete === undefined ||
       typeof record.legacy_import_complete === "boolean",
+    record.legacy_import_sources === undefined || Array.isArray(record.legacy_import_sources),
   ].every(Boolean);
 }
 

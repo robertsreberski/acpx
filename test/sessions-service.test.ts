@@ -129,6 +129,191 @@ test("the first transcript read imports retained chat idempotently before any mu
   });
 });
 
+test("later compatibility appends appear on the next transcript read exactly once", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-later-legacy-append",
+      acpSessionId: "provider-later-legacy-append",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const firstMessage = retainedMessage(record.acpSessionId, "Retained first");
+    const laterMessage = retainedMessage(record.acpSessionId, "Appended by warm owner");
+    record.lastSeq = 1;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    const streamPath = sessionEventActivePath(record.acpxRecordId);
+    await fs.writeFile(streamPath, `${JSON.stringify(firstMessage)}\n`, "utf8");
+    const keeper = await startKeeperProcess();
+    const ownerPaths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...ownerPaths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      queueProtocol: 1,
+    });
+    const service = createAcpxSessionService({ cwd });
+    try {
+      await service.getTranscriptPage({ acpxRecordId: record.acpxRecordId, limit: 20 });
+      await fs.appendFile(streamPath, `${JSON.stringify(laterMessage)}\n`, "utf8");
+      const second = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const third = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const messages = (page: typeof second) =>
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        );
+      assert.deepEqual(messages(second), [firstMessage, laterMessage]);
+      assert.deepEqual(messages(third), [firstMessage, laterMessage]);
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("modern timeline appends are not re-imported from their compatibility copy", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-modern-no-duplicate",
+      acpSessionId: "provider-modern-no-duplicate",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const retained = retainedMessage(record.acpSessionId, "Retained");
+    const modern = retainedMessage(record.acpSessionId, "Modern");
+    record.lastSeq = 1;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${JSON.stringify(retained)}\n`,
+      "utf8",
+    );
+    const service = createAcpxSessionService({ cwd });
+    const keeper = await startKeeperProcess();
+    const ownerPaths = queuePaths(homeDir, record.acpxRecordId);
+    try {
+      await service.getTranscriptPage({ acpxRecordId: record.acpxRecordId, limit: 20 });
+      const writer = await SessionEventWriter.open(await resolveSessionRecord(record.acpxRecordId));
+      await writer.appendMessage(modern);
+      await writer.close({ checkpoint: true });
+      await writeQueueOwnerLock({
+        ...ownerPaths,
+        pid: keeper.pid,
+        sessionId: record.acpxRecordId,
+        timeline: true,
+      });
+      const page = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.deepEqual(
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        ),
+        [retained, modern],
+      );
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("legacy first-read migration is bounded and advertises continuation", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-bounded-legacy-import",
+      acpSessionId: "provider-bounded-legacy-import",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const count = 2_049;
+    record.lastSeq = count;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${Array.from({ length: count }, (_value, index) =>
+        JSON.stringify(retainedMessage(record.acpSessionId, `message-${index}`)),
+      ).join("\n")}\n`,
+      "utf8",
+    );
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const first = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.equal(first.legacyImportPending, true);
+      assert.equal((await resolveSessionRecord(record.acpxRecordId)).timeline?.last_seq, 2_048);
+      const second = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.equal(second.legacyImportPending, undefined);
+      assert.equal((await resolveSessionRecord(record.acpxRecordId)).timeline?.last_seq, count);
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+test("a truncated terminal compatibility fragment does not request endless continuation", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-truncated-legacy-tail",
+      acpSessionId: "provider-truncated-legacy-tail",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const retained = retainedMessage(record.acpSessionId, "Retained");
+    record.lastSeq = 2;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${JSON.stringify(retained)}\n{"jsonrpc":"2.0","method":`,
+      "utf8",
+    );
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const first = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const second = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.equal(first.legacyImportPending, undefined);
+      assert.equal(second.legacyImportPending, undefined);
+      assert.equal(
+        second.items.filter((item) => "payload" in item && item.payload.kind === "acp").length,
+        1,
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
 test("bounded session projection preserves order and caps concurrent owner work", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => {

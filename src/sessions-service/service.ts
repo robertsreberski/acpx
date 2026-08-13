@@ -14,7 +14,11 @@ import {
   tryListRequestsOnRunningOwner,
   tryRespondOnRunningOwner,
 } from "../cli/queue/ipc.js";
-import { readLiveQueueOwner, readQueueOwnerRecord } from "../cli/queue/lease-store.js";
+import {
+  queueOwnerWritesTimeline,
+  readLiveQueueOwner,
+  readQueueOwnerRecord,
+} from "../cli/queue/lease-store.js";
 import { queueOwnerSpawnArgsForModule } from "../cli/session/queue-owner-process.js";
 import { sendSession } from "../cli/session/queue-owner-runtime.js";
 import {
@@ -922,24 +926,34 @@ class SessionService implements AcpxSessionService {
     return receipt;
   }
 
+  // oxlint-disable-next-line eslint/complexity -- Migration admission distinguishes initial, incomplete, and legacy-owner states.
   async getTranscriptPage(input: {
     acpxRecordId: string;
     before?: string;
     limit?: number;
   }): Promise<AcpxTranscriptPage> {
     const record = await this.requireExactRecord(input.acpxRecordId);
-    if (record.timeline?.legacy_import_complete !== true) {
+    let legacyImportPending = false;
+    const liveOwner = await readLiveQueueOwner(record.acpxRecordId);
+    const legacyOwnerCanAppend = liveOwner !== undefined && !queueOwnerWritesTimeline(liveOwner);
+    if (
+      record.timeline?.legacy_import_complete !== true ||
+      (record.timeline?.legacy_retained && legacyOwnerCanAppend) ||
+      (!record.timeline && record.lastSeq > 0)
+    ) {
       // Retained pre-ledger traffic used to appear only after the next prompt,
       // because prompt execution was the first path that opened a timeline
-      // writer. Complete/resume that idempotent import on the first transcript
-      // read so selecting a session never requires a mutation to reveal chat.
-      const writer = await SessionTimelineWriter.open(record);
-      await writer.close({ checkpoint: true });
+      // writer. Scan it on every transcript read: a warm pre-ledger owner can
+      // append more compatibility traffic after an earlier scan completed.
+      legacyImportPending = await SessionTimelineWriter.refreshLegacyCompatibility(
+        record.acpxRecordId,
+      );
     }
-    return await listSessionTimelinePage(input.acpxRecordId, {
+    const page = await listSessionTimelinePage(input.acpxRecordId, {
       before: input.before,
       limit: input.limit,
     });
+    return legacyImportPending ? { ...page, legacyImportPending: true } : page;
   }
 
   async readTimeline(input: {
