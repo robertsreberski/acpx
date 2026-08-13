@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertWorkspaceAllowed, resolveConsoleConfig } from "../src/config.js";
+import { assertWorkspaceAllowed, consoleDisplayHost, resolveConsoleConfig } from "../src/config.js";
 
 test("console defaults to a loopback bind and the current workspace", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-config-"));
@@ -33,10 +33,57 @@ test("non-loopback binding requires an explicit network trust decision", async (
   });
   assert.equal(config.trustNetwork, true);
   assert.deepEqual(config.allowedHosts, ["console.example.test"]);
+  assert.equal(consoleDisplayHost(config), "console.example.test");
   await assert.rejects(
     resolveConsoleConfig({ homeDir: root, cwd: root, host: "0.0.0.0", trustNetwork: true }),
     /explicit --allowed-host/,
   );
+  await assert.rejects(
+    resolveConsoleConfig({
+      homeDir: root,
+      cwd: root,
+      host: "0.0.0.0",
+      trustNetwork: true,
+      allowedHosts: ["0.0.0.0"],
+    }),
+    /non-wildcard allowed host/,
+  );
+  for (const wildcard of [
+    "::0",
+    "0::",
+    "0:0:0:0:0:0::",
+    "::0:0",
+    "0000::0000",
+    "0:0:0:0:0:0:0:0",
+  ]) {
+    await assert.rejects(
+      resolveConsoleConfig({
+        homeDir: root,
+        cwd: root,
+        host: wildcard,
+        trustNetwork: true,
+        allowedHosts: [wildcard],
+      }),
+      /non-wildcard allowed host/,
+    );
+  }
+  for (const allowedHost of [
+    "console.example.test:4174",
+    "[::1]:4174",
+    "console.example:notaport",
+    "foo:bar",
+  ]) {
+    await assert.rejects(
+      resolveConsoleConfig({
+        homeDir: root,
+        cwd: root,
+        host: "0.0.0.0",
+        trustNetwork: true,
+        allowedHosts: [allowedHost],
+      }),
+      /Invalid allowed host/,
+    );
+  }
 });
 
 test("workspace validation resolves symlinks before enforcing roots", async () => {

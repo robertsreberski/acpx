@@ -45,6 +45,29 @@ export function assertAllowedHost(request: IncomingMessage, allowedHosts: string
   }
 }
 
+export function assertSameOriginRequest(request: IncomingMessage): void {
+  const fetchSite = request.headers["sec-fetch-site"];
+  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+    throw new HttpError(403, "CROSS_SITE_REQUEST", "Cross-site requests are not allowed");
+  }
+  const origin = request.headers.origin;
+  if (!origin) {
+    return;
+  }
+  let parsedOrigin: URL;
+  try {
+    parsedOrigin = new URL(origin);
+  } catch {
+    throw new HttpError(403, "INVALID_ORIGIN", "Origin is invalid");
+  }
+  if (
+    parsedOrigin.protocol !== "http:" ||
+    parsedOrigin.host.toLowerCase() !== request.headers.host?.toLowerCase()
+  ) {
+    throw new HttpError(403, "ORIGIN_NOT_ALLOWED", "Cross-origin requests are not allowed");
+  }
+}
+
 function constantTimeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
@@ -65,22 +88,7 @@ function cookieValue(request: IncomingMessage, name: string): string | undefined
 }
 
 export function assertMutationRequest(request: IncomingMessage, csrfToken: string): string {
-  const fetchSite = request.headers["sec-fetch-site"];
-  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
-    throw new HttpError(403, "CROSS_SITE_REQUEST", "Cross-site mutations are not allowed");
-  }
-  const origin = request.headers.origin;
-  if (origin) {
-    let originHost: string;
-    try {
-      originHost = new URL(origin).host.toLowerCase();
-    } catch {
-      throw new HttpError(403, "INVALID_ORIGIN", "Origin is invalid");
-    }
-    if (originHost !== request.headers.host?.toLowerCase()) {
-      throw new HttpError(403, "ORIGIN_NOT_ALLOWED", "Cross-origin mutations are not allowed");
-    }
-  }
+  assertSameOriginRequest(request);
   const headerToken = request.headers["x-csrf-token"];
   const cookieToken = cookieValue(request, "acpx_console_csrf");
   if (
@@ -104,6 +112,55 @@ export function assertMutationRequest(request: IncomingMessage, csrfToken: strin
     );
   }
   return idempotencyKey;
+}
+
+export class InFlightRequestLimiter {
+  private globalCount = 0;
+  private readonly clientCounts = new Map<string, number>();
+
+  constructor(
+    private readonly globalLimit: number,
+    private readonly perClientLimit: number,
+  ) {
+    if (globalLimit < 1 || perClientLimit < 1 || perClientLimit > globalLimit) {
+      throw new Error("Invalid in-flight request limits");
+    }
+  }
+
+  async run<T>(client: string, operation: () => Promise<T>): Promise<T> {
+    const clientCount = this.clientCounts.get(client) ?? 0;
+    if (clientCount >= this.perClientLimit) {
+      throw new HttpError(
+        429,
+        "PROVIDER_ENUMERATION_LIMIT",
+        "Too many provider-session requests from this client",
+      );
+    }
+    if (this.globalCount >= this.globalLimit) {
+      throw new HttpError(
+        503,
+        "PROVIDER_ENUMERATION_CAPACITY",
+        "Provider-session request capacity is temporarily full",
+      );
+    }
+    this.globalCount += 1;
+    this.clientCounts.set(client, clientCount + 1);
+    try {
+      return await operation();
+    } finally {
+      this.globalCount -= 1;
+      const remaining = (this.clientCounts.get(client) ?? 1) - 1;
+      if (remaining === 0) {
+        this.clientCounts.delete(client);
+      } else {
+        this.clientCounts.set(client, remaining);
+      }
+    }
+  }
+
+  get activeCount(): number {
+    return this.globalCount;
+  }
 }
 
 export class MutationRateLimiter {

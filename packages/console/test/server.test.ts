@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ResolvedConsoleConfig } from "../src/config.js";
-import { startAcpxConsoleServer } from "../src/server.js";
+import { startAcpxConsoleServer, type AcpxConsoleServerOptions } from "../src/server.js";
 import { MockSessionService } from "./helpers.js";
 
-async function fixture() {
+async function fixture(
+  serverOptions: Pick<AcpxConsoleServerOptions, "providerEnumerationLimit"> = {},
+) {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-server-"));
   const web = join(root, "web");
   const workspace = join(root, "workspace");
@@ -29,6 +31,7 @@ async function fixture() {
     config,
     service,
     logger: { info() {}, warn() {}, error() {} },
+    ...serverOptions,
   });
   return { root, workspace, service, running };
 }
@@ -174,6 +177,127 @@ test("mutations reject cross-origin and cross-site browser requests", async () =
   } finally {
     await running.close();
   }
+});
+
+test("costly reads and event streams reject hostile browser requests before service work", async () => {
+  const { running, service } = await fixture();
+  try {
+    const hostileHeaders = { "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "cross-site" };
+    const provider = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+      headers: hostileHeaders,
+    });
+    assert.equal(provider.status, 403);
+    assert.equal(
+      service.calls.some((call) => call.method === "listProviderSessions"),
+      false,
+    );
+
+    const events = await fetch(`${running.origin}/api/v1/events`, { headers: hostileHeaders });
+    assert.equal(events.status, 403);
+
+    const wrongScheme = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+      headers: { Origin: running.origin.replace(/^http:/, "https:") },
+    });
+    assert.equal(wrongScheme.status, 403);
+    assert.equal(
+      service.calls.some((call) => call.method === "listProviderSessions"),
+      false,
+    );
+
+    const legitimate = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+      headers: { "Sec-Fetch-Site": "same-origin", Origin: running.origin },
+    });
+    assert.equal(legitimate.status, 200);
+    assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
+  } finally {
+    await running.close();
+  }
+});
+
+test("provider-session enumeration rejects excess in-flight work per client", async () => {
+  const { running, service } = await fixture({
+    providerEnumerationLimit: { global: 1, perClient: 1 },
+  });
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  service.listProviderSessions = async () => {
+    markEntered();
+    await blocked;
+    return { sessions: [] };
+  };
+  try {
+    const first = fetch(`${running.origin}/api/v1/agents/codex/sessions`);
+    await entered;
+    const refused = await fetch(`${running.origin}/api/v1/agents/codex/sessions`);
+    assert.equal(refused.status, 429);
+    assert.equal(
+      ((await refused.json()) as { error: { code: string } }).error.code,
+      "PROVIDER_ENUMERATION_LIMIT",
+    );
+    release();
+    assert.equal((await first).status, 200);
+  } finally {
+    release();
+    await running.close();
+  }
+});
+
+test("wildcard binds display an explicit allowed host", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-wildcard-display-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const running = await startAcpxConsoleServer({
+    config: {
+      host: "0.0.0.0",
+      port: 0,
+      trustNetwork: true,
+      allowedHosts: ["console.example.test"],
+      workspaceRoots: [root],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service: new MockSessionService(),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  try {
+    assert.match(running.origin, /^http:\/\/console\.example\.test:\d+$/);
+    assert.doesNotMatch(running.origin, /0\.0\.0\.0|\[::\]/);
+  } finally {
+    await running.close();
+  }
+});
+
+test("an invalid direct wildcard display host fails before subscription", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-invalid-display-"));
+  const service = new MockSessionService();
+  let subscribed = false;
+  service.subscribe = () => {
+    subscribed = true;
+    return () => undefined;
+  };
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "::0",
+        port: 0,
+        trustNetwork: true,
+        allowedHosts: ["::"],
+        workspaceRoots: [root],
+        stateDir: join(root, "state"),
+        staticDir: join(root, "web"),
+      },
+      service,
+    }),
+    /non-wildcard allowed host/,
+  );
+  assert.equal(subscribed, false);
 });
 
 test("JSON request bodies are bounded before parsing", async () => {
@@ -486,6 +610,32 @@ test("structurally shaped service failures cannot expose messages or details", a
     const text = await response.text();
     assert.doesNotMatch(text, /SECRET|operator|private\.json|token/);
     assert.match(text, /INTERNAL_ERROR/);
+  } finally {
+    await running.close();
+  }
+});
+
+test("unknown session-start results require reconciliation instead of reporting generic failure", async () => {
+  const { running, service, workspace } = await fixture();
+  service.createSession = async () => {
+    throw Object.assign(new Error("provider may have created session provider-secret"), {
+      code: "SESSION_START_RESULT_UNKNOWN",
+    });
+  };
+  try {
+    const auth = await bootstrap(running.origin);
+    const response = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "unknown-create-result"),
+      body: JSON.stringify({ agentId: "codex", cwd: workspace }),
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: {
+        code: "SESSION_START_RESULT_UNKNOWN",
+        message: "Session start result is unknown; reconcile before retrying",
+      },
+    });
   } finally {
     await running.close();
   }

@@ -1,4 +1,5 @@
 import { realpath, readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,6 +49,37 @@ export function isLoopbackHost(host: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
+export function isWildcardHost(host: string): boolean {
+  const normalized = host
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  if (normalized === "0.0.0.0") {
+    return true;
+  }
+  if (normalized.includes(":")) {
+    try {
+      return new URL(`http://[${normalized}]`).hostname === "[::]";
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+export function consoleDisplayHost(
+  config: Pick<ResolvedConsoleConfig, "host" | "allowedHosts">,
+): string {
+  if (!isWildcardHost(config.host)) {
+    return config.host;
+  }
+  const displayHost = config.allowedHosts.find((host) => !isWildcardHost(host));
+  if (!displayHost) {
+    throw new Error("A wildcard bind requires an explicit non-wildcard allowed host");
+  }
+  return displayHost;
+}
+
 function assertPort(port: number): void {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error(`Invalid console port: ${port}`);
@@ -56,10 +88,23 @@ function assertPort(port: number): void {
 
 function normalizeAllowedHost(host: string): string {
   const trimmed = host.trim().toLowerCase();
-  if (trimmed === "" || trimmed.includes("/") || trimmed.includes("\\")) {
+  const bare = trimmed.replace(/^\[|\]$/g, "");
+  if (
+    trimmed === "" ||
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    /^\[[^\]]+\]:\d+$/.test(trimmed) ||
+    /^[^:[\]]+:\d+$/.test(trimmed) ||
+    (bare.includes(":") && isIP(bare) !== 6) ||
+    (!bare.includes(":") &&
+      isIP(bare) === 0 &&
+      !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(
+        bare,
+      ))
+  ) {
     throw new Error(`Invalid allowed host: ${host}`);
   }
-  return trimmed.replace(/^\[|\]$/g, "");
+  return bare;
 }
 
 async function readConfigFile(path: string): Promise<ConsoleConfigFile> {
@@ -142,16 +187,16 @@ export async function resolveConsoleConfig(
     requestedRoots.map(async (root) => realpath(resolve(cwd, root))),
   );
   const configuredAllowedHosts = overrides.allowedHosts ?? file.allowedHosts;
-  if (
-    (host === "0.0.0.0" || host === "::") &&
-    (!configuredAllowedHosts || configuredAllowedHosts.length === 0)
-  ) {
+  if (isWildcardHost(host) && (!configuredAllowedHosts || configuredAllowedHosts.length === 0)) {
     throw new Error(`A wildcard bind requires at least one explicit --allowed-host value`);
   }
   const defaultHosts = isLoopbackHost(host) ? ["localhost", "127.0.0.1", "::1"] : [host];
   const allowedHosts = [...new Set(configuredAllowedHosts ?? defaultHosts)].map(
     normalizeAllowedHost,
   );
+  if (isWildcardHost(host) && !allowedHosts.some((allowedHost) => !isWildcardHost(allowedHost))) {
+    throw new Error("A wildcard bind requires an explicit non-wildcard allowed host");
+  }
 
   const stateDir = resolve(overrides.stateDir ?? defaultConsoleStateDir(home));
   const staticDir = resolve(

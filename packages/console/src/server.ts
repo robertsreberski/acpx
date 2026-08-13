@@ -5,7 +5,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Socket } from "node:net";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { assertWorkspaceAllowed, ConsoleInputError, type ResolvedConsoleConfig } from "./config.js";
+import {
+  assertWorkspaceAllowed,
+  consoleDisplayHost,
+  ConsoleInputError,
+  type ResolvedConsoleConfig,
+} from "./config.js";
 import type {
   AcpxConsoleSessionService,
   ConsoleBootstrap,
@@ -15,7 +20,9 @@ import {
   applySecurityHeaders,
   assertAllowedHost,
   assertMutationRequest,
+  assertSameOriginRequest,
   HttpError,
+  InFlightRequestLimiter,
   MutationRateLimiter,
   optionalString,
   readJsonBody,
@@ -29,6 +36,8 @@ const MAX_SSE_CLIENTS = 64;
 const MAX_SERVER_CONNECTIONS = 128;
 const TIMELINE_PAGE_LIMIT = 100;
 const MAX_TIMELINE_PAGE_LIMIT = 500;
+const MAX_PROVIDER_ENUMERATIONS = 8;
+const MAX_PROVIDER_ENUMERATIONS_PER_CLIENT = 2;
 
 interface BufferedEvent {
   id: number;
@@ -40,6 +49,7 @@ export interface AcpxConsoleServerOptions {
   service: AcpxConsoleSessionService;
   logger?: Pick<Console, "error" | "info" | "warn">;
   mutationRateLimit?: { maxRequests: number; windowMs: number };
+  providerEnumerationLimit?: { global: number; perClient: number };
 }
 
 export interface RunningAcpxConsoleServer {
@@ -99,6 +109,10 @@ const SAFE_SERVICE_ERRORS: Readonly<
   CURSOR_EXPIRED: { statusCode: 410, message: "Timeline cursor has expired" },
   AGENT_NOT_REGISTERED: { statusCode: 400, message: "Agent is not registered" },
   SESSION_ADOPTION_FAILED: { statusCode: 422, message: "Provider session could not be adopted" },
+  SESSION_START_RESULT_UNKNOWN: {
+    statusCode: 409,
+    message: "Session start result is unknown; reconcile before retrying",
+  },
   AGENT_CAPABILITY_UNSUPPORTED: {
     statusCode: 422,
     message: "Agent does not support this operation",
@@ -296,6 +310,7 @@ async function handleApi(
     service: AcpxConsoleSessionService;
     csrfToken: string;
     mutationRateLimiter: MutationRateLimiter;
+    providerEnumerationLimiter: InFlightRequestLimiter;
     connectSse(response: ServerResponse, lastEventId?: string): void;
   },
 ): Promise<boolean> {
@@ -311,6 +326,9 @@ async function handleApi(
   if (method === "GET" && path === "/healthz") {
     sendJson(response, 200, { status: "ok", version: 1 });
     return true;
+  }
+  if (method === "GET" && path.startsWith("/api/")) {
+    assertSameOriginRequest(request);
   }
   if (method === "GET" && path === "/api/v1/bootstrap") {
     response.setHeader(
@@ -394,14 +412,19 @@ async function handleApi(
     const cwd = cwdParam
       ? await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots)
       : undefined;
+    const client = request.socket.remoteAddress ?? "unknown";
     sendJson(
       response,
       200,
-      await context.service.listProviderSessions({
-        agentId: provider[0],
-        cwd,
-        cursor: url.searchParams.get("cursor") ?? undefined,
-      }),
+      await context.providerEnumerationLimiter.run(
+        client,
+        async () =>
+          await context.service.listProviderSessions({
+            agentId: provider[0],
+            cwd,
+            cursor: url.searchParams.get("cursor") ?? undefined,
+          }),
+      ),
     );
     return true;
   }
@@ -501,10 +524,15 @@ export async function startAcpxConsoleServer(
   options: AcpxConsoleServerOptions,
 ): Promise<RunningAcpxConsoleServer> {
   const logger = options.logger ?? console;
+  const selectedDisplayHost = consoleDisplayHost(options.config);
   const csrfToken = randomBytes(32).toString("base64url");
   const mutationRateLimiter = new MutationRateLimiter(
     options.mutationRateLimit?.maxRequests,
     options.mutationRateLimit?.windowMs,
+  );
+  const providerEnumerationLimiter = new InFlightRequestLimiter(
+    options.providerEnumerationLimit?.global ?? MAX_PROVIDER_ENUMERATIONS,
+    options.providerEnumerationLimit?.perClient ?? MAX_PROVIDER_ENUMERATIONS_PER_CLIENT,
   );
   const events: BufferedEvent[] = [];
   const clients = new Set<ServerResponse>();
@@ -586,6 +614,7 @@ export async function startAcpxConsoleServer(
         service: options.service,
         csrfToken,
         mutationRateLimiter,
+        providerEnumerationLimiter,
         connectSse,
       });
       if (!handled) {
@@ -649,9 +678,9 @@ export async function startAcpxConsoleServer(
   }
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : options.config.port;
-  const displayHost = options.config.host.includes(":")
-    ? `[${options.config.host}]`
-    : options.config.host;
+  const displayHost = selectedDisplayHost.includes(":")
+    ? `[${selectedDisplayHost}]`
+    : selectedDisplayHost;
   const origin = `http://${displayHost}:${port}`;
   logger.info(`ACPX Console listening at ${origin}`);
   if (options.config.trustNetwork && !options.config.host.startsWith("127.")) {

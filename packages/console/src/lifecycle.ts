@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
+  link,
   mkdir,
   open as openFile,
   readFile,
@@ -19,7 +21,7 @@ import {
 } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ResolvedConsoleConfig } from "./config.js";
+import { isWildcardHost, type ResolvedConsoleConfig } from "./config.js";
 import type { AcpxConsoleSessionService } from "./contracts.js";
 import { startAcpxConsoleServer, type RunningAcpxConsoleServer } from "./server.js";
 
@@ -45,6 +47,8 @@ export interface ConsoleRuntimeRecord {
 
 export interface ConsoleLifecyclePaths {
   runtime: string;
+  claim: string;
+  claimGuard: string;
   control: string;
   stdout: string;
   stderr: string;
@@ -58,10 +62,26 @@ export function lifecyclePaths(stateDir: string): ConsoleLifecyclePaths {
       : join(tmpdir(), `acpx-console-${stateIdentity}.sock`);
   return {
     runtime: join(stateDir, "runtime.json"),
+    claim: join(stateDir, "runtime.claim"),
+    claimGuard: join(stateDir, "runtime.claim.guard"),
     control,
     stdout: join(stateDir, "console.log"),
     stderr: join(stateDir, "console.error.log"),
   };
+}
+
+interface ConsoleRuntimeClaim {
+  schema: "acpx.console.claim.v1";
+  pid: number;
+  instanceToken: string;
+}
+
+function instanceControlPath(stateDir: string, instanceToken: string): string {
+  const stateIdentity = createHash("sha256").update(resolve(stateDir)).digest("hex").slice(0, 12);
+  const instanceIdentity = createHash("sha256").update(instanceToken).digest("hex").slice(0, 12);
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\acpx-console-${stateIdentity}-${instanceIdentity}`
+    : join(tmpdir(), `acpx-console-${stateIdentity}-${instanceIdentity}.sock`);
 }
 
 async function prepareStateDir(stateDir: string): Promise<void> {
@@ -131,20 +151,174 @@ async function writeRuntimeRecord(stateDir: string, record: ConsoleRuntimeRecord
   }
 }
 
-async function cleanStaleLifecycle(stateDir: string): Promise<void> {
-  const paths = lifecyclePaths(stateDir);
-  await rm(paths.runtime, { force: true });
-  if (process.platform !== "win32") {
-    await rm(paths.control, { force: true });
+async function readRuntimeClaim(stateDir: string): Promise<ConsoleRuntimeClaim | undefined> {
+  const path = lifecyclePaths(stateDir).claim;
+  try {
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("schema" in value) ||
+      value.schema !== "acpx.console.claim.v1" ||
+      !("pid" in value) ||
+      typeof value.pid !== "number" ||
+      !("instanceToken" in value) ||
+      typeof value.instanceToken !== "string" ||
+      value.instanceToken.length < 32
+    ) {
+      throw new Error(`ACPX Console runtime claim is invalid: ${path}`);
+    }
+    return value as ConsoleRuntimeClaim;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error(`ACPX Console runtime claim is corrupt: ${path}`, { cause: error });
+    }
+    throw error;
   }
 }
 
-async function assertNoRunningConsole(stateDir: string): Promise<void> {
-  const record = await readRuntimeRecord(stateDir);
-  if (record && isProcessAlive(record.pid) && (await authenticateRuntime(record))) {
-    throw new Error(`ACPX Console is already running at ${record.origin} (pid ${record.pid})`);
+async function removeOwnedClaim(stateDir: string, instanceToken: string): Promise<boolean> {
+  const claim = await readRuntimeClaim(stateDir);
+  if (!claim || claim.instanceToken !== instanceToken) {
+    return false;
   }
-  await cleanStaleLifecycle(stateDir);
+  await rm(lifecyclePaths(stateDir).claim, { force: true });
+  return true;
+}
+
+async function acquireRuntimeClaim(
+  stateDir: string,
+  instanceToken: string,
+): Promise<ConsoleRuntimeClaim> {
+  const paths = lifecyclePaths(stateDir);
+  const claim: ConsoleRuntimeClaim = {
+    schema: "acpx.console.claim.v1",
+    pid: process.pid,
+    instanceToken,
+  };
+  const temporary = `${paths.claim}.${process.pid}.${instanceToken}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(claim)}\n`, { mode: 0o600 });
+  try {
+    const guardDeadline = Date.now() + CONTROL_TIMEOUT_MS;
+    for (;;) {
+      try {
+        await link(temporary, paths.claimGuard);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw error;
+        }
+        let guard: ConsoleRuntimeClaim;
+        try {
+          const value: unknown = JSON.parse(await readFile(paths.claimGuard, "utf8"));
+          guard = value as ConsoleRuntimeClaim;
+          if (
+            guard.schema !== "acpx.console.claim.v1" ||
+            typeof guard.pid !== "number" ||
+            typeof guard.instanceToken !== "string" ||
+            guard.instanceToken.length < 32
+          ) {
+            throw new Error(`ACPX Console claim guard is invalid: ${paths.claimGuard}`, {
+              cause: error,
+            });
+          }
+        } catch (guardError) {
+          if ((guardError as NodeJS.ErrnoException).code === "ENOENT") {
+            continue;
+          }
+          throw guardError;
+        }
+        if (!isProcessAlive(guard.pid)) {
+          throw new Error(
+            `ACPX Console claim recovery was interrupted by dead pid ${guard.pid}; remove ${paths.claimGuard} after verifying no startup is active`,
+            { cause: error },
+          );
+        }
+        if (Date.now() >= guardDeadline) {
+          throw new Error("Timed out waiting for another ACPX Console startup claim", {
+            cause: error,
+          });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    try {
+      const owner = await readRuntimeClaim(stateDir);
+      if (owner && isProcessAlive(owner.pid)) {
+        throw new Error(
+          `ACPX Console state is already claimed by a live process (pid ${owner.pid})`,
+        );
+      }
+      if (owner) {
+        await rm(paths.claim, { force: true });
+      }
+      await link(temporary, paths.claim);
+      return claim;
+    } finally {
+      const guard = await readFile(paths.claimGuard, "utf8").catch(() => undefined);
+      if (guard === `${JSON.stringify(claim)}\n`) {
+        await rm(paths.claimGuard, { force: true });
+      }
+    }
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function removeStaleControlEndpoint(
+  stateDir: string,
+  record: ConsoleRuntimeRecord,
+): Promise<void> {
+  if (process.platform === "win32") {
+    return;
+  }
+  const expectedPaths = new Set([
+    lifecyclePaths(stateDir).control,
+    instanceControlPath(stateDir, record.instanceToken),
+  ]);
+  if (expectedPaths.has(record.controlPath)) {
+    await rm(record.controlPath, { force: true });
+  }
+}
+
+async function removeOwnedRuntime(stateDir: string, instanceToken: string): Promise<void> {
+  const paths = lifecyclePaths(stateDir);
+  const record = await readRuntimeRecord(stateDir);
+  if (record?.instanceToken === instanceToken) {
+    await rm(paths.runtime, { force: true });
+  }
+}
+
+async function claimConsoleLifecycle(
+  stateDir: string,
+  instanceToken: string,
+): Promise<ConsoleRuntimeClaim> {
+  const record = await readRuntimeRecord(stateDir);
+  if (record && isProcessAlive(record.pid)) {
+    throw new Error(
+      `ACPX Console state belongs to a live${(await authenticateRuntime(record)) ? "" : " but unreachable"} process at ${record.origin} (pid ${record.pid})`,
+    );
+  }
+  const claim = await acquireRuntimeClaim(stateDir, instanceToken);
+  try {
+    const current = await readRuntimeRecord(stateDir);
+    if (current && isProcessAlive(current.pid)) {
+      throw new Error(
+        `ACPX Console state belongs to a live process at ${current.origin} (pid ${current.pid})`,
+      );
+    }
+    if (current) {
+      await removeStaleControlEndpoint(stateDir, current);
+      await rm(lifecyclePaths(stateDir).runtime, { force: true });
+    }
+    return claim;
+  } catch (error) {
+    await removeOwnedClaim(stateDir, instanceToken).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function startControlServer(
@@ -152,10 +326,7 @@ async function startControlServer(
   instanceToken: string,
   stop: () => Promise<void>,
 ): Promise<{ server: NetServer; controlPath: string; sockets: Set<Socket> }> {
-  const controlPath = lifecyclePaths(stateDir).control;
-  if (process.platform !== "win32") {
-    await rm(controlPath, { force: true });
-  }
+  const controlPath = instanceControlPath(stateDir, instanceToken);
   const sockets = new Set<Socket>();
   const server = createNetServer((socket) => {
     sockets.add(socket);
@@ -253,9 +424,36 @@ export async function startForegroundConsole(
   service: AcpxConsoleSessionService,
 ): Promise<ForegroundConsole> {
   await prepareStateDir(config.stateDir);
-  await assertNoRunningConsole(config.stateDir);
-  const running = await startAcpxConsoleServer({ config, service });
+  const instanceToken = randomBytes(32).toString("base64url");
+  try {
+    await claimConsoleLifecycle(config.stateDir, instanceToken);
+  } catch (error) {
+    try {
+      await service.dispose?.();
+    } catch (disposeError) {
+      if (disposeError instanceof Error && disposeError.cause === undefined) {
+        disposeError.cause = error;
+      }
+      throw disposeError;
+    }
+    throw error;
+  }
+  let running: RunningAcpxConsoleServer;
+  try {
+    running = await startAcpxConsoleServer({ config, service });
+  } catch (error) {
+    try {
+      await removeOwnedClaim(config.stateDir, instanceToken);
+    } catch (cleanupError) {
+      if (cleanupError instanceof Error && cleanupError.cause === undefined) {
+        cleanupError.cause = error;
+      }
+      throw cleanupError;
+    }
+    throw error;
+  }
   let control: NetServer | undefined;
+  let controlPath: string | undefined;
   let controlSockets = new Set<Socket>();
   let stopStarted: Promise<void> | undefined;
   let resolveStopped!: () => void;
@@ -265,22 +463,42 @@ export async function startForegroundConsole(
   const stop = (): Promise<void> => {
     stopStarted ??= (async () => {
       let failure: unknown;
+      let controlClosed = false;
+      let serverClosed = false;
       try {
         if (control) {
           await closeNetServer(control, controlSockets);
+        }
+        controlClosed = true;
+        if (controlPath && process.platform !== "win32") {
+          await rm(controlPath, { force: true });
         }
       } catch (error) {
         failure = error;
       }
       try {
         await running.close();
+        serverClosed = true;
       } catch (error) {
         failure ??= error;
       }
       try {
-        await cleanStaleLifecycle(config.stateDir);
-      } catch (error) {
-        failure ??= error;
+        if (controlClosed && serverClosed) {
+          let runtimeRemoved = false;
+          try {
+            await removeOwnedRuntime(config.stateDir, instanceToken);
+            runtimeRemoved = true;
+          } catch (error) {
+            failure ??= error;
+          }
+          if (runtimeRemoved) {
+            try {
+              await removeOwnedClaim(config.stateDir, instanceToken);
+            } catch (error) {
+              failure ??= error;
+            }
+          }
+        }
       } finally {
         resolveStopped();
       }
@@ -291,9 +509,9 @@ export async function startForegroundConsole(
     return stopStarted;
   };
   try {
-    const instanceToken = randomBytes(32).toString("base64url");
     const controlResult = await startControlServer(config.stateDir, instanceToken, stop);
     control = controlResult.server;
+    controlPath = controlResult.controlPath;
     controlSockets = controlResult.sockets;
     const address = running.server.address();
     const port = typeof address === "object" && address ? address.port : config.port;
@@ -311,11 +529,37 @@ export async function startForegroundConsole(
     await writeRuntimeRecord(config.stateDir, record);
     return { record, stopped, stop };
   } catch (error) {
+    let controlClosed = control === undefined;
     if (control) {
-      await closeNetServer(control, controlSockets).catch(() => undefined);
+      try {
+        await closeNetServer(control, controlSockets);
+        controlClosed = true;
+      } catch {
+        controlClosed = false;
+      }
     }
-    await running.close();
-    await cleanStaleLifecycle(config.stateDir);
+    if (controlPath && process.platform !== "win32") {
+      await rm(controlPath, { force: true }).catch(() => undefined);
+    }
+    let serverClosed = false;
+    try {
+      await running.close();
+      serverClosed = true;
+    } catch {
+      serverClosed = false;
+    }
+    if (controlClosed && serverClosed) {
+      let runtimeRemoved = false;
+      try {
+        await removeOwnedRuntime(config.stateDir, instanceToken);
+        runtimeRemoved = true;
+      } catch {
+        runtimeRemoved = false;
+      }
+      if (runtimeRemoved) {
+        await removeOwnedClaim(config.stateDir, instanceToken).catch(() => undefined);
+      }
+    }
     throw error;
   }
 }
@@ -324,7 +568,11 @@ async function healthCheck(record: ConsoleRuntimeRecord): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     const request = httpRequest(
       {
-        host: record.host,
+        host: isWildcardHost(record.host)
+          ? record.host.includes(":")
+            ? "::1"
+            : "127.0.0.1"
+          : record.host,
         port: record.port,
         path: "/healthz",
         method: "GET",
@@ -347,11 +595,12 @@ async function healthCheck(record: ConsoleRuntimeRecord): Promise<boolean> {
 async function controlRequest(
   record: ConsoleRuntimeRecord,
   command: "status" | "stop",
+  timeoutMs = CONTROL_TIMEOUT_MS,
 ): Promise<{ ok: boolean; pid?: number; error?: string }> {
   return await new Promise((resolve, reject) => {
     const socket = createConnection(record.controlPath);
     socket.setEncoding("utf8");
-    socket.setTimeout(CONTROL_TIMEOUT_MS);
+    socket.setTimeout(timeoutMs);
     let response = "";
     let settled = false;
     const finish = (error?: Error, value?: { ok: boolean; pid?: number; error?: string }): void => {
@@ -400,9 +649,12 @@ async function controlRequest(
   });
 }
 
-async function authenticateRuntime(record: ConsoleRuntimeRecord): Promise<boolean> {
+async function authenticateRuntime(
+  record: ConsoleRuntimeRecord,
+  timeoutMs = CONTROL_TIMEOUT_MS,
+): Promise<boolean> {
   try {
-    const response = await controlRequest(record, "status");
+    const response = await controlRequest(record, "status", timeoutMs);
     return response.ok && response.pid === record.pid;
   } catch {
     return false;
@@ -414,16 +666,31 @@ export interface ConsoleStatus {
   record?: ConsoleRuntimeRecord;
 }
 
-export async function consoleStatus(stateDir: string): Promise<ConsoleStatus> {
-  const record = await readRuntimeRecord(stateDir);
+export interface ConsoleControlOptions {
+  controlTimeoutMs?: number;
+}
+
+export async function consoleStatus(
+  stateDir: string,
+  options: ConsoleControlOptions = {},
+): Promise<ConsoleStatus> {
+  const [record, claim] = await Promise.all([
+    readRuntimeRecord(stateDir),
+    readRuntimeClaim(stateDir),
+  ]);
+  if (claim && isProcessAlive(claim.pid)) {
+    if (!record || record.pid !== claim.pid || record.instanceToken !== claim.instanceToken) {
+      return { status: "unreachable", ...(record ? { record } : {}) };
+    }
+  }
   if (!record) {
     return { status: "stopped" };
   }
   if (!isProcessAlive(record.pid)) {
     return { status: "stopped", record };
   }
-  if (!(await authenticateRuntime(record))) {
-    return { status: "stopped", record };
+  if (!(await authenticateRuntime(record, options.controlTimeoutMs))) {
+    return { status: "unreachable", record };
   }
   return { status: (await healthCheck(record)) ? "running" : "unreachable", record };
 }
@@ -442,47 +709,116 @@ async function rotateLog(path: string): Promise<void> {
   }
 }
 
+async function terminateDetachedChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  child.kill("SIGTERM");
+  let timeout: NodeJS.Timeout | undefined;
+  const graceful = await Promise.race([
+    exited.then(() => true),
+    new Promise<boolean>((resolve) => {
+      timeout = setTimeout(() => resolve(false), 1_000);
+    }),
+  ]);
+  if (timeout) {
+    clearTimeout(timeout);
+  }
+  if (!graceful && child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await exited;
+  }
+}
+
 export async function startDetachedConsole(
   config: ResolvedConsoleConfig,
   childArguments: string[],
 ): Promise<ConsoleRuntimeRecord> {
   await prepareStateDir(config.stateDir);
-  await assertNoRunningConsole(config.stateDir);
+  const existing = await consoleStatus(config.stateDir);
+  if (existing.status !== "stopped") {
+    throw new Error(
+      `ACPX Console state belongs to a live${existing.status === "unreachable" ? " but unreachable" : ""} process${existing.record ? ` (pid ${existing.record.pid})` : ""}`,
+    );
+  }
   const paths = lifecyclePaths(config.stateDir);
   await Promise.all([rotateLog(paths.stdout), rotateLog(paths.stderr)]);
   const stdoutHandle = await openFile(paths.stdout, "a", 0o600);
   const stderrHandle = await openFile(paths.stderr, "a", 0o600);
+  let child: ChildProcess;
   try {
-    const child = spawn(process.execPath, childArguments, {
+    child = spawn(process.execPath, childArguments, {
       detached: true,
       stdio: ["ignore", stdoutHandle.fd, stderrHandle.fd],
       env: process.env,
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
     });
     child.unref();
   } finally {
     await stdoutHandle.close();
     await stderrHandle.close();
   }
-  const deadline = Date.now() + DETACH_WAIT_MS;
-  while (Date.now() < deadline) {
-    const status = await consoleStatus(config.stateDir);
-    if (status.status === "running" && status.record) {
-      return status.record;
+  try {
+    const deadline = Date.now() + DETACH_WAIT_MS;
+    while (Date.now() < deadline) {
+      const [status, claim] = await Promise.all([
+        consoleStatus(config.stateDir),
+        readRuntimeClaim(config.stateDir),
+      ]);
+      if (claim && isProcessAlive(claim.pid) && claim.pid !== child.pid) {
+        throw new Error(`ACPX Console state was claimed by another process (pid ${claim.pid})`);
+      }
+      if (status.status === "running" && status.record) {
+        if (child.pid !== undefined && status.record.pid !== child.pid) {
+          throw new Error(
+            `ACPX Console state was claimed by another process (pid ${status.record.pid})`,
+          );
+        }
+        return status.record;
+      }
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error(
+          `Detached ACPX Console exited before becoming healthy; inspect ${paths.stderr}`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    throw new Error(`Detached ACPX Console did not become healthy; inspect ${paths.stderr}`);
+  } catch (error) {
+    await terminateDetachedChild(child);
+    throw error;
   }
-  throw new Error(`Detached ACPX Console did not become healthy; inspect ${paths.stderr}`);
 }
 
 export async function stopDetachedConsole(
   stateDir: string,
+  options: ConsoleControlOptions = {},
 ): Promise<ConsoleRuntimeRecord | undefined> {
-  const record = await readRuntimeRecord(stateDir);
-  if (!record || !isProcessAlive(record.pid)) {
-    await cleanStaleLifecycle(stateDir);
+  const [record, claim] = await Promise.all([
+    readRuntimeRecord(stateDir),
+    readRuntimeClaim(stateDir),
+  ]);
+  if (
+    claim &&
+    isProcessAlive(claim.pid) &&
+    (!record || record.pid !== claim.pid || record.instanceToken !== claim.instanceToken)
+  ) {
+    throw new Error(`ACPX Console is starting or unreachable (pid ${claim.pid})`);
+  }
+  if (!record) {
+    if (claim && isProcessAlive(claim.pid)) {
+      throw new Error(`ACPX Console is starting or unreachable (pid ${claim.pid})`);
+    }
     return undefined;
   }
-  const response = await controlRequest(record, "stop");
+  if (!isProcessAlive(record.pid)) {
+    return undefined;
+  }
+  const response = await controlRequest(record, "stop", options.controlTimeoutMs);
   if (!response.ok) {
     throw new Error(`ACPX Console stop failed: ${response.error ?? "control endpoint refused"}`);
   }
