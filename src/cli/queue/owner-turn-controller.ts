@@ -45,6 +45,7 @@ type QueueOwnerTurnControllerOptions = {
 export class QueueOwnerTurnController {
   private readonly options: QueueOwnerTurnControllerOptions;
   private state: QueueOwnerTurnState = "idle";
+  private shuttingDown = false;
   private pendingCancel = false;
   private activeController?: QueueOwnerActiveSessionController;
   private controlTargetReady?: Promise<void>;
@@ -88,11 +89,19 @@ export class QueueOwnerTurnController {
     this.finishControlTargetWait();
   }
 
+  prepareForShutdown(): void {
+    this.shuttingDown = true;
+    this.finishControlTargetWait();
+    this.resolveIdleControlsDone?.();
+    this.resolveIdleControlsDone = undefined;
+    this.idleControlsDone = undefined;
+  }
+
   beginClosing(): void {
+    this.prepareForShutdown();
     this.state = "closing";
     this.pendingCancel = false;
     this.activeController = undefined;
-    this.finishControlTargetWait();
   }
 
   setActiveController(controller: QueueOwnerActiveSessionController): void {
@@ -161,7 +170,7 @@ export class QueueOwnerTurnController {
   }
 
   private assertCanHandleControlRequest(): void {
-    if (this.state === "closing") {
+    if (this.shuttingDown || this.state === "closing") {
       throw new QueueConnectionError("Queue owner is closing", {
         detailCode: "QUEUE_OWNER_SHUTTING_DOWN",
         origin: "queue",

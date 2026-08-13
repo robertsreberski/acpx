@@ -33,7 +33,7 @@ import {
   type QueueOwnerRecord,
   queueOwnerProtocolVersion,
   readQueueOwnerRecord,
-  terminateQueueOwnerForSession,
+  terminateQueueOwnerIfCurrent,
 } from "./lease-store.js";
 import {
   parseQueueOwnerMessage,
@@ -77,27 +77,35 @@ const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
 
+type StaleOwnerProtocolRecovery = "not_applicable" | "retired" | "replaced";
+
 async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   sessionId: string;
   owner: QueueOwnerRecord;
   error: unknown;
   verbose?: boolean;
-}): Promise<boolean> {
+}): Promise<StaleOwnerProtocolRecovery> {
   if (
     !(params.error instanceof QueueProtocolError) &&
     !(params.error instanceof QueueConnectionError)
   ) {
-    return false;
+    return "not_applicable";
   }
 
   const detailCode = params.error.detailCode;
   if (!detailCode || !STALE_OWNER_PROTOCOL_DETAIL_CODES.has(detailCode)) {
-    return false;
+    return "not_applicable";
   }
 
-  await terminateQueueOwnerForSession(params.sessionId).catch(() => {
-    // Preserve existing behavior if cleanup fails.
-  });
+  const recovery = await terminateQueueOwnerIfCurrent(params.sessionId, params.owner).catch(
+    () => "failed" as const,
+  );
+  if (recovery === "failed") {
+    return "not_applicable";
+  }
+  if (recovery === "replaced") {
+    return "replaced";
+  }
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {
@@ -106,7 +114,28 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
     );
   }
 
-  return true;
+  return "retired";
+}
+
+async function handleStaleOwnerProtocolError<T>(params: {
+  sessionId: string;
+  owner: QueueOwnerRecord;
+  error: unknown;
+  replacementRetries: number;
+  verbose?: boolean;
+  retry: () => Promise<T | undefined>;
+}): Promise<T | undefined> {
+  const recovery = await maybeRecoverStaleOwnerAfterProtocolMismatch(params);
+  if (recovery === "retired") {
+    return undefined;
+  }
+  if (recovery !== "replaced") {
+    throw params.error;
+  }
+  if (params.replacementRetries <= 0) {
+    throw queueOwnerChangedDuringRecovery(params.sessionId);
+  }
+  return await params.retry();
 }
 export { inspectQueueOwnerHealth, probeQueueOwnerHealth };
 export type { QueueOwnerHealth };
@@ -986,16 +1015,7 @@ export async function trySubmitToRunningOwner(
   try {
     submitted = await submitToQueueOwner(owner, options);
   } catch (error) {
-    const recovered = await maybeRecoverStaleOwnerAfterProtocolMismatch({
-      sessionId: options.sessionId,
-      owner,
-      error,
-      verbose: options.verbose,
-    });
-    if (recovered) {
-      return undefined;
-    }
-    throw error;
+    return await handlePromptOwnerProtocolError(options, owner, error);
   }
   if (submitted) {
     if (options.verbose) {
@@ -1015,6 +1035,46 @@ export async function trySubmitToRunningOwner(
     "Session queue owner is running but not accepting queue requests",
     {
       detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+async function handlePromptOwnerProtocolError(
+  options: SubmitToQueueOwnerOptions,
+  owner: QueueOwnerRecord,
+  error: unknown,
+): Promise<undefined> {
+  const recovery = await maybeRecoverStaleOwnerAfterProtocolMismatch({
+    sessionId: options.sessionId,
+    owner,
+    error,
+    verbose: options.verbose,
+  });
+  if (recovery === "retired" || recovery === "replaced") {
+    throw ambiguousPromptDeliveryError(options.sessionId);
+  }
+  throw error;
+}
+
+function ambiguousPromptDeliveryError(sessionId: string): QueueConnectionError {
+  return new QueueConnectionError(
+    `Session queue owner changed before confirming the prompt for session ${sessionId}; ` +
+      "the prompt may already have been accepted, so acpx did not retry it automatically",
+    {
+      detailCode: "QUEUE_OWNER_CHANGED_DURING_REQUEST",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
+function queueOwnerChangedDuringRecovery(sessionId: string): QueueConnectionError {
+  return new QueueConnectionError(
+    `Session queue owner changed repeatedly while retrying request for session ${sessionId}`,
+    {
+      detailCode: "QUEUE_OWNER_CHANGED_DURING_REQUEST",
       origin: "queue",
       retryable: true,
     },
@@ -1369,6 +1429,19 @@ export async function tryApplySessionPreferencesOnRunningOwner(options: {
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<QueueOwnerApplySessionPreferencesResultMessage | undefined> {
+  return await tryApplySessionPreferencesOnRunningOwnerAttempt(options, 2);
+}
+
+async function tryApplySessionPreferencesOnRunningOwnerAttempt(
+  options: {
+    sessionId: string;
+    modelId?: string;
+    effort: string;
+    timeoutMs?: number;
+    verbose?: boolean;
+  },
+  replacementRetries: number,
+): Promise<QueueOwnerApplySessionPreferencesResultMessage | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
     return undefined;
@@ -1386,16 +1459,15 @@ export async function tryApplySessionPreferencesOnRunningOwner(options: {
       options.timeoutMs,
     );
   } catch (error) {
-    const recovered = await maybeRecoverStaleOwnerAfterProtocolMismatch({
+    return await handleStaleOwnerProtocolError({
       sessionId: options.sessionId,
       owner,
       error,
+      replacementRetries,
       verbose: options.verbose,
+      retry: async () =>
+        await tryApplySessionPreferencesOnRunningOwnerAttempt(options, replacementRetries - 1),
     });
-    if (recovered) {
-      return undefined;
-    }
-    throw error;
   }
   if (response) {
     if (options.verbose) {

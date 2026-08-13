@@ -51,6 +51,7 @@ export async function reapplyDesiredEffortAfterModelChange(params: {
   previousState: SessionAcpxState | undefined;
   nextState: SessionAcpxState | undefined;
   timeoutMs?: number;
+  onReconciledState?: (state: SessionAcpxState) => void | Promise<void>;
 }): Promise<{
   state: SessionAcpxState;
   response?: SetSessionConfigOptionResponse;
@@ -59,6 +60,7 @@ export async function reapplyDesiredEffortAfterModelChange(params: {
     params.previousState,
     params.nextState,
   );
+  await params.onReconciledState?.(reconciliation.state);
   if (!reconciliation.selection) {
     return { state: reconciliation.state };
   }

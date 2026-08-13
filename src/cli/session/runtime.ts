@@ -359,14 +359,20 @@ async function applyPromptPreferences(params: {
   if (application.effort.applied) {
     setDesiredEffort(params.record, params.requestedEffort, application.effort.configId);
   }
-  await reapplySavedPromptEffort({
-    client: params.client,
-    sessionId: params.sessionId,
-    record: params.record,
-    previousState,
-    replacesEffort,
-    timeoutMs: params.timeoutMs,
-  });
+  // A legacy session/set_model success has no config response, so it cannot
+  // prove that the old model's effort remains valid for the new model. The
+  // model preference update intentionally clears that unverified selection;
+  // replay only after a config response refreshes model-aware capabilities.
+  if (application.model.response) {
+    await reapplySavedPromptEffort({
+      client: params.client,
+      sessionId: params.sessionId,
+      record: params.record,
+      previousState,
+      replacesEffort,
+      timeoutMs: params.timeoutMs,
+    });
+  }
 }
 
 async function reapplySavedPromptEffort(params: {
@@ -380,7 +386,7 @@ async function reapplySavedPromptEffort(params: {
   if (
     params.replacesEffort ||
     params.record.acpx?.config_options === undefined ||
-    !getDesiredEffort(params.record.acpx)
+    !getDesiredEffort(params.previousState)
   ) {
     return;
   }
@@ -390,6 +396,9 @@ async function reapplySavedPromptEffort(params: {
     previousState: params.previousState,
     nextState: params.record.acpx,
     timeoutMs: params.timeoutMs,
+    onReconciledState: (state) => {
+      params.record.acpx = state;
+    },
   });
   params.record.acpx = effort.state;
 }
@@ -606,6 +615,7 @@ async function setActiveSessionConfigOption(params: {
   state: SessionAcpxState | undefined;
   configId: string;
   value: string;
+  onReconciledState?: (state: SessionAcpxState) => void;
 }): Promise<{
   state: SessionAcpxState;
   response: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>;
@@ -634,6 +644,7 @@ async function setActiveSessionConfigOption(params: {
     sessionId: params.sessionId,
     previousState,
     nextState: stored.state,
+    onReconciledState: params.onReconciledState,
   });
   return { state: effort.state, response: effort.response ?? response };
 }
@@ -1220,6 +1231,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         sessionId: activeSessionIdForControl,
         previousState,
         nextState: acpxState,
+        onReconciledState: async (state) => {
+          acpxState = state;
+          await liveCheckpoint.checkpoint();
+        },
       });
       acpxState = effort.state;
       return effort.response ?? response;
@@ -1231,6 +1246,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         state: acpxState,
         configId,
         value,
+        onReconciledState: async (state) => {
+          acpxState = state;
+          await liveCheckpoint.checkpoint();
+        },
       });
       acpxState = result.state;
       return result.response;

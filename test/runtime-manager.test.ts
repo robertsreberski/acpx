@@ -1374,7 +1374,7 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
 });
 
 test("AcpRuntimeManager times out effort replay after an active model config change", async () => {
-  const configOptions = (model: string, effort: string) => [
+  const configOptions = (model: string, effort: string, effortConfigId = "reasoning_effort") => [
     {
       id: "model",
       name: "Model",
@@ -1387,7 +1387,7 @@ test("AcpRuntimeManager times out effort replay after an active model config cha
       ],
     },
     {
-      id: "reasoning_effort",
+      id: effortConfigId,
       name: "Reasoning Effort",
       category: "thought_level",
       type: "select" as const,
@@ -1438,7 +1438,9 @@ test("AcpRuntimeManager times out effort replay after an active model config cha
           setSessionMode: async () => {},
           setSessionConfigOption: async (_sessionId: string, configId: string) => {
             if (configId === "model") {
-              return { configOptions: configOptions("smart-model", "medium") };
+              return {
+                configOptions: configOptions("smart-model", "medium", "refreshed_effort"),
+              };
             }
             return await new Promise<SetSessionConfigOptionResponse>(() => {});
           },
@@ -1463,6 +1465,13 @@ test("AcpRuntimeManager times out effort replay after an active model config cha
     async () => await manager.setConfigOption(handle, "model", "smart-model"),
     /Timed out after 20ms/,
   );
+
+  const stored = await store.load(record.acpxRecordId);
+  assert.equal(stored?.acpx?.session_options?.model, "smart-model");
+  assert.equal(stored?.acpx?.session_options?.effort, "high");
+  assert.deepEqual(stored?.acpx?.desired_config_options, {
+    refreshed_effort: "high",
+  });
 
   resolvePrompt({ stopReason: "end_turn" });
   assert.deepEqual(await turn.result, { status: "completed", stopReason: "end_turn" });

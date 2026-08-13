@@ -1816,6 +1816,73 @@ test("integration: prompt model switch reconciles saved effort unless --effort i
   });
 });
 
+test("integration: prompt model switch migrates effort keyed by the prior config id", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+    const args = ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "--ttl", "0"];
+
+    try {
+      const created = await runCli(
+        [
+          ...args,
+          "--model",
+          "default-model",
+          "--effort",
+          "medium",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const warmed = await runCli([...args, "prompt", "echo warm"], homeDir);
+      assert.equal(warmed.code, 0, warmed.stderr);
+
+      const recordPath = sessionRecordPath(homeDir, sessionId);
+      const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+        acpx?: {
+          session_options?: Record<string, unknown>;
+          desired_config_options?: Record<string, unknown>;
+          config_options?: Array<Record<string, unknown>>;
+        };
+      };
+      assert(record.acpx);
+      const sessionOptions = { ...record.acpx.session_options };
+      delete sessionOptions.effort;
+      record.acpx.session_options = sessionOptions;
+      record.acpx.desired_config_options = { legacy_effort: "medium" };
+      record.acpx.config_options = record.acpx.config_options?.map((option) =>
+        option.id === "reasoning_effort" ? { ...option, id: "legacy_effort" } : option,
+      );
+      await fs.writeFile(recordPath, `${JSON.stringify(record)}\n`, "utf8");
+
+      const prompted = await runCli(
+        [...args, "--model", "fast-model", "prompt", "echo model-only"],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, {
+        model: "fast-model",
+        effort: "medium",
+      });
+      assert.deepEqual(acpxState.desired_config_options, {
+        reasoning_effort: "medium",
+      });
+    } finally {
+      await runCli([...args, "sessions", "close"], homeDir).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: sessions ensure applies model and effort through a warm owner", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

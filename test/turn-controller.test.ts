@@ -342,6 +342,39 @@ test("QueueOwnerTurnController finishes idle preference updates before starting 
   assert.equal(controller.lifecycleState, "starting");
 });
 
+test("QueueOwnerTurnController releases the idle-control barrier during shutdown", async () => {
+  let releaseFallback!: () => void;
+  const fallbackGate = new Promise<void>((resolve) => {
+    releaseFallback = resolve;
+  });
+  const controller = createQueueOwnerTurnController({
+    applySessionPreferencesFallback: async () => {
+      await fallbackGate;
+      return {
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      };
+    },
+  });
+
+  const preference = controller.applySessionPreferences("smart-model", "high");
+  await Promise.resolve();
+  const beginTurn = controller.beginTurn();
+  await Promise.resolve();
+
+  controller.prepareForShutdown();
+
+  await assert.rejects(beginTurn, /Queue owner is closing/);
+  await assert.rejects(
+    async () => await controller.setSessionMode("plan"),
+    /Queue owner is closing/,
+  );
+  assert.equal(controller.lifecycleState, "idle");
+
+  releaseFallback();
+  await preference;
+});
+
 test("QueueOwnerTurnController rejects control requests while closing", async () => {
   let setModeFallbackCalls = 0;
   let setModelFallbackCalls = 0;

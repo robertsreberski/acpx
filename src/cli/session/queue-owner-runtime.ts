@@ -463,6 +463,7 @@ function createQueueOwnerShutdownController(params: {
   const request = (): void => {
     requested = true;
     params.stopHeartbeat();
+    params.turnController.prepareForShutdown();
     params.getOwner()?.beginShutdown();
     // Unwind parked requests first: a turn blocked on one cannot respond to
     // session/cancel, so draining before cancelling would burn the whole grace

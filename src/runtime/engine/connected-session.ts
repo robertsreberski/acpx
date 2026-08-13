@@ -126,6 +126,9 @@ function createActiveSessionController(params: {
         sessionId: getActiveSessionId(),
         previousState,
         nextState: params.record.acpx,
+        onReconciledState: (state) => {
+          params.record.acpx = state;
+        },
       });
       params.record.acpx = effort.state;
       return effort.response ?? response;
@@ -149,6 +152,9 @@ function createActiveSessionController(params: {
         sessionId: getActiveSessionId(),
         previousState,
         nextState: params.record.acpx,
+        onReconciledState: (state) => {
+          params.record.acpx = state;
+        },
       });
       params.record.acpx = effort.state;
       return effort.response ?? response;

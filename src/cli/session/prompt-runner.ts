@@ -191,6 +191,9 @@ export async function runSessionSetModelDirect(
         previousState,
         nextState: record.acpx,
         timeoutMs: options.timeoutMs,
+        onReconciledState: (state) => {
+          record.acpx = state;
+        },
       });
       record.acpx = effort.state;
       return effort.response ?? response;
@@ -278,6 +281,9 @@ export async function runSessionSetConfigOptionDirect(
           previousState,
           nextState: record.acpx,
           timeoutMs: options.timeoutMs,
+          onReconciledState: (state) => {
+            record.acpx = state;
+          },
         });
         record.acpx = effort.state;
         return effort.response ?? response;

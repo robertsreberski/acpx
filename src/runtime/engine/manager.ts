@@ -1123,6 +1123,10 @@ export class AcpRuntimeManager {
           previousState,
           nextState: turn.acpxState,
           timeoutMs: this.options.timeoutMs,
+          onReconciledState: async (state) => {
+            turn.acpxState = state;
+            await turn.liveCheckpoint.checkpoint();
+          },
         });
         turn.acpxState = effort.state;
         return effort.response ?? response;
@@ -1197,6 +1201,10 @@ export class AcpRuntimeManager {
       previousState,
       nextState: turn.acpxState,
       timeoutMs: this.options.timeoutMs,
+      onReconciledState: async (state) => {
+        turn.acpxState = state;
+        await turn.liveCheckpoint.checkpoint();
+      },
     });
     turn.acpxState = effort.state;
     return { configId: resolvedConfigId, response: effort.response ?? response };
@@ -1541,6 +1549,9 @@ export class AcpRuntimeManager {
             previousState,
             nextState: connectedRecord.acpx,
             timeoutMs: this.options.timeoutMs,
+            onReconciledState: (state) => {
+              connectedRecord.acpx = state;
+            },
           });
           connectedRecord.acpx = effort.state;
         }
