@@ -2175,3 +2175,90 @@ test("pending responses inherit a bounded service timeout when the request omits
     }
   });
 });
+
+test("an owner-gone response does not reserve the request recovery scope", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-owner-gone-response",
+      acpSessionId: "provider-owner-gone-response",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const service = createAcpxSessionService({ cwd, pendingResponseTimeoutMs: 250 });
+    const input = {
+      acpxRecordId: initial.acpxRecordId,
+      requestId: "retryable-request",
+      answer: { type: "cancel" } as const,
+    };
+
+    try {
+      await assert.rejects(
+        async () =>
+          await service.respondToPendingRequest({
+            ...input,
+            idempotencyKey: "owner-gone-first",
+          }),
+        (error: unknown) => {
+          assert.equal((error as { detailCode?: string }).detailCode, "PENDING_REQUEST_OWNER_GONE");
+          return true;
+        },
+      );
+
+      const keeper = await startKeeperProcess();
+      const paths = queuePaths(homeDir, initial.acpxRecordId);
+      await writeQueueOwnerLock({
+        ...paths,
+        pid: keeper.pid,
+        sessionId: initial.acpxRecordId,
+        ownerGeneration: 88,
+      });
+      let responseWrites = 0;
+      const server = createSingleRequestServer((socket, request) => {
+        responseWrites += 1;
+        socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+        // Never confirm the result: unlike the first owner-gone failure, this
+        // attempt crossed the owner acknowledgement boundary and is unknown.
+      });
+      await listenServer(server, paths.socketPath);
+      try {
+        await assert.rejects(
+          async () =>
+            await service.respondToPendingRequest({
+              ...input,
+              idempotencyKey: "owner-gone-second",
+            }),
+          (error: unknown) => {
+            assert.equal(
+              (error as { detailCode?: string }).detailCode,
+              "PENDING_REQUEST_ANSWER_TIMEOUT",
+            );
+            assert.equal((error as { answerOutcome?: string }).answerOutcome, "unknown");
+            return true;
+          },
+        );
+        assert.equal(responseWrites, 1, "the fresh key must reach the replacement owner");
+        await assert.rejects(
+          async () =>
+            await service.respondToPendingRequest({
+              ...input,
+              idempotencyKey: "owner-gone-third",
+            }),
+          (error: unknown) => {
+            assert.equal((error as { answerOutcome?: string }).answerOutcome, "unknown");
+            return true;
+          },
+        );
+        assert.equal(responseWrites, 1, "post-ack uncertainty must still block another answer");
+      } finally {
+        await closeServer(server);
+        await cleanupOwnerArtifacts(paths);
+        stopProcess(keeper);
+      }
+    } finally {
+      service.dispose();
+    }
+  });
+});

@@ -608,11 +608,13 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   request: QueueRequest,
   isExpectedResponse: (message: QueueOwnerMessage) => message is TResponse,
   responseTimeoutMs?: number,
+  onAccepted?: () => void,
 ): Promise<TResponse | undefined> {
   return await runQueueOwnerRequest<TResponse>({
     owner,
     request,
     ...(responseTimeoutMs === undefined ? {} : { responseTimeoutMs }),
+    ...(onAccepted === undefined ? {} : { onAccepted }),
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
@@ -1324,7 +1326,11 @@ function isQueueBudgetTimeout(error: unknown): error is QueueConnectionError {
 async function submitRespondRequest(
   owner: QueueOwnerRecord,
   request: QueueRespondRequest,
-  options: { pendingRequestId: string; responseTimeoutMs?: number },
+  options: {
+    pendingRequestId: string;
+    responseTimeoutMs?: number;
+    onQueueAccepted?: () => void;
+  },
 ): Promise<QueueOwnerRespondResultMessage | undefined> {
   const responseTimeoutMs = options.responseTimeoutMs;
   try {
@@ -1334,6 +1340,7 @@ async function submitRespondRequest(
       (message): message is QueueOwnerRespondResultMessage =>
         message.type === "respond_request_result",
       responseTimeoutMs,
+      options.onQueueAccepted,
     );
   } catch (error) {
     if (isQueueBudgetTimeout(error) && responseTimeoutMs !== undefined) {
@@ -1359,6 +1366,8 @@ export async function tryRespondOnRunningOwner(options: {
   pendingRequestId: string;
   answer: PendingRequestAnswer;
   responseTimeoutMs?: number;
+  /** Fires only after the owner acknowledges that it accepted this answer. */
+  onQueueAccepted?: () => void;
   verbose?: boolean;
 }): Promise<PendingRequest | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);

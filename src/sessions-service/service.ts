@@ -926,7 +926,6 @@ class SessionService implements AcpxSessionService {
       idempotencyKey: input.idempotencyKey,
       input,
       recoveryScope,
-      recoveryResult: recoveryScope,
       outcomeUnknown: (error) =>
         error instanceof PendingRequestAnswerTimeoutError && error.answerOutcome === "unknown",
       recover: async () => {
@@ -940,18 +939,37 @@ class SessionService implements AcpxSessionService {
           "unknown",
         );
       },
-      run: async () => {
+      run: async (checkpoint) => {
         await this.requireExactRecord(input.acpxRecordId);
         await this.assertAnswerableByLiveOwner(input.acpxRecordId, input.requestId);
-        const answered = await tryRespondOnRunningOwner({
-          sessionId: input.acpxRecordId,
-          pendingRequestId: input.requestId,
-          answer: input.answer,
-          responseTimeoutMs:
-            input.responseTimeoutMs ??
-            this.options.pendingResponseTimeoutMs ??
-            DEFAULT_PENDING_RESPONSE_TIMEOUT_MS,
-        });
+        let ownerAccepted = false;
+        let answered: PendingRequest | undefined;
+        try {
+          answered = await tryRespondOnRunningOwner({
+            sessionId: input.acpxRecordId,
+            pendingRequestId: input.requestId,
+            answer: input.answer,
+            responseTimeoutMs:
+              input.responseTimeoutMs ??
+              this.options.pendingResponseTimeoutMs ??
+              DEFAULT_PENDING_RESPONSE_TIMEOUT_MS,
+            onQueueAccepted: () => {
+              ownerAccepted = true;
+            },
+          });
+        } catch (error) {
+          if (
+            ownerAccepted &&
+            error instanceof PendingRequestAnswerTimeoutError &&
+            error.answerOutcome === "unknown"
+          ) {
+            // Reserve the request scope only after the owner acknowledged the
+            // answer and then left its outcome unknown. Pre-delivery failures
+            // are safe to retry with a fresh key and must remain terminal.
+            await checkpoint(recoveryScope);
+          }
+          throw error;
+        }
         if (!answered) {
           throw new PendingRequestOwnerGoneError(
             `Request ${input.requestId} can no longer be answered because its queue owner stopped`,
