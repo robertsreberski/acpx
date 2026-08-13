@@ -1,6 +1,7 @@
 import type { AgentCapabilities } from "@agentclientprotocol/sdk";
 import { AGENT_REGISTRY } from "../agent-registry.js";
 import { inspectQueueOwnerHealth } from "../cli/queue/ipc-health.js";
+import { tryListPromptQueueOnRunningOwner } from "../cli/queue/ipc.js";
 import {
   getDesiredModeId,
   getDesiredModelId,
@@ -10,7 +11,6 @@ import { listPendingRequests, type PendingRequest } from "../session/pending-req
 import {
   getActiveSessionTimelineTurn,
   getLatestSessionTimelineLifecycleEvent,
-  listQueuedSessionTimelineTurns,
 } from "../session/timeline.js";
 import type { SessionRecord } from "../types.js";
 import type {
@@ -30,6 +30,8 @@ const WARM_OWNER_MODE_REMEDIATION =
 const MODE_CONFLICT_REMEDIATION =
   "The saved mode differs from the last adapter report. Answer or cancel pending requests, " +
   "then close and reopen the session before sending another prompt.";
+
+const LIVE_QUEUE_SNAPSHOT_TIMEOUT_MS = 250;
 
 type CapabilitySupport = "supported" | "unsupported" | "unknown";
 
@@ -195,15 +197,30 @@ export async function projectSession(
   pendingEntries?: PendingRequest[],
 ): Promise<AcpxSessionSummary | AcpxSessionDetail> {
   const health = await inspectQueueOwnerHealth(record.acpxRecordId);
-  const [pending, lifecycle, activeTurn, queuedTurns] = await Promise.all([
+  const queueSnapshot = health.healthy
+    ? tryListPromptQueueOnRunningOwner({
+        sessionId: record.acpxRecordId,
+        responseTimeoutMs: LIVE_QUEUE_SNAPSHOT_TIMEOUT_MS,
+      }).catch(() => undefined)
+    : Promise.resolve(undefined);
+  const [pending, lifecycle, activeTurn, authoritativeQueue] = await Promise.all([
     pendingEntries ?? listPendingRequests(record.acpxRecordId),
     getLatestSessionTimelineLifecycleEvent(record.acpxRecordId),
     getActiveSessionTimelineTurn(record.acpxRecordId),
-    listQueuedSessionTimelineTurns(record.acpxRecordId, health.queueDepth ?? 0),
+    queueSnapshot,
   ]);
   const waiting = pendingTurnState(pending);
   const lifecycleState = lifecycleTurnState(lifecycle);
   const projectedOwnerState = ownerState(health);
+  const queuedTurns =
+    authoritativeQueue !== undefined &&
+    authoritativeQueue.ownerGeneration === health.ownerGeneration
+      ? authoritativeQueue.prompts
+      : [];
+  // The lease depth remains useful when an owner is old or unreachable. Exact
+  // cancellation targets never come from it (or from timeline guesses); only
+  // a current generation's read-only FIFO snapshot can expose those controls.
+  const queueDepth = health.queueDepth ?? authoritativeQueue?.prompts.length ?? 0;
   const projectedLifecycleState =
     activeTurn && !health.healthy ? "unknown" : activeTurn ? "running" : lifecycleState;
   const summary: AcpxSessionSummary = {
@@ -217,7 +234,7 @@ export async function projectSession(
     sessionState: record.closed === true ? "closed" : "open",
     ownerState: projectedOwnerState,
     turnState: waiting ?? projectedLifecycleState,
-    queue: { depth: health.queueDepth ?? 0, turns: queuedTurns },
+    queue: { depth: queueDepth, turns: queuedTurns },
     createdAt: record.createdAt,
     updatedAt: record.lastUsedAt,
     model: record.acpx?.current_model_id ?? getDesiredModelId(record.acpx),

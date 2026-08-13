@@ -5,6 +5,7 @@ import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
 import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
+import { sessionEventActivePath } from "../src/session/event-log.js";
 import { SessionEventWriter } from "../src/session/events.js";
 import {
   PENDING_REQUEST_SCHEMA,
@@ -30,6 +31,20 @@ import {
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
+
+function retainedMessage(sessionId: string, text: string): Record<string, unknown> {
+  return {
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+      },
+    },
+  };
+}
 
 test("session lookup requires an exact acpx record id and returns browser-safe DTOs", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
@@ -61,6 +76,110 @@ test("session lookup requires an exact acpx record id and returns browser-safe D
       listSessions: false,
     });
     service.dispose();
+  });
+});
+
+test("the first transcript read imports retained chat idempotently before any mutation", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-first-transcript-read",
+      acpSessionId: "provider-first-transcript-read",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const messages = [
+      retainedMessage(record.acpSessionId, "Retained first"),
+      retainedMessage(record.acpSessionId, "Retained second"),
+    ];
+    record.lastSeq = messages.length;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${messages.map((message) => JSON.stringify(message)).join("\n")}\n`,
+      "utf8",
+    );
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const first = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const second = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const projected = (page: typeof first) =>
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        );
+      assert.deepEqual(projected(first), messages);
+      assert.deepEqual(projected(second), messages);
+      assert.equal(first.coverage, "legacy_retained");
+      assert.equal(second.items.length, first.items.length, "second read duplicated retained chat");
+      assert.equal(
+        (await resolveSessionRecord(record.acpxRecordId)).timeline?.legacy_import_complete,
+        true,
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+test("bounded session projection preserves order and caps concurrent owner work", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let active = 0;
+  let peak = 0;
+  const work = Array.from({ length: 12 }, (_, index) => index);
+  const pending = sessionsServiceTestInternals.mapConcurrentBounded(work, 3, async (value) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await gate;
+    active -= 1;
+    return value * 2;
+  });
+  await Promise.resolve();
+  assert.equal(active, 3);
+  assert.equal(peak, 3);
+  release();
+  assert.deepEqual(
+    await pending,
+    work.map((value) => value * 2),
+  );
+  assert.equal(peak, 3);
+});
+
+test("an explicit empty subscription scope observes no sessions", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeSessionRecordFile(
+      homeDir,
+      makeSessionRecord({
+        acpxRecordId: "session-empty-subscription-scope",
+        acpSessionId: "provider-empty-subscription-scope",
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+      }),
+    );
+    assert.deepEqual(
+      await sessionsServiceTestInternals.listSubscriptionRecords({
+        cwd,
+        subscriptionWorkspaceRoots: [],
+      }),
+      [],
+    );
+    assert.equal(
+      (await sessionsServiceTestInternals.listSubscriptionRecords({ cwd })).length,
+      1,
+      "an omitted explicit scope should still inherit cwd",
+    );
   });
 });
 
@@ -335,6 +454,166 @@ test("owner loss after dispatch never projects a turn as still running", async (
     assert.equal(detail?.ownerState, "absent");
     assert.equal(detail?.turnState, "unknown");
     assert.equal(detail?.activeTurnId, undefined);
+  });
+});
+
+test("an unreachable owner keeps queue depth visible without guessed turn controls or retirement", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-unreachable-queue",
+      acpSessionId: "provider-unreachable-queue",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    await appendSessionTimelineLifecycleEvent(
+      record,
+      { type: "turn_submitted", prompt_text: "Never infer this target" },
+      { turnId: "turn-unproven" },
+    );
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      ownerGeneration: 87,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 1,
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+    });
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const detail = await service.getSession({ acpxRecordId: record.acpxRecordId });
+      assert.equal(detail?.ownerState, "unreachable");
+      assert.equal(detail?.queue.depth, 1);
+      assert.deepEqual(detail?.queue.turns, []);
+      await fs.access(paths.lockPath);
+      assert.equal(keeper.exitCode, null, "read-only projection retired the unreachable owner");
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("an online pre-snapshot owner keeps depth but exposes no guessed turn controls", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-legacy-queue-owner",
+      acpSessionId: "provider-legacy-queue-owner",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    await appendSessionTimelineLifecycleEvent(
+      record,
+      { type: "turn_submitted", prompt_text: "Timeline is not queue authority" },
+      { turnId: "turn-unproven" },
+    );
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      ownerGeneration: 88,
+      queueProtocol: QUEUE_PROTOCOL_VERSION - 1,
+      queueDepth: 1,
+    });
+    const requests: string[] = [];
+    const server = createSingleRequestServer((socket, request) => {
+      requests.push(request.type);
+      assert.equal(request.type, "list_requests");
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "list_requests_result",
+          requestId: request.requestId,
+          ownerGeneration: 88,
+          requests: [],
+        })}\n`,
+      );
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const detail = await service.getSession({ acpxRecordId: record.acpxRecordId });
+      assert.equal(detail?.ownerState, "online");
+      assert.equal(detail?.queue.depth, 1);
+      assert.deepEqual(detail?.queue.turns, []);
+      assert.deepEqual(requests, ["list_requests"], "sent a v5 verb to a pre-v5 owner");
+      await fs.access(paths.lockPath);
+      assert.equal(keeper.exitCode, null);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("a wedged exact-queue snapshot degrades within its read bound without retiring the owner", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-wedged-queue-snapshot",
+      acpSessionId: "provider-wedged-queue-snapshot",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      ownerGeneration: 89,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 1,
+    });
+    const server = createSingleRequestServer((socket, request) => {
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      if (request.type === "list_requests") {
+        socket.write(
+          `${JSON.stringify({
+            type: "list_requests_result",
+            requestId: request.requestId,
+            ownerGeneration: 89,
+            requests: [],
+          })}\n`,
+        );
+        return;
+      }
+      assert.equal(request.type, "list_prompt_queue");
+      // Keep the connection open after acknowledgement: the read-side bound
+      // must turn this into an empty exact projection without touching lease state.
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    const startedAt = Date.now();
+    try {
+      const detail = await service.getSession({ acpxRecordId: record.acpxRecordId });
+      assert.ok(Date.now() - startedAt < 1_000, "snapshot exceeded its bounded read window");
+      assert.equal(detail?.ownerState, "online");
+      assert.equal(detail?.queue.depth, 1);
+      assert.deepEqual(detail?.queue.turns, []);
+      await fs.access(paths.lockPath);
+      assert.equal(keeper.exitCode, null, "read timeout retired the live owner");
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
   });
 });
 
@@ -750,6 +1029,11 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
       { type: "turn_submitted", prompt_text: "Run this after reload" },
       { turnId: "turn-queued" },
     );
+    await appendSessionTimelineLifecycleEvent(
+      record,
+      { type: "turn_submitted", prompt_text: "Outcome unknown and not in FIFO" },
+      { turnId: "turn-newer-unknown" },
+    );
     const keeper = await startKeeperProcess();
     const paths = queuePaths(homeDir, initial.acpxRecordId);
     await writeQueueOwnerLock({
@@ -758,7 +1042,9 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
       sessionId: initial.acpxRecordId,
       ownerGeneration: 80,
       queueProtocol: QUEUE_PROTOCOL_VERSION,
-      queueDepth: 1,
+      // One prompt is pending and one cancellation is still settling. The
+      // lease depth remains two, while only the pending prompt gets a control.
+      queueDepth: 2,
     });
     const targeted: string[] = [];
     const server = createSingleRequestServer((socket, request) => {
@@ -770,6 +1056,24 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
             requestId: request.requestId,
             ownerGeneration: 80,
             requests: [],
+          })}\n`,
+        );
+        return;
+      }
+      if (request.type === "list_prompt_queue") {
+        socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+        socket.write(
+          `${JSON.stringify({
+            type: "list_prompt_queue_result",
+            requestId: request.requestId,
+            ownerGeneration: 80,
+            prompts: [
+              {
+                turnId: "turn-queued",
+                submittedAt: "2026-08-13T10:00:00.000Z",
+                promptText: "Run this after reload",
+              },
+            ],
           })}\n`,
         );
         return;
@@ -797,11 +1101,11 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
 
     try {
       const reloaded = await service.getSession({ acpxRecordId: record.acpxRecordId });
-      assert.equal(reloaded?.queue.depth, 1);
+      assert.equal(reloaded?.queue.depth, 2);
       assert.equal(reloaded?.queue.turns.length, 1);
       assert.equal(reloaded?.queue.turns[0]?.turnId, "turn-queued");
       assert.equal(reloaded?.queue.turns[0]?.promptText, "Run this after reload");
-      assert.match(reloaded?.queue.turns[0]?.submittedAt ?? "", /^\d{4}-\d{2}-\d{2}T/u);
+      assert.equal(reloaded?.queue.turns[0]?.submittedAt, "2026-08-13T10:00:00.000Z");
       const queued = await service.cancelTurn({
         acpxRecordId: record.acpxRecordId,
         turnId: "turn-queued",

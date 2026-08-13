@@ -29,6 +29,7 @@ import {
   ensureOwnerIsUsable,
   QUEUE_PROTOCOL_DEFER_VERSION,
   QUEUE_PROTOCOL_EXACT_CANCEL_VERSION,
+  QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION,
   readLiveQueueOwner,
   type QueueOwnerRecord,
   queueOwnerProtocolVersion,
@@ -40,9 +41,11 @@ import {
   type QueueCancelOutcome,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
+  type QueueListPromptQueueRequest,
   type QueueListRequestsRequest,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
+  type QueueOwnerListPromptQueueResultMessage,
   type QueueOwnerListRequestsResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerRespondResultMessage,
@@ -50,6 +53,7 @@ import {
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueRequest,
+  type QueuePromptSnapshot,
   type QueueRespondRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetModelRequest,
@@ -1218,6 +1222,54 @@ export async function tryListRequestsOnRunningOwner(options: {
     );
   }
   return (await requireAcceptingOwner(options.sessionId, response, "list_requests"))?.requests;
+}
+
+/**
+ * Exact queued prompt identities owned by the current queue generation.
+ *
+ * Older owners return `undefined` without receiving an unknown verb. Callers
+ * must keep their separately observed depth but omit turn controls in that
+ * case; timeline submissions are not proof of FIFO membership.
+ */
+export async function tryListPromptQueueOnRunningOwner(options: {
+  sessionId: string;
+  responseTimeoutMs?: number;
+  verbose?: boolean;
+}): Promise<{ ownerGeneration: number; prompts: QueuePromptSnapshot[] } | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner || queueOwnerProtocolVersion(owner) < QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION) {
+    return undefined;
+  }
+
+  const request: QueueListPromptQueueRequest = {
+    type: "list_prompt_queue",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerListPromptQueueResultMessage =>
+      message.type === "list_prompt_queue_result",
+    options.responseTimeoutMs,
+  );
+  if (options.verbose && response) {
+    process.stderr.write(
+      `[acpx] listed ${response.prompts.length} queued prompt(s) on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+    );
+  }
+  const accepted = await requireAcceptingOwner(options.sessionId, response, "list_prompt_queue");
+  if (!accepted) {
+    return undefined;
+  }
+  if (accepted.ownerGeneration !== owner.ownerGeneration) {
+    throw new QueueProtocolError("Queue owner omitted its prompt queue generation", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return { ownerGeneration: accepted.ownerGeneration, prompts: accepted.prompts };
 }
 
 /**

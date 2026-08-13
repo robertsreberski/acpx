@@ -18,7 +18,9 @@ import {
 } from "./composer-drafts";
 import { listenForLiveInvalidations } from "./live-events";
 import {
+  expireOptimisticQueuedPrompts,
   mergeSessionQueuedProjection,
+  OPTIMISTIC_QUEUE_GRACE_MS,
   reconcileSessionQueuedPrompts,
   removeQueuedPrompt,
   type QueuedPrompt,
@@ -140,7 +142,13 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
         }
         setSelectedSession(detail);
         setQueuedPrompts((current) =>
-          mergeSessionQueuedProjection(current, id, detail.queuedCount, detail.queuedTurns),
+          mergeSessionQueuedProjection(
+            current,
+            id,
+            detail.ownerState,
+            detail.queuedTurns,
+            performance.now(),
+          ),
         );
         setTimeline((current) =>
           preserveLoadedHistory
@@ -198,6 +206,26 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       );
     }
   }, [selectedSessionId, timeline]);
+
+  useEffect(() => {
+    const now = performance.now();
+    const nextExpiry = queuedPrompts.reduce<number | undefined>((soonest, prompt) => {
+      if (prompt.optimisticSince === undefined) {
+        return soonest;
+      }
+      const expiry = prompt.optimisticSince + OPTIMISTIC_QUEUE_GRACE_MS;
+      return soonest === undefined || expiry < soonest ? expiry : soonest;
+    }, undefined);
+    if (nextExpiry === undefined) {
+      return undefined;
+    }
+    const timer = window.setTimeout(
+      () =>
+        setQueuedPrompts((current) => expireOptimisticQueuedPrompts(current, performance.now())),
+      Math.max(0, nextExpiry - now) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [queuedPrompts]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -335,7 +363,12 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
             const turnId = receipt.turnId;
             setQueuedPrompts((current) => [
               ...current.filter((item) => item.id !== turnId),
-              { id: turnId, sessionId, text: submittedText },
+              {
+                id: turnId,
+                sessionId,
+                text: submittedText,
+                optimisticSince: performance.now(),
+              },
             ]);
           }
         },

@@ -428,6 +428,70 @@ test("SessionQueueOwner cancels exactly one queued prompt and preserves FIFO ord
   });
 });
 
+test("SessionQueueOwner snapshots mixed prompt sources exactly and a new owner starts empty", async () => {
+  await withTempHome(async () => {
+    const sessionId = "owner-list-prompt-queue";
+    const handlers = {
+      ...noParkedRequestControlHandlers,
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {},
+      setSessionModel: async (): Promise<undefined> => undefined,
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+    const firstLease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(firstLease);
+    const firstOwner = await SessionQueueOwner.start(firstLease, handlers, { maxQueueDepth: 4 });
+
+    try {
+      await enqueuePrompt(firstLease.socketPath, "turn-cli", false, "ordinary CLI prompt");
+      await enqueuePrompt(firstLease.socketPath, "turn-service", false, "service prompt");
+      const snapshot = (await sendQueueRequest(firstLease.socketPath, {
+        type: "list_prompt_queue",
+        requestId: "list-mixed",
+        ownerGeneration: firstLease.ownerGeneration,
+      })) as {
+        type: string;
+        ownerGeneration?: number;
+        prompts: Array<{ turnId: string; submittedAt: string; promptText: string }>;
+      };
+      assert.equal(snapshot.type, "list_prompt_queue_result");
+      assert.equal(snapshot.ownerGeneration, firstLease.ownerGeneration);
+      assert.deepEqual(
+        snapshot.prompts.map(({ turnId, promptText }) => ({ turnId, promptText })),
+        [
+          { turnId: "turn-cli", promptText: "ordinary CLI prompt" },
+          { turnId: "turn-service", promptText: "service prompt" },
+        ],
+      );
+      assert.equal(
+        snapshot.prompts.every(({ submittedAt }) => !Number.isNaN(Date.parse(submittedAt))),
+        true,
+      );
+    } finally {
+      await firstOwner.close();
+      await releaseQueueOwnerLease(firstLease);
+    }
+
+    const secondLease = await tryAcquireQueueOwnerLease(sessionId);
+    assert(secondLease);
+    assert.notEqual(secondLease.ownerGeneration, firstLease.ownerGeneration);
+    const secondOwner = await SessionQueueOwner.start(secondLease, handlers, { maxQueueDepth: 4 });
+    try {
+      const restarted = (await sendQueueRequest(secondLease.socketPath, {
+        type: "list_prompt_queue",
+        requestId: "list-restarted",
+        ownerGeneration: secondLease.ownerGeneration,
+      })) as { type: string; prompts: unknown[] };
+      assert.equal(restarted.type, "list_prompt_queue_result");
+      assert.deepEqual(restarted.prompts, []);
+    } finally {
+      await secondOwner.close();
+      await releaseQueueOwnerLease(secondLease);
+    }
+  });
+});
+
 test("SessionQueueOwner restores a queued prompt when durable cancellation fails", async () => {
   await withTempHome(async () => {
     const lease = await tryAcquireQueueOwnerLease("owner-cancel-queued-fails");
@@ -537,6 +601,7 @@ async function enqueuePrompt(
   socketPath: string,
   requestId: string,
   waitForCompletion: boolean,
+  message = requestId,
 ): Promise<void> {
   const socket = await connectSocket(socketPath);
   const lines = readline.createInterface({ input: socket });
@@ -546,7 +611,7 @@ async function enqueuePrompt(
       `${JSON.stringify({
         type: "submit_prompt",
         requestId,
-        message: requestId,
+        message,
         permissionMode: "approve-reads",
         waitForCompletion,
       })}\n`,

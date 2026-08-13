@@ -9,6 +9,7 @@ import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useStat
 import { shouldSubmitComposerKey } from "../composer-submit";
 import { booleanElicitationChoices, readElicitationField } from "../elicitation";
 import { interactionAvailability } from "../interaction-availability";
+import { unavailableQueuedControlsMessage } from "../queued-prompts";
 import { useSessionStore } from "../session-store";
 import type { ElicitationProperty, PendingInteraction } from "../types";
 import { consumeUiAction } from "../ui-actions";
@@ -440,6 +441,10 @@ export function Transcript() {
       session.turnState,
     );
   const sendLabel = isBusy ? "Queue follow-up" : "Send prompt";
+  const unavailableQueueControls = unavailableQueuedControlsMessage(
+    session?.queuedCount ?? 0,
+    store.queuedPrompts.length,
+  );
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const composerDraft = session ? store.composerDraftFor(session.id) : "";
   const resizeComposer = () => {
@@ -514,7 +519,7 @@ export function Transcript() {
           </div>
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
-        {store.queuedPrompts.length > 0 && (
+        {(store.queuedPrompts.length > 0 || unavailableQueueControls) && (
           <section className="queued-prompts" aria-label="Queued follow-ups">
             <strong>Queued follow-ups</strong>
             {store.queuedPrompts.map((prompt) => (
@@ -531,8 +536,9 @@ export function Transcript() {
                 </button>
               </div>
             ))}
-            <small>
-              Accepted by ACPX; they will appear in the transcript when execution starts.
+            <small role={unavailableQueueControls ? "note" : undefined}>
+              {unavailableQueueControls ??
+                "Accepted by ACPX; they will appear in the transcript when execution starts."}
             </small>
           </section>
         )}

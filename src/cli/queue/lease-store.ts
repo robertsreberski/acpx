@@ -34,14 +34,17 @@ const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
  *    ignore that field and could cancel a newer turn after a handoff race.
  * 4: exact cancellation targets both active and queued turns. A v3 owner only
  *    checks the active turn and would silently leave a queued target in place.
+ * 5: clients can read the exact queued prompt FIFO from its owning generation.
  */
-export const QUEUE_PROTOCOL_VERSION = 4;
+export const QUEUE_PROTOCOL_VERSION = 5;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
 /** First protocol version that atomically cancels an exact active or queued turn. */
 export const QUEUE_PROTOCOL_EXACT_CANCEL_VERSION = 4;
+/** First protocol version that exposes the exact prompt FIFO read-only. */
+export const QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION = 5;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided

@@ -17,6 +17,7 @@ import {
   type QueueCancelOutcome,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
+  type QueuePromptSnapshot,
   type QueueRequest,
 } from "./messages.js";
 
@@ -354,6 +355,16 @@ export class SessionQueueOwner {
     return (await this.controlHandlers.cancelPrompt(targetTurnId)) ? "active" : "not_found";
   }
 
+  private async promptQueueSnapshot(): Promise<QueuePromptSnapshot[]> {
+    return await this.runPendingMutation(async () =>
+      this.pending.map((task) => ({
+        turnId: task.requestId,
+        submittedAt: new Date(task.enqueuedAt).toISOString(),
+        promptText: task.message,
+      })),
+    );
+  }
+
   private enqueue(task: QueueTask): boolean {
     if (this.closed) {
       task.send(
@@ -528,6 +539,18 @@ export class SessionQueueOwner {
             outcome,
           };
         },
+      });
+      return true;
+    }
+    if (request.type === "list_prompt_queue") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "list_prompt_queue_result",
+          requestId: request.requestId,
+          prompts: await this.promptQueueSnapshot(),
+        }),
       });
       return true;
     }

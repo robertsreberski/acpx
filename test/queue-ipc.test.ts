@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { tryListRequestsOnRunningOwner, tryRespondOnRunningOwner } from "../src/cli/queue/ipc.js";
+import {
+  tryListPromptQueueOnRunningOwner,
+  tryListRequestsOnRunningOwner,
+  tryRespondOnRunningOwner,
+} from "../src/cli/queue/ipc.js";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { PendingRequestAnswerTimeoutError } from "../src/errors.js";
 import {
   cleanupOwnerArtifacts,
@@ -141,6 +146,81 @@ test("tryListRequestsOnRunningOwner parses the parked requests the owner reports
   });
 });
 
+test("tryListPromptQueueOnRunningOwner returns only the owner's exact FIFO snapshot", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "prompt-queue-session";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      ownerGeneration: 78,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 2,
+    });
+    const prompts = [
+      {
+        turnId: "turn-cli",
+        submittedAt: "2026-08-13T10:00:00.000Z",
+        promptText: "CLI prompt",
+      },
+      {
+        turnId: "turn-service",
+        submittedAt: "2026-08-13T10:00:01.000Z",
+        promptText: "Service prompt",
+      },
+    ];
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "list_prompt_queue");
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "list_prompt_queue_result",
+          requestId: request.requestId,
+          ownerGeneration: 78,
+          prompts,
+        })}\n`,
+      );
+      socket.end();
+    });
+    await listenServer(server, socketPath);
+    try {
+      assert.deepEqual(await tryListPromptQueueOnRunningOwner({ sessionId }), {
+        ownerGeneration: 78,
+        prompts,
+      });
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("prompt queue snapshots fail closed for owners predating the read-only verb", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "legacy-prompt-queue-session";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      queueProtocol: 4,
+      queueDepth: 1,
+    });
+    try {
+      assert.equal(await tryListPromptQueueOnRunningOwner({ sessionId }), undefined);
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("tryRespondOnRunningOwner sends the tagged answer and returns the terminal entry", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "requests-session";
@@ -216,6 +296,7 @@ test("the parked-request client verbs report no owner rather than an empty resul
     // No lease at all: "nothing to ask" must stay distinguishable from "the
     // owner says there is nothing parked".
     assert.equal(await tryListRequestsOnRunningOwner({ sessionId: "never-owned" }), undefined);
+    assert.equal(await tryListPromptQueueOnRunningOwner({ sessionId: "never-owned" }), undefined);
     assert.equal(
       await tryRespondOnRunningOwner({
         sessionId: "never-owned",

@@ -4,7 +4,35 @@ export interface QueuedPrompt {
   readonly id: string;
   readonly sessionId: string;
   readonly text: string;
+  /** Browser monotonic time used only to bound post-acceptance projection lag. */
+  readonly optimisticSince?: number;
 }
+
+export const OPTIMISTIC_QUEUE_GRACE_MS = 3_000;
+
+const isWithinOptimisticGrace = (prompt: QueuedPrompt, now: number): boolean =>
+  prompt.optimisticSince !== undefined &&
+  now >= prompt.optimisticSince &&
+  now - prompt.optimisticSince <= OPTIMISTIC_QUEUE_GRACE_MS;
+
+/** Expire post-acceptance placeholders even when no further server invalidation arrives. */
+export const expireOptimisticQueuedPrompts = (
+  prompts: readonly QueuedPrompt[],
+  now: number,
+): readonly QueuedPrompt[] =>
+  prompts.filter(
+    (prompt) => prompt.optimisticSince === undefined || isWithinOptimisticGrace(prompt, now),
+  );
+
+export const unavailableQueuedControlsMessage = (
+  queueDepth: number,
+  exactTurnCount: number,
+): string | undefined => {
+  const unavailableCount = Math.max(0, queueDepth - exactTurnCount);
+  return unavailableCount > 0
+    ? `${unavailableCount} queued follow-up${unavailableCount === 1 ? "" : "s"} ${unavailableCount === 1 ? "has" : "have"} no exact control while the queue owner is reconciling or unavailable.`
+    : undefined;
+};
 
 /** Remove exactly one optimistic receipt without disturbing another session or turn. */
 export const removeQueuedPrompt = (
@@ -56,15 +84,22 @@ export const replaceSessionQueuedPrompts = (
   ...durable.map((prompt) => ({ ...prompt, sessionId })),
 ];
 
-/** Preserve a just-accepted optimistic row while the owner lease depth catches up. */
+type QueueProjectionOwnerState = "absent" | "starting" | "online" | "unreachable" | "dead";
+
+/** Preserve a just-accepted optimistic row only while its online owner projection catches up. */
 export const mergeSessionQueuedProjection = (
   prompts: readonly QueuedPrompt[],
   sessionId: string,
-  queueDepth: number,
+  ownerState: QueueProjectionOwnerState,
   durable: readonly { readonly id: string; readonly text: string }[],
+  now: number,
 ): readonly QueuedPrompt[] => {
   const optimistic = prompts.filter((prompt) => prompt.sessionId === sessionId);
-  return durable.length === 0 && queueDepth < optimistic.length
-    ? prompts
+  if (durable.length > 0) {
+    return replaceSessionQueuedPrompts(prompts, sessionId, durable);
+  }
+  const withinGrace = optimistic.filter((prompt) => isWithinOptimisticGrace(prompt, now));
+  return ownerState === "online" && withinGrace.length > 0
+    ? [...prompts.filter((prompt) => prompt.sessionId !== sessionId), ...withinGrace]
     : replaceSessionQueuedPrompts(prompts, sessionId, durable);
 };

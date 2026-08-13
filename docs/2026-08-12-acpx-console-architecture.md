@@ -122,12 +122,14 @@ action. The guarantee is exactly-once local admission. ACPX
 does not promise exactly-once external-agent execution after an ambiguous
 process failure.
 
-The submitted lifecycle envelope also retains browser-safe prompt display text.
-Session projection combines unresolved submissions with the live owner's queue
-depth, so reloading the console reconstructs the exact queued rows and their
-cancellation targets instead of relying on browser memory. Older envelopes
-without text remain readable, and owner loss never turns stale submissions into
-apparently cancellable work.
+Queue protocol v5 adds a bounded, read-only snapshot of the current owner's
+exact pending FIFO, including stable turn IDs and browser-safe display text.
+Session projection uses that same-generation snapshot for cancellation targets
+and keeps the lease's depth as a separate count, because depth can also include
+a cancellation still settling. A pre-v5, unreachable, generation-mismatched,
+or slow owner therefore retains its reported depth but exposes no guessed turn
+controls. Timeline submissions remain useful history, but are not evidence that
+a prompt entered the owner's FIFO.
 
 Session close has two explicit outcomes in one receipt: the local record is
 durably closed, and provider close is either `confirmed` or `degraded` with a

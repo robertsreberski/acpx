@@ -54,7 +54,9 @@ streaming. Use **Load earlier** to page backward through long conversations;
 the browser does not need to load the whole history at once.
 
 New session events are durably sequenced. Sessions created before this event
-ledger existed expose the history ACPX still retained and show a visible
+ledger existed import the history ACPX still retained on the first transcript
+read, so selecting the session does not require sending another prompt. The
+import is resumable and idempotent, and the transcript still shows a visible
 legacy-history gap. The console never labels unavailable history as complete.
 
 ## Session state
@@ -89,6 +91,13 @@ new user action and may create another turn. ACPX guarantees exactly-once local 
 exactly-once execution by an external agent. If an owner dies after dispatch,
 the turn becomes `interrupted` or `unknown` and is never replayed
 automatically.
+
+Reloaded queued-turn controls come only from a bounded exact FIFO snapshot of
+the current queue owner. Lease depth remains visible when that snapshot is
+unavailable or the owner predates the snapshot protocol, but the console does
+not invent a cancellation target from transcript history. A just-accepted
+browser receipt may bridge projection lag briefly while its owner is online;
+it expires after a bounded grace period if no exact row arrives.
 
 Replayable mutation results are retained for seven days and at least the latest
 512 terminal actions. Compacted key hashes remain exact (not probabilistic)

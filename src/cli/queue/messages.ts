@@ -101,6 +101,13 @@ export type QueueListRequestsRequest = {
   ownerGeneration?: number;
 };
 
+/** Read the exact FIFO currently owned by this queue-owner generation. */
+export type QueueListPromptQueueRequest = {
+  type: "list_prompt_queue";
+  requestId: string;
+  ownerGeneration?: number;
+};
+
 export type QueueRespondRequest = {
   type: "respond_request";
   requestId: string;
@@ -118,6 +125,7 @@ export type QueueRequest =
   | QueueSetConfigOptionRequest
   | QueueCloseSessionRequest
   | QueueListRequestsRequest
+  | QueueListPromptQueueRequest
   | QueueRespondRequest;
 
 export type QueueOwnerAcceptedMessage = {
@@ -192,6 +200,19 @@ export type QueueOwnerListRequestsResultMessage = {
   requests: PendingRequest[];
 };
 
+export type QueuePromptSnapshot = {
+  turnId: string;
+  submittedAt: string;
+  promptText: string;
+};
+
+export type QueueOwnerListPromptQueueResultMessage = {
+  type: "list_prompt_queue_result";
+  requestId: string;
+  ownerGeneration?: number;
+  prompts: QueuePromptSnapshot[];
+};
+
 export type QueueOwnerRespondResultMessage = {
   type: "respond_request_result";
   requestId: string;
@@ -224,6 +245,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerListRequestsResultMessage
+  | QueueOwnerListPromptQueueResultMessage
   | QueueOwnerRespondResultMessage
   | QueueOwnerErrorMessage;
 
@@ -533,6 +555,13 @@ function parsePendingRequestQueueRequest(
       ownerGeneration: context.ownerGeneration,
     };
   }
+  if (request.type === "list_prompt_queue") {
+    return {
+      type: "list_prompt_queue",
+      requestId: context.requestId,
+      ownerGeneration: context.ownerGeneration,
+    };
+  }
   if (request.type === "respond_request") {
     return parseRespondRequest(request, context);
   }
@@ -787,6 +816,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_model_result: parseSetModelOwnerMessage,
   set_config_option_result: parseSetConfigOptionOwnerMessage,
   list_requests_result: parseListRequestsOwnerMessage,
+  list_prompt_queue_result: parseListPromptQueueOwnerMessage,
   respond_request_result: parseRespondResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
@@ -938,6 +968,42 @@ function parseListRequestsOwnerMessage(
     requests.push(parsed);
   }
   return { type: "list_requests_result", ...context, requests };
+}
+
+function parseListPromptQueueOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerListPromptQueueResultMessage | null {
+  if (!Array.isArray(message.prompts)) {
+    return null;
+  }
+  const prompts: QueuePromptSnapshot[] = [];
+  const turnIds = new Set<string>();
+  for (const raw of message.prompts) {
+    const prompt = parseQueuePromptSnapshot(raw);
+    if (!prompt || turnIds.has(prompt.turnId)) {
+      return null;
+    }
+    turnIds.add(prompt.turnId);
+    prompts.push(prompt);
+  }
+  return { type: "list_prompt_queue_result", ...context, prompts };
+}
+
+function parseQueuePromptSnapshot(value: unknown): QueuePromptSnapshot | null {
+  const prompt = asRecord(value);
+  const turnId = parseNonEmptyString(prompt?.turnId);
+  const submittedAt = parseNonEmptyString(prompt?.submittedAt);
+  if (
+    !prompt ||
+    !turnId ||
+    !submittedAt ||
+    !Number.isFinite(Date.parse(submittedAt)) ||
+    typeof prompt.promptText !== "string"
+  ) {
+    return null;
+  }
+  return { turnId, submittedAt, promptText: prompt.promptText };
 }
 
 function parseRespondResultOwnerMessage(

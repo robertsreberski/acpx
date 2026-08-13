@@ -711,6 +711,66 @@ test("parseQueueRequest accepts a list_requests control request", () => {
   );
 });
 
+test("parseQueueRequest accepts the read-only prompt queue request", () => {
+  assert.deepEqual(
+    parseQueueRequest({
+      type: "list_prompt_queue",
+      requestId: "req-list-queue",
+      ownerGeneration: 7,
+    }),
+    {
+      type: "list_prompt_queue",
+      requestId: "req-list-queue",
+      ownerGeneration: 7,
+    },
+  );
+});
+
+test("parseQueueOwnerMessage validates exact queued prompt snapshots", () => {
+  const prompts = [
+    {
+      turnId: "turn-cli",
+      submittedAt: "2026-08-13T10:00:00.000Z",
+      promptText: "CLI follow-up",
+    },
+    {
+      turnId: "turn-service",
+      submittedAt: "2026-08-13T10:00:01.000Z",
+      promptText: "Service follow-up",
+    },
+  ];
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "list_prompt_queue_result",
+      requestId: "req-list-queue",
+      ownerGeneration: 7,
+      prompts,
+    }),
+    {
+      type: "list_prompt_queue_result",
+      requestId: "req-list-queue",
+      ownerGeneration: 7,
+      prompts,
+    },
+  );
+  for (const invalid of [
+    undefined,
+    [{ ...prompts[0], turnId: "" }],
+    [{ ...prompts[0], submittedAt: "not-a-date" }],
+    [{ ...prompts[0], promptText: 42 }],
+    [prompts[0], prompts[0]],
+  ]) {
+    assert.equal(
+      parseQueueOwnerMessage({
+        type: "list_prompt_queue_result",
+        requestId: "req-list-queue",
+        prompts: invalid,
+      }),
+      null,
+    );
+  }
+});
+
 test("parseQueueRequest accepts every respond_request answer arm", () => {
   assert.deepEqual(
     parseQueueRequest({

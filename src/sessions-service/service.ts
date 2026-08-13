@@ -42,6 +42,7 @@ import {
   appendSessionTimelineLifecycleEvent,
   getActiveSessionTimelineTurn,
   listSessionTimelinePage,
+  SessionTimelineWriter,
 } from "../session/timeline.js";
 import type { PermissionPolicy, SessionRecord } from "../types.js";
 import type {
@@ -76,6 +77,7 @@ const DEFAULT_DEFER_MAX_AGE_MS = 86_400_000;
 const NO_LIVE_OWNER_GENERATION = 0;
 const SESSION_SERVICE_QUEUE_OWNER_ARGS = queueOwnerSpawnArgsForModule(import.meta.url);
 const SUBSCRIPTION_POLL_CONCURRENCY = 8;
+const SESSION_PROJECTION_CONCURRENCY = 8;
 
 /** Browser-created sessions stop at the human boundary unless a caller opts into another policy. */
 export const DEFAULT_SESSIONS_PERMISSION_POLICY: Readonly<PermissionPolicy> = {
@@ -284,23 +286,45 @@ function pendingFingerprint(entries: PendingRequest[]): string {
     .join("|");
 }
 
-async function runBounded<T>(
+async function mapConcurrentBounded<T, TResult>(
   values: readonly T[],
   concurrency: number,
-  run: (value: T) => Promise<void>,
-): Promise<void> {
+  run: (value: T) => Promise<TResult>,
+): Promise<TResult[]> {
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new Error("concurrency must be a positive integer");
+  }
   let next = 0;
+  const results: TResult[] = [];
   const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
     for (;;) {
       const index = next++;
-      const value = values[index];
-      if (value === undefined) {
+      if (index >= values.length) {
         return;
       }
-      await run(value);
+      results[index] = await run(values[index]);
     }
   });
   await Promise.all(workers);
+  return results;
+}
+
+function subscriptionWorkspaceRoots(
+  options: AcpxSessionsServiceOptions,
+): readonly string[] | undefined {
+  if (options.subscriptionWorkspaceRoots !== undefined) {
+    return options.subscriptionWorkspaceRoots;
+  }
+  return options.cwd ? [options.cwd] : undefined;
+}
+
+async function listSubscriptionRecords(
+  options: AcpxSessionsServiceOptions,
+): Promise<SessionRecord[]> {
+  const roots = subscriptionWorkspaceRoots(options);
+  // An embedding server that resolved no safe roots must observe nothing.
+  // Only an omitted scope is allowed to retain the legacy unscoped behavior.
+  return roots?.length === 0 ? [] : await listOpenSessionsForSubscription(roots);
 }
 
 // oxlint-disable-next-line eslint/complexity -- The fingerprint intentionally covers independent persisted and owner axes.
@@ -460,9 +484,13 @@ class SessionService implements AcpxSessionService {
   async listSessions(): Promise<AcpxSessionSummary[]> {
     const records = await listSessions();
     // Every live-owner read is bounded by LIVE_PENDING_LIST_TIMEOUT_MS. Keep
-    // session projections concurrent so N retained owners cost one bounded
-    // window rather than N serial two-second windows.
-    return await Promise.all(records.map(async (record) => await this.projectSummary(record)));
+    // projections concurrent, but cap the owner/socket pressure from a large
+    // retained inventory rather than opening one connection per session.
+    return await mapConcurrentBounded(
+      records,
+      SESSION_PROJECTION_CONCURRENCY,
+      async (record) => await this.projectSummary(record),
+    );
   }
 
   async getSession(input: { acpxRecordId: string }): Promise<AcpxSessionDetail | undefined> {
@@ -899,7 +927,15 @@ class SessionService implements AcpxSessionService {
     before?: string;
     limit?: number;
   }): Promise<AcpxTranscriptPage> {
-    await this.requireExactRecord(input.acpxRecordId);
+    const record = await this.requireExactRecord(input.acpxRecordId);
+    if (record.timeline?.legacy_import_complete !== true) {
+      // Retained pre-ledger traffic used to appear only after the next prompt,
+      // because prompt execution was the first path that opened a timeline
+      // writer. Complete/resume that idempotent import on the first transcript
+      // read so selecting a session never requires a mutation to reveal chat.
+      const writer = await SessionTimelineWriter.open(record);
+      await writer.close({ checkpoint: true });
+    }
     return await listSessionTimelinePage(input.acpxRecordId, {
       before: input.before,
       limit: input.limit,
@@ -992,12 +1028,9 @@ class SessionService implements AcpxSessionService {
     }
     this.pollBusy = true;
     try {
-      const records = await listOpenSessionsForSubscription(
-        this.options.subscriptionWorkspaceRoots ??
-          (this.options.cwd ? [this.options.cwd] : undefined),
-      );
+      const records = await listSubscriptionRecords(this.options);
       const liveIds = new Set(records.map((record) => record.acpxRecordId));
-      await runBounded(
+      await mapConcurrentBounded(
         records,
         SUBSCRIPTION_POLL_CONCURRENCY,
         async (record) => await this.pollRecord(record),
@@ -1034,6 +1067,8 @@ export const sessionsServiceTestInternals = {
   adapterOperationTimeout,
   configuredAgentArgv,
   exactRecord,
+  listSubscriptionRecords,
+  mapConcurrentBounded,
   mergePending,
   providerSessionProjection,
   registeredAgent,
