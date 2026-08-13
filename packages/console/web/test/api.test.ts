@@ -423,7 +423,7 @@ test("an unknown pending response blocks conflicting answers until durable recon
       }
       mutations.push({
         key: new Headers(init?.headers).get("Idempotency-Key") ?? "",
-        body: String(init?.body),
+        body: typeof init?.body === "string" ? init.body : JSON.stringify(init?.body),
       });
       return mutations.length === 1
         ? response(
