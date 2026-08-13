@@ -12,6 +12,7 @@ import {
   trySetModeOnRunningOwner,
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
@@ -80,7 +81,7 @@ test("an acknowledged prompt whose owner generation disappears is an ambiguous a
       sessionId,
       socketPath,
       ownerGeneration: 71,
-      queueProtocol: 3,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
       parking: true,
       parkingMaxAgeMs: 86_400_000,
     });
@@ -148,6 +149,10 @@ test("trySubmitToRunningOwner propagates typed queue prompt errors", async () =>
 
     const server = createSingleRequestServer((socket, request) => {
       assert.equal(request.type, "submit_prompt");
+      assert.equal(
+        (request as typeof request & { resumePolicy?: unknown }).resumePolicy,
+        "same-session-only",
+      );
       socket.write(
         `${JSON.stringify({
           type: "accepted",
@@ -184,6 +189,7 @@ test("trySubmitToRunningOwner propagates typed queue prompt errors", async () =>
             sessionId,
             message: "hello",
             permissionMode: "approve-reads",
+            resumePolicy: "same-session-only",
             outputFormatter: NOOP_OUTPUT_FORMATTER,
             waitForCompletion: true,
           }),
@@ -528,6 +534,7 @@ test("trySubmitToRunningOwner streams queued lifecycle and returns result", asyn
           type: "result",
           requestId: request.requestId,
           result: {
+            status: "completed",
             stopReason: "end_turn",
             sessionId: "agent-session",
             permissionStats: {

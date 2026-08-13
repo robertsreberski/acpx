@@ -1,6 +1,6 @@
 ---
 title: Exit codes
-description: Stable acpx exit codes for scripting — success, runtime errors, usage errors, timeouts, no-session, permission denial, and interrupts.
+description: Stable acpx exit codes for scripting — success, runtime errors, usage errors, timeouts, no-session, permission denial, incomplete turns, and interrupts.
 ---
 
 `acpx` uses a small, stable set of exit codes so wrapping scripts can branch on them.
@@ -13,6 +13,7 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
 | `3`   | Timeout (`--timeout` exceeded)                                      |
 | `4`   | No session found, or the owner that parked a request is gone        |
 | `5`   | Permission denied (every request denied/cancelled, none approved)   |
+| `6`   | Incomplete turn (context compaction ended without a final answer)   |
 | `130` | Interrupted (`SIGINT` / `SIGTERM`)                                  |
 
 ## Notes
@@ -23,6 +24,7 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
 - **`3`** is reserved for `--timeout` expiry. Adapter-side timeouts that are not surfaced as `acpx` timeouts come through as `1`. `respond --timeout` uses it too, with `detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT"`: the answer was delivered but not confirmed in time, and it may still be applied.
 - **`4`** is the "directory walk found no active session" signal. Run `sessions new` (or `sessions ensure` for idempotent scripts) and retry. `respond` also uses it when the queue owner that parked a request is gone: the request is marked `orphaned` and can no longer be answered by anyone.
 - **`5`** only fires when at least one permission request happened, and every one ended in a denial or cancellation. If at least one was approved, the result reflects whatever the agent returned.
+- **`6`** means an exact Codex context-compaction marker was observed but the same prompt attempt ended without a later non-empty final-answer message. The turn is terminal but not successful; `acpx` never sends an automatic follow-up. Persistent prompts preserve the provider session for an explicit next prompt, while `exec` and `compare` discard their temporary sessions.
 - **`130`** matches the conventional shell signal exit code for `Ctrl+C` (`128 + SIGINT`). `acpx` cancels cooperatively before exiting with this code.
 
 ## Branching example
@@ -36,6 +38,7 @@ else
     3)   echo "timed out"   ;;
     4)   echo "no session — run sessions new"; acpx codex sessions new ;;
     5)   echo "all denied"  ;;
+    6)   echo "incomplete — explicit follow-up required" ;;
     130) echo "interrupted" ;;
     *)   echo "agent or runtime error" ;;
   esac
@@ -48,3 +51,4 @@ fi
 - [CLI reference](CLI.md#respond-command) — `respond` exit codes in context.
 - [Sessions](sessions.md) — what makes exit `4` happen and how to fix it.
 - [Prompting](prompting.md) — `--timeout` and `--no-wait` semantics.
+- [CLI reference](CLI.md#incomplete-codex-turns) — exact context-compaction completion rules.

@@ -870,11 +870,20 @@ function parseSessionSendResult(raw: unknown): SessionSendResult | null {
 }
 
 function hasValidSessionSendResultCore(result: Record<string, unknown>): boolean {
-  return (
-    typeof result.stopReason === "string" &&
-    typeof result.sessionId === "string" &&
-    typeof result.resumed === "boolean"
-  );
+  if (
+    typeof result.stopReason !== "string" ||
+    typeof result.sessionId !== "string" ||
+    typeof result.resumed !== "boolean"
+  ) {
+    return false;
+  }
+  if (result.status === "incomplete") {
+    return result.stopReason !== "cancelled" && result.reason === "context_compaction";
+  }
+  if (result.status === "cancelled") {
+    return result.stopReason === "cancelled";
+  }
+  return result.status === "completed" && result.stopReason !== "cancelled";
 }
 
 function hasValidPermissionStats(permissionStats: Record<string, unknown>): boolean {

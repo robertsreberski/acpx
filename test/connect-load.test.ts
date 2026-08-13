@@ -774,7 +774,7 @@ test("connectAndLoadSession falls back to createSession for empty sessions on ad
   });
 });
 
-test("connectAndLoadSession fails clearly when same-session resume is required but session reuse is unsupported", async () => {
+test("connectAndLoadSession creates the first provider session when an empty record cannot be resumed", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -784,6 +784,104 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
       acpSessionId: "unsupported-load-session",
       agentCommand: "agent",
       cwd,
+      agentCapabilities: {},
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({
+        running: true,
+      }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSession should not be called");
+      },
+      createSession: async () => ({
+        sessionId: "first-provider-session",
+        agentSessionId: "first-runtime-session",
+      }),
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      resumePolicy: "same-session-only",
+      allowFreshSessionForFirstPrompt: true,
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.sessionId, "first-provider-session");
+    assert.equal(result.agentSessionId, "first-runtime-session");
+    assert.equal(result.resumed, false);
+    assert.equal(record.acpSessionId, "first-provider-session");
+  });
+});
+
+test("connectAndLoadSession keeps direct operations strict for an empty record", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "strict-empty-record",
+      acpSessionId: "strict-empty-session",
+      agentCommand: "agent",
+      cwd,
+      agentCapabilities: {},
+    });
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => false,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSession should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          resumePolicy: "same-session-only",
+          timeoutMs: 1_000,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session strict-empty-session could not be resumed/i,
+    );
+  });
+});
+
+test("connectAndLoadSession fails clearly when recorded history cannot be resumed", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "unsupported-history-record",
+      acpSessionId: "unsupported-history-session",
+      agentCommand: "agent",
+      cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "history that must not be replaced" }],
+            tool_results: {},
+          },
+        },
+      ],
     });
 
     const client: FakeClient = {
@@ -813,7 +911,7 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
           timeoutMs: 1_000,
           activeController: ACTIVE_CONTROLLER,
         }),
-      /Persistent ACP session unsupported-load-session could not be resumed: agent does not support session\/resume or session\/load/i,
+      /Persistent ACP session unsupported-history-session could not be resumed: agent does not support session\/resume or session\/load/i,
     );
   });
 });

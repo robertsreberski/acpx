@@ -70,7 +70,7 @@ test("runSessionSetModeDirect resumes a load-capable session and closes the clie
   });
 });
 
-test("runSessionSetConfigOptionDirect falls back to createSession and returns updated options", async () => {
+test("runSessionSetConfigOptionDirect fails closed instead of replacing the provider session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -84,110 +84,29 @@ test("runSessionSetConfigOptionDirect falls back to createSession and returns up
     });
     await writeSessionRecord(homeDir, record);
 
-    const result = await runSessionSetConfigOptionDirect({
-      sessionRecordId: record.acpxRecordId,
-      configId: "reasoning_effort",
-      value: "high",
-      timeoutMs: 5_000,
-    });
-
-    assert.equal(result.resumed, false);
-    assert.match(result.loadError ?? "", /internal error/i);
-    assert.notEqual(result.record.acpSessionId, "stale-session-id");
-    assert.deepEqual(result.response.configOptions, [
-      {
-        id: "mode",
-        name: "Session Mode",
-        category: "mode",
-        type: "select",
-        currentValue: "auto",
-        options: [
-          {
-            value: "read-only",
-            name: "Read Only",
-          },
-          {
-            value: "auto",
-            name: "Default",
-          },
-          {
-            value: "full-access",
-            name: "Full Access",
-          },
-          {
-            value: "plan",
-            name: "Plan",
-          },
-          {
-            value: "default",
-            name: "Default",
-          },
-        ],
+    await assert.rejects(
+      async () =>
+        await runSessionSetConfigOptionDirect({
+          sessionRecordId: record.acpxRecordId,
+          configId: "reasoning_effort",
+          value: "high",
+          timeoutMs: 5_000,
+        }),
+      (error: unknown) => {
+        const operational = error as Error & {
+          detailCode?: string;
+          retryable?: boolean;
+        };
+        assert.equal(operational.detailCode, "SESSION_RESUME_REQUIRED");
+        assert.equal(operational.retryable, true);
+        assert.match(operational.message, /run `sessions new` explicitly/);
+        return true;
       },
-      {
-        id: "model",
-        name: "Model",
-        category: "model",
-        type: "select",
-        currentValue: "default-model",
-        options: [
-          {
-            value: "default-model",
-            name: "default-model",
-          },
-          {
-            value: "fast-model",
-            name: "fast-model",
-          },
-          {
-            value: "smart-model",
-            name: "smart-model",
-          },
-          {
-            value: "gpt-5.4",
-            name: "gpt-5.4",
-          },
-          {
-            value: "gpt-5.2",
-            name: "gpt-5.2",
-          },
-        ],
-      },
-      {
-        id: "reasoning_effort",
-        name: "Reasoning Effort",
-        category: "thought_level",
-        type: "select",
-        currentValue: "high",
-        options: [
-          {
-            value: "low",
-            name: "Low",
-          },
-          {
-            value: "medium",
-            name: "Medium",
-          },
-          {
-            value: "high",
-            name: "High",
-          },
-          {
-            value: "xhigh",
-            name: "Xhigh",
-          },
-        ],
-      },
-    ]);
+    );
 
     const persisted = await resolveSessionRecord(record.acpxRecordId);
-    assert.equal(persisted.acpSessionId, result.record.acpSessionId);
-    assert.equal(persisted.protocolVersion, 1);
-    assert.equal(persisted.closed, false);
-    assert.deepEqual(persisted.acpx?.desired_config_options, {
-      reasoning_effort: "high",
-    });
-    assert.equal(persisted.acpx?.session_options?.effort, "high");
+    assert.equal(persisted.acpSessionId, "stale-session-id");
+    assert.equal(persisted.acpx?.desired_config_options, undefined);
   });
 });
 

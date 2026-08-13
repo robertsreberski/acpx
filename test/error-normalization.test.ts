@@ -160,6 +160,20 @@ test("normalizeOutputError extracts ACP payload from wrapped errors", () => {
   });
 });
 
+test("normalizeOutputError suppresses nested ACP payload for an explicit continuity detail", () => {
+  const normalized = normalizeOutputError(
+    {
+      code: -32603,
+      message: "Internal error",
+      data: { details: "adapter session vanished" },
+    },
+    { detailCode: "SESSION_RESUME_REQUIRED" },
+  );
+
+  assert.equal(normalized.detailCode, "SESSION_RESUME_REQUIRED");
+  assert.equal(normalized.acp, undefined);
+});
+
 test("exitCodeForOutputErrorCode maps machine codes to stable exits", () => {
   assert.equal(exitCodeForOutputErrorCode("USAGE"), 2);
   assert.equal(exitCodeForOutputErrorCode("TIMEOUT"), 3);

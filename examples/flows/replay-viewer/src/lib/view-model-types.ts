@@ -12,7 +12,8 @@ export type ViewerNodeStatus =
   | "completed"
   | "failed"
   | "timed_out"
-  | "cancelled";
+  | "cancelled"
+  | "incomplete";
 
 export type ViewerNodeData = {
   nodeId: string;

@@ -74,6 +74,7 @@ test("text formatter batches thought chunks from ACP notifications", () => {
   formatter.onAcpMessage(thoughtChunk("the issue") as never);
   formatter.onAcpMessage(messageChunk("Done.") as never);
   formatter.onAcpMessage(doneResult("end_turn") as never);
+  formatter.flush();
 
   const output = writer.toString();
   assert.equal((output.match(/\[thinking\]/g) ?? []).length, 1);
@@ -87,10 +88,34 @@ test("text formatter preserves line breaks in thought chunks", () => {
 
   formatter.onAcpMessage(thoughtChunk("Line one\n\nLine two") as never);
   formatter.onAcpMessage(doneResult("end_turn") as never);
+  formatter.flush();
 
   const output = writer.toString();
   assert.match(output, /\[thinking\] Line one\n\s*\n\s*Line two/);
   assert.doesNotMatch(output, /\[thinking\] Line one Line two/);
+});
+
+test("text formatter replaces a pending done marker with incomplete", () => {
+  const writer = new CaptureWriter();
+  const formatter = createOutputFormatter("text", { stdout: writer });
+
+  formatter.onAcpMessage(messageChunk("Partial answer") as never);
+  formatter.onAcpMessage(doneResult("end_turn") as never);
+  assert.doesNotMatch(writer.toString(), /\[done\]/);
+
+  formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    method: "_acpx/turn_incomplete",
+    params: {
+      reason: "context_compaction",
+      stopReason: "end_turn",
+    },
+  } as never);
+  formatter.flush();
+
+  const output = writer.toString();
+  assert.match(output, /\[incomplete\] context_compaction/);
+  assert.doesNotMatch(output, /\[done\]/);
 });
 
 test("text formatter renders tool call lifecycle from ACP updates", () => {
@@ -571,10 +596,12 @@ test("quiet formatter ignores suppress-reads and still outputs assistant text on
   formatter.onAcpMessage(messageChunk("Hello world") as never);
   formatter.onAcpMessage(doneResult("end_turn") as never);
 
+  assert.equal(writer.toString(), "");
+  formatter.flush();
   assert.equal(writer.toString(), "Hello world\n");
 });
 
-test("quiet formatter outputs only agent text and flushes on prompt result", () => {
+test("quiet formatter outputs only agent text after the runtime drain flush", () => {
   const writer = new CaptureWriter();
   const formatter = createOutputFormatter("quiet", { stdout: writer });
 
@@ -583,7 +610,22 @@ test("quiet formatter outputs only agent text and flushes on prompt result", () 
   formatter.onAcpMessage(messageChunk("world") as never);
   formatter.onAcpMessage(doneResult("end_turn") as never);
 
+  assert.equal(writer.toString(), "");
+  formatter.flush();
   assert.equal(writer.toString(), "Hello world\n");
+});
+
+test("quiet formatter retains final chunks that arrive after the prompt response", () => {
+  const writer = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout: writer });
+
+  formatter.onAcpMessage(messageChunk("before ") as never);
+  formatter.onAcpMessage(doneResult("end_turn") as never);
+  formatter.onAcpMessage(messageChunk("after response") as never);
+
+  assert.equal(writer.toString(), "");
+  formatter.flush();
+  assert.equal(writer.toString(), "before after response\n");
 });
 
 test("quiet formatter emits final usage and cost metadata to stderr", () => {
@@ -608,6 +650,9 @@ test("quiet formatter emits final usage and cost metadata to stderr", () => {
     }) as never,
   );
 
+  assert.equal(stdout.toString(), "");
+  assert.equal(stderr.toString(), "");
+  formatter.flush();
   assert.equal(stdout.toString(), "OK\n");
   assert.equal(
     stderr.toString(),

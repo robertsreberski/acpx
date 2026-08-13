@@ -7,6 +7,7 @@ import {
   decisionToResponse,
   inferToolKind,
   matchPermissionPolicy,
+  permissionStatsDelta,
   resolvePermissionRequest,
   resolvePermissionRequestWithDetails,
 } from "../src/permissions.js";
@@ -60,6 +61,16 @@ function makeRequestWithTitle(
 function withNonTty<T>(run: () => Promise<T>): Promise<T> {
   return withTtyState({ stdin: false, stderr: false }, run);
 }
+
+test("permissionStatsDelta isolates decisions made after a client snapshot", () => {
+  assert.deepEqual(
+    permissionStatsDelta(
+      { requested: 5, approved: 2, denied: 2, cancelled: 1 },
+      { requested: 3, approved: 2, denied: 0, cancelled: 1 },
+    ),
+    { requested: 2, approved: 0, denied: 2, cancelled: 0 },
+  );
+});
 
 test("approve-all approves everything", async () => {
   const request = makeRequest("execute");

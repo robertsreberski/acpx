@@ -54,18 +54,19 @@ Command-local options:
 
 Text output includes one row per agent:
 
-| Column          | Meaning                                                      |
-| --------------- | ------------------------------------------------------------ |
-| `agent`         | Agent name or raw command token.                             |
-| `status`        | `ok`, `cancelled`, `permission_denied`, or `error`.          |
-| `wall_ms`       | Wall-clock runtime in milliseconds.                          |
-| `input`         | Input token count from the latest `usage_update`.            |
-| `output`        | Output token count from the latest `usage_update`.           |
-| `total`         | Total token count from the latest `usage_update`.            |
-| `permissions`   | Denied-or-cancelled permission requests over total requests. |
-| `stop_reason`   | ACP `session/prompt` stop reason, such as `end_turn`.        |
-| `final_message` | First 200 characters of assistant text output.               |
-| `error`         | Error preview for failed runs.                               |
+| Column              | Meaning                                                               |
+| ------------------- | --------------------------------------------------------------------- |
+| `agent`             | Agent name or raw command token.                                      |
+| `status`            | `ok`, `incomplete`, `cancelled`, `permission_denied`, or `error`.     |
+| `wall_ms`           | Wall-clock runtime in milliseconds.                                   |
+| `input`             | Input token count from the latest `usage_update`.                     |
+| `output`            | Output token count from the latest `usage_update`.                    |
+| `total`             | Total token count from the latest `usage_update`.                     |
+| `permissions`       | Denied-or-cancelled permission requests over total requests.          |
+| `stop_reason`       | ACP `session/prompt` stop reason, such as `end_turn`.                 |
+| `incomplete_reason` | `context_compaction` when `status` is `incomplete`; otherwise `null`. |
+| `final_message`     | First 200 characters of assistant text output.                        |
+| `error`             | Error preview for failed runs.                                        |
 
 `--format json` emits an array of rows:
 
@@ -75,6 +76,7 @@ Text output includes one row per agent:
     "agent": "codex",
     "status": "ok",
     "stop_reason": "end_turn",
+    "incomplete_reason": null,
     "wall_ms": 1240,
     "input_tokens": 1200,
     "output_tokens": 340,
@@ -88,3 +90,8 @@ Text output includes one row per agent:
 ```
 
 `--format quiet` prints one tab-separated `<agent>\t<status>` row per agent.
+
+An `incomplete` row means the agent emitted an exact Codex context-compaction
+marker and ended without a later non-empty final-answer message in that prompt
+attempt. `compare` exits `6` when incomplete is the highest-priority result and
+discards every temporary session; it does not send an automatic follow-up.

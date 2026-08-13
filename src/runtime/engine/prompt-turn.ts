@@ -3,7 +3,8 @@ import {
   hasAgentReplyAfterPrompt,
   recordPromptResponseUsage,
 } from "../../session/conversation-model.js";
-import type { PromptInput, RunPromptResult, SessionConversation } from "../../types.js";
+import type { PromptInput, SessionConversation, TurnCompletionResult } from "../../types.js";
+import { completionForStopReason, TurnCompletionTracker } from "./turn-completion.js";
 
 const SESSION_REPLY_IDLE_MS = 1_000;
 const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5_000;
@@ -12,58 +13,125 @@ type PromptTurnClient = {
   prompt: (
     sessionId: string,
     prompt: PromptInput | string,
-  ) => Promise<{ stopReason: RunPromptResult["stopReason"]; usage?: unknown }>;
+  ) => Promise<{ stopReason: TurnCompletionResult["stopReason"]; usage?: unknown }>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
 };
 
-export async function runPromptTurn(params: {
+export type PromptTurnResult = TurnCompletionResult & { source: "rpc" | "session" };
+
+type RunPromptTurnParams = {
   client: PromptTurnClient;
   sessionId: string;
   prompt: PromptInput | string;
   timeoutMs?: number;
-  conversation: SessionConversation;
+  conversation?: SessionConversation;
   promptMessageId?: string;
   onPromptStarted?: () => Promise<void> | void;
-}): Promise<{ stopReason: RunPromptResult["stopReason"]; source: "rpc" | "session" }> {
-  try {
-    const promptPromise = params.client.prompt(params.sessionId, params.prompt);
-    await params.onPromptStarted?.();
-    const response = await withTimeout(promptPromise, params.timeoutMs);
-    await params.client
-      .waitForSessionUpdatesIdle?.({
-        idleMs: SESSION_REPLY_IDLE_MS,
-        timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS,
-      })
-      .catch(() => {
-        // Best effort. The prompt already completed successfully, so keep the
-        // original stop reason if late update draining itself times out.
-      });
+  completionTracker?: TurnCompletionTracker;
+  initialDrainIdleMs?: number;
+};
+
+function completionResult(
+  tracker: TurnCompletionTracker | undefined,
+  stopReason: TurnCompletionResult["stopReason"],
+): TurnCompletionResult {
+  return tracker?.finish(stopReason) ?? completionForStopReason(stopReason);
+}
+
+async function drainSessionUpdates(client: PromptTurnClient, idleMs: number): Promise<void> {
+  await client
+    .waitForSessionUpdatesIdle?.({
+      idleMs,
+      timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS,
+    })
+    .catch(() => {
+      // Best effort. Preserve the prompt response or error when late-update draining times out.
+    });
+}
+
+async function drainPromptResponse(params: RunPromptTurnParams): Promise<void> {
+  const initialIdleMs = params.initialDrainIdleMs ?? SESSION_REPLY_IDLE_MS;
+  if (
+    initialIdleMs < SESSION_REPLY_IDLE_MS &&
+    params.completionTracker?.hasUnansweredCompaction()
+  ) {
+    await drainSessionUpdates(params.client, SESSION_REPLY_IDLE_MS);
+    return;
+  }
+  await drainSessionUpdates(params.client, initialIdleMs);
+  if (
+    initialIdleMs < SESSION_REPLY_IDLE_MS &&
+    params.completionTracker?.hasUnansweredCompaction()
+  ) {
+    // Ordinary one-shot turns use a short initial drain, but once compaction
+    // appears the full settle window is required for a later final answer.
+    await drainSessionUpdates(params.client, SESSION_REPLY_IDLE_MS);
+  }
+}
+
+async function runPromptRpc(params: RunPromptTurnParams): Promise<PromptTurnResult> {
+  const promptPromise = params.client.prompt(params.sessionId, params.prompt);
+  await params.onPromptStarted?.();
+  const response = await withTimeout(promptPromise, params.timeoutMs);
+  // The compaction marker itself can arrive after the prompt response. Drain
+  // before classifying, extending a short one-shot drain when compaction needs
+  // more time to produce its final answer.
+  await drainPromptResponse(params);
+  if (params.conversation) {
     recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
-    return {
-      stopReason: response.stopReason,
-      source: "rpc",
-    };
-  } catch (error) {
-    if (!(error instanceof TimeoutError) || !params.promptMessageId) {
-      throw error;
-    }
+  }
+  return {
+    ...completionResult(params.completionTracker, response.stopReason),
+    source: "rpc",
+  };
+}
 
-    await params.client
-      .waitForSessionUpdatesIdle?.({
-        idleMs: SESSION_REPLY_IDLE_MS,
-        timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS,
-      })
-      .catch(() => {
-        // Best effort. If the update drain itself times out, fall back to the prompt error.
-      });
+function canSalvageTimedOutReply(params: RunPromptTurnParams): boolean {
+  return Boolean(
+    params.conversation &&
+    params.promptMessageId &&
+    hasAgentReplyAfterPrompt(params.conversation, params.promptMessageId),
+  );
+}
 
-    if (hasAgentReplyAfterPrompt(params.conversation, params.promptMessageId)) {
-      return {
-        stopReason: "end_turn",
-        source: "session",
-      };
-    }
+function canInspectTimedOutReply(
+  params: RunPromptTurnParams,
+  error: unknown,
+): error is TimeoutError {
+  return error instanceof TimeoutError && Boolean(params.conversation && params.promptMessageId);
+}
 
+async function recoverPromptError(
+  params: RunPromptTurnParams,
+  error: unknown,
+): Promise<PromptTurnResult> {
+  if (!canInspectTimedOutReply(params, error)) {
+    // One-shot callers keep no durable conversation that could prove a late
+    // assistant reply. Respect timeouts without adding a futile drain, and
+    // preserve non-timeout failures unchanged.
+    params.completionTracker?.abandonAttempt();
     throw error;
+  }
+  await drainSessionUpdates(params.client, SESSION_REPLY_IDLE_MS);
+  if (params.completionTracker?.hasUnansweredCompaction()) {
+    params.completionTracker.abandonAttempt();
+    throw error;
+  }
+  if (canSalvageTimedOutReply(params)) {
+    return {
+      ...completionResult(params.completionTracker, "end_turn"),
+      source: "session",
+    };
+  }
+  params.completionTracker?.abandonAttempt();
+  throw error;
+}
+
+export async function runPromptTurn(params: RunPromptTurnParams): Promise<PromptTurnResult> {
+  params.completionTracker?.beginAttempt();
+  try {
+    return await runPromptRpc(params);
+  } catch (error) {
+    return await recoverPromptError(params, error);
   }
 }

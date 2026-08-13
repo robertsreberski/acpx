@@ -9,6 +9,8 @@ import type {
   PermissionMode,
   PermissionPolicy,
   SessionRecord,
+  TurnCompletionResult,
+  TurnIncompleteReason,
 } from "../../types.js";
 import type { SessionAgentOptions } from "../engine/session-options.js";
 
@@ -235,6 +237,14 @@ export type AcpRuntimeEvent =
   | {
       type: "done";
       stopReason?: string;
+      incomplete?: false;
+      reason?: never;
+    }
+  | {
+      type: "done";
+      stopReason?: string;
+      incomplete: true;
+      reason: TurnIncompleteReason;
     }
   /**
    * Compatibility failure event emitted by runTurn(...). startTurn(...).events
@@ -263,6 +273,11 @@ export type AcpRuntimeTurnResult =
   | {
       status: "cancelled";
       stopReason?: string;
+    }
+  | {
+      status: "incomplete";
+      stopReason: Extract<TurnCompletionResult, { status: "incomplete" }>["stopReason"];
+      reason: TurnIncompleteReason;
     }
   | {
       status: "failed";

@@ -12,6 +12,7 @@ import type {
   PermissionEscalationAction,
   PermissionEscalationEvent,
   PermissionMode,
+  PermissionStats,
   PermissionPolicyAction,
   ReadonlyPermissionPolicy,
 } from "./types.js";
@@ -33,6 +34,24 @@ const PERMISSION_MODE_RANK: Record<PermissionMode, number> = {
   "approve-reads": 1,
   "approve-all": 2,
 };
+
+/** True when a turn requested permissions but none were approved. */
+export function permissionDenialTakesPrecedence(stats: PermissionStats): boolean {
+  return stats.requested > 0 && stats.approved === 0 && stats.denied + stats.cancelled > 0;
+}
+
+/** Permission decisions recorded after a snapshot of the same client. */
+export function permissionStatsDelta(
+  current: PermissionStats,
+  snapshot: PermissionStats,
+): PermissionStats {
+  return {
+    requested: Math.max(0, current.requested - snapshot.requested),
+    approved: Math.max(0, current.approved - snapshot.approved),
+    denied: Math.max(0, current.denied - snapshot.denied),
+    cancelled: Math.max(0, current.cancelled - snapshot.cancelled),
+  };
+}
 
 function selected(optionId: string): RequestPermissionResponse {
   return { outcome: { outcome: "selected", optionId } };

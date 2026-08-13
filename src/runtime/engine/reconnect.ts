@@ -80,6 +80,24 @@ export type SessionConnectWarning = {
   modeId: string;
 };
 
+function hasNoSessionReuseCapability(record: SessionRecord): boolean {
+  const capabilities = record.agentCapabilities;
+  return (
+    record.importedFrom === undefined &&
+    capabilities !== undefined &&
+    !capabilities.loadSession &&
+    !capabilities.sessionCapabilities?.resume
+  );
+}
+
+export function canCreateFirstPromptProviderSession(record: SessionRecord): boolean {
+  return (
+    record.messages.length === 0 &&
+    record.lastPromptAt === undefined &&
+    hasNoSessionReuseCapability(record)
+  );
+}
+
 export type ConnectAndLoadSessionOptions = {
   client: AcpClient;
   record: SessionRecord;
@@ -92,6 +110,7 @@ export type ConnectAndLoadSessionOptions = {
   onConnectedRecord?: (record: SessionRecord) => void;
   onSessionIdResolved?: (sessionId: string) => void;
   onWarning?: (warning: SessionConnectWarning) => void;
+  allowFreshSessionForFirstPrompt?: boolean;
 };
 
 export type ConnectAndLoadSessionResult = {
@@ -138,11 +157,13 @@ function makeSessionResumeRequiredError(params: {
   record: SessionRecord;
   reason: string;
   cause?: unknown;
+  retryable?: boolean;
 }): SessionResumeRequiredError {
   return new SessionResumeRequiredError(
-    `Persistent ACP session ${params.record.acpSessionId} could not be resumed: ${params.reason}`,
+    `Persistent ACP session ${params.record.acpSessionId} could not be resumed: ${params.reason}. The saved conversation was preserved; run \`sessions new\` explicitly to replace it`,
     {
       cause: params.cause instanceof Error ? params.cause : undefined,
+      retryable: params.retryable ?? true,
     },
   );
 }
@@ -562,6 +583,7 @@ export async function connectAndLoadSession(
     record,
     reusingLoadedSession,
     sameSessionOnly,
+    allowFreshSessionForFirstPrompt: options.allowFreshSessionForFirstPrompt,
     timeoutMs: options.timeoutMs,
   });
   resumed = loadState.resumed;
@@ -829,6 +851,7 @@ async function loadOrCreateRuntimeSession(params: {
   record: SessionRecord;
   reusingLoadedSession: boolean;
   sameSessionOnly: boolean;
+  allowFreshSessionForFirstPrompt?: boolean;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
   if (params.reusingLoadedSession) {
@@ -851,13 +874,19 @@ async function loadOrCreateRuntimeSession(params: {
     return await loadRuntimeSession(params);
   }
 
-  if (params.sameSessionOnly) {
+  const canCreateFirstProviderSession =
+    params.allowFreshSessionForFirstPrompt === true && hasNoSessionReuseCapability(params.record);
+  if (params.sameSessionOnly && !canCreateFirstProviderSession) {
     throw makeSessionResumeRequiredError({
       record: params.record,
       reason: "agent does not support session/resume or session/load",
+      retryable: false,
     });
   }
 
+  // ACP session reuse is optional. The prompt caller may prove that this is a
+  // locally-created record's first turn, so it has no conversation to lose.
+  // Direct controls and imported/external sessions never receive this escape.
   return await createFreshRuntimeSession(params.client, params.record, params.timeoutMs);
 }
 
@@ -928,10 +957,12 @@ async function recoverRuntimeSessionLoadFailure(
 ): Promise<RuntimeSessionLoadState> {
   const loadError = formatErrorMessage(error);
   if (params.sameSessionOnly) {
+    const acp = extractAcpError(error);
     throw makeSessionResumeRequiredError({
       record: params.record,
       reason: loadError,
       cause: error,
+      retryable: !(isAcpResourceNotFoundError(error) || isUnsupportedSessionLoadAcpError(acp)),
     });
   }
   if (!shouldFallbackToNewSession(error, params.record)) {

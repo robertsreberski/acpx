@@ -9,6 +9,35 @@ import {
   QUEUE_PROMPT_SNAPSHOT_MAX_BYTES,
 } from "../src/cli/queue/messages.js";
 
+function validQueueResult(completion: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...completion,
+    sessionId: "session-1",
+    resumed: true,
+    permissionStats: {
+      requested: 0,
+      approved: 0,
+      denied: 0,
+      cancelled: 0,
+    },
+    record: {
+      acpxRecordId: "record-1",
+      acpSessionId: "session-1",
+      agentCommand: "codex",
+      cwd: "/tmp/work",
+      createdAt: "2026-03-26T00:00:00.000Z",
+      lastUsedAt: "2026-03-26T00:00:00.000Z",
+      messages: [],
+      updated_at: "2026-03-26T00:00:00.000Z",
+      lastSeq: 0,
+      eventLog: {
+        stream_count: 0,
+        segment_count: 0,
+      },
+    },
+  };
+}
+
 test("parseQueueRequest accepts submit_prompt with nonInteractivePermissions", () => {
   const parsed = parseQueueRequest({
     type: "submit_prompt",
@@ -16,6 +45,7 @@ test("parseQueueRequest accepts submit_prompt with nonInteractivePermissions", (
     ownerGeneration: 123,
     message: "hello",
     permissionMode: "approve-reads",
+    resumePolicy: "same-session-only",
     nonInteractivePermissions: "fail",
     timeoutMs: 1_500,
     promptRetries: 2,
@@ -29,11 +59,25 @@ test("parseQueueRequest accepts submit_prompt with nonInteractivePermissions", (
     message: "hello",
     prompt: [{ type: "text", text: "hello" }],
     permissionMode: "approve-reads",
+    resumePolicy: "same-session-only",
     nonInteractivePermissions: "fail",
     timeoutMs: 1_500,
     promptRetries: 2,
     waitForCompletion: true,
   });
+});
+
+test("parseQueueRequest rejects invalid resumePolicy value", () => {
+  const parsed = parseQueueRequest({
+    type: "submit_prompt",
+    requestId: "req-invalid-resume-policy",
+    message: "hello",
+    permissionMode: "approve-reads",
+    resumePolicy: "start-fresh",
+    waitForCompletion: false,
+  });
+
+  assert.equal(parsed, null);
 });
 
 test("parseQueueRequest rejects invalid nonInteractivePermissions value", () => {
@@ -506,6 +550,7 @@ test("parseQueueOwnerMessage accepts result payloads and optional emitted-error 
       type: "result",
       requestId: "req-result",
       result: {
+        status: "completed",
         stopReason: "end_turn",
         sessionId: "session-1",
         resumed: true,
@@ -537,6 +582,7 @@ test("parseQueueOwnerMessage accepts result payloads and optional emitted-error 
       requestId: "req-result",
       ownerGeneration: undefined,
       result: {
+        status: "completed",
         stopReason: "end_turn",
         sessionId: "session-1",
         resumed: true,
@@ -587,6 +633,58 @@ test("parseQueueOwnerMessage accepts result payloads and optional emitted-error 
       outputAlreadyEmitted: true,
     },
   );
+});
+
+test("parseQueueOwnerMessage preserves incomplete results and rejects mismatched discriminants", () => {
+  const result = validQueueResult({
+    status: "incomplete",
+    stopReason: "end_turn",
+    reason: "context_compaction",
+  });
+  assert.deepEqual(
+    parseQueueOwnerMessage({ type: "result", requestId: "req-incomplete", result }),
+    {
+      type: "result",
+      requestId: "req-incomplete",
+      ownerGeneration: undefined,
+      result,
+    },
+  );
+  const limitedResult = validQueueResult({
+    status: "incomplete",
+    stopReason: "max_tokens",
+    reason: "context_compaction",
+  });
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "result",
+      requestId: "req-incomplete-limited",
+      result: limitedResult,
+    }),
+    {
+      type: "result",
+      requestId: "req-incomplete-limited",
+      ownerGeneration: undefined,
+      result: limitedResult,
+    },
+  );
+
+  for (const completion of [
+    { stopReason: "end_turn" },
+    { status: "incomplete", stopReason: "cancelled", reason: "context_compaction" },
+    { status: "incomplete", stopReason: "end_turn" },
+    { status: "cancelled", stopReason: "end_turn" },
+    { status: "completed", stopReason: "cancelled" },
+  ]) {
+    assert.equal(
+      parseQueueOwnerMessage({
+        type: "result",
+        requestId: "req-invalid-completion",
+        result: validQueueResult(completion),
+      }),
+      null,
+    );
+  }
 });
 
 test("parseQueueOwnerMessage rejects invalid structured owner message payloads", () => {
