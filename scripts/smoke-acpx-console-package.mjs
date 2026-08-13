@@ -7,6 +7,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveNpmPackArtifact } from "./resolve-npm-pack-artifact.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const consolePackageDir = path.join(root, "packages", "console");
@@ -71,7 +72,10 @@ async function getJson(url, host) {
 }
 
 async function packageTarball(packDir, packageDir, before) {
-  await run("npm", ["pack", "--pack-destination", packDir], { cwd: packageDir, inherit: true });
+  const packed = await run("npm", ["pack", "--silent", "--json", "--pack-destination", packDir], {
+    cwd: packageDir,
+  });
+  const artifact = resolveNpmPackArtifact(packDir, packed.stdout);
   const after = await fs.readdir(packDir);
   const created = after.filter((name) => name.endsWith(".tgz") && !before.has(name));
   assert.equal(
@@ -79,7 +83,8 @@ async function packageTarball(packDir, packageDir, before) {
     1,
     `Expected one tarball from ${packageDir}; got ${created.join(", ")}`,
   );
-  return path.join(packDir, created[0]);
+  assert.equal(artifact, path.join(packDir, created[0]));
+  return artifact;
 }
 
 async function main() {

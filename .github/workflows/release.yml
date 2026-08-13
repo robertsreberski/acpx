@@ -189,10 +189,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TARBALL=$(cd packages/console && npm pack --silent)
+          PACK_OUTPUT=$(mktemp)
           INSTALL_ROOT=$(mktemp -d)
-          trap 'rm -rf "${INSTALL_ROOT}" "packages/console/${TARBALL}"' EXIT
-          npm install --prefix "${INSTALL_ROOT}" "${GITHUB_WORKSPACE}/packages/console/${TARBALL}"
+          TARBALL_PATH=""
+          cleanup() {
+            rm -rf -- "${INSTALL_ROOT}"
+            rm -f -- "${PACK_OUTPUT}"
+            if [ -n "${TARBALL_PATH}" ]; then
+              rm -f -- "${TARBALL_PATH}"
+            fi
+          }
+          trap cleanup EXIT
+          (
+            cd packages/console
+            npm pack --silent --json >"${PACK_OUTPUT}"
+          )
+          TARBALL_PATH=$(node scripts/resolve-npm-pack-artifact.mjs packages/console "${PACK_OUTPUT}")
+          npm install --prefix "${INSTALL_ROOT}" "${TARBALL_PATH}"
           (
             cd "${INSTALL_ROOT}"
             node --input-type=module - <<'NODE'
