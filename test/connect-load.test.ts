@@ -283,15 +283,18 @@ test("connectAndLoadSession forces saved effort replay when rebound metadata is 
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
-    const configCalls: Array<{ configId: string; value: string }> = [];
+    const calls: string[] = [];
     const record = makeSessionRecord({
       acpxRecordId: "sparse-effort-record",
       acpSessionId: "sparse-effort-session",
       agentCommand: "agent",
       cwd,
       acpx: {
-        session_options: { effort: "high" },
+        session_options: { model: "smart-model", effort: "high" },
         desired_config_options: { reasoning_effort: "high" },
+        current_model_id: "default-model",
+        available_models: ["default-model", "smart-model"],
+        model_control: "legacy_set_model",
         config_options: effortConfigOptions("high"),
       },
     });
@@ -309,9 +312,11 @@ test("connectAndLoadSession forces saved effort replay when rebound metadata is 
         throw new Error("createSession should not be called");
       },
       setSessionMode: async () => {},
-      setSessionModel: async () => {},
+      setSessionModel: async (_sessionId, modelId) => {
+        calls.push(`model:${modelId}`);
+      },
       setSessionConfigOption: async (_sessionId, configId, value) => {
-        configCalls.push({ configId, value });
+        calls.push(`${configId}:${value}`);
         return { configOptions: effortConfigOptions(value) };
       },
     };
@@ -322,7 +327,8 @@ test("connectAndLoadSession forces saved effort replay when rebound metadata is 
       activeController: ACTIVE_CONTROLLER,
     });
 
-    assert.deepEqual(configCalls, [{ configId: "reasoning_effort", value: "high" }]);
+    assert.deepEqual(calls, ["model:smart-model", "reasoning_effort:high"]);
+    assert.equal(record.acpx?.session_options?.model, "smart-model");
     assert.equal(record.acpx?.session_options?.effort, "high");
     assert.equal(record.acpx?.config_options?.[0]?.currentValue, "high");
   });

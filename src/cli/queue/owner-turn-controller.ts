@@ -49,10 +49,10 @@ export class QueueOwnerTurnController {
   private activeController?: QueueOwnerActiveSessionController;
   private controlTargetReady?: Promise<void>;
   private resolveControlTargetReady?: () => void;
-  private idlePreferenceSequence: Promise<void> = Promise.resolve();
-  private pendingIdlePreferenceUpdates = 0;
-  private idlePreferenceUpdatesDone?: Promise<void>;
-  private resolveIdlePreferenceUpdatesDone?: () => void;
+  private idleControlSequence: Promise<void> = Promise.resolve();
+  private pendingIdleControls = 0;
+  private idleControlsDone?: Promise<void>;
+  private resolveIdleControlsDone?: () => void;
 
   constructor(options: QueueOwnerTurnControllerOptions) {
     this.options = options;
@@ -67,8 +67,8 @@ export class QueueOwnerTurnController {
   }
 
   async beginTurn(): Promise<void> {
-    while (this.idlePreferenceUpdatesDone) {
-      await this.idlePreferenceUpdatesDone;
+    while (this.idleControlsDone) {
+      await this.idleControlsDone;
     }
     this.assertCanHandleControlRequest();
     this.state = "starting";
@@ -120,39 +120,33 @@ export class QueueOwnerTurnController {
     this.controlTargetReady = undefined;
   }
 
-  private beginIdlePreferenceUpdate(): void {
-    if (this.pendingIdlePreferenceUpdates === 0) {
-      this.idlePreferenceUpdatesDone = new Promise((resolve) => {
-        this.resolveIdlePreferenceUpdatesDone = resolve;
+  private beginIdleControl(): void {
+    if (this.pendingIdleControls === 0) {
+      this.idleControlsDone = new Promise((resolve) => {
+        this.resolveIdleControlsDone = resolve;
       });
     }
-    this.pendingIdlePreferenceUpdates += 1;
+    this.pendingIdleControls += 1;
   }
 
-  private finishIdlePreferenceUpdate(): void {
-    this.pendingIdlePreferenceUpdates -= 1;
-    if (this.pendingIdlePreferenceUpdates > 0) {
+  private finishIdleControl(): void {
+    this.pendingIdleControls -= 1;
+    if (this.pendingIdleControls > 0) {
       return;
     }
-    this.resolveIdlePreferenceUpdatesDone?.();
-    this.resolveIdlePreferenceUpdatesDone = undefined;
-    this.idlePreferenceUpdatesDone = undefined;
+    this.resolveIdleControlsDone?.();
+    this.resolveIdleControlsDone = undefined;
+    this.idleControlsDone = undefined;
   }
 
-  private runIdlePreferenceUpdate(
-    modelId: string | undefined,
-    effort: string,
-    timeoutMs: number | undefined,
-  ): Promise<AppliedSessionPreferences> {
-    this.beginIdlePreferenceUpdate();
-    const operation = this.idlePreferenceSequence.then(
-      async () => await this.options.applySessionPreferencesFallback(modelId, effort, timeoutMs),
-    );
-    this.idlePreferenceSequence = operation.then(
+  private runIdleControl<T>(run: () => Promise<T>): Promise<T> {
+    this.beginIdleControl();
+    const operation = this.idleControlSequence.then(run);
+    this.idleControlSequence = operation.then(
       () => undefined,
       () => undefined,
     );
-    return operation.finally(() => this.finishIdlePreferenceUpdate());
+    return operation.finally(() => this.finishIdleControl());
   }
 
   private async waitForActiveControllerOrIdle(timeoutMs?: number): Promise<void> {
@@ -208,33 +202,46 @@ export class QueueOwnerTurnController {
   }
 
   async setSessionMode(modeId: string, timeoutMs?: number): Promise<void> {
-    this.assertCanHandleControlRequest();
-    const activeController = this.activeController;
-    if (activeController) {
-      await this.options.withTimeout(
-        async () => await activeController.setSessionMode(modeId),
-        timeoutMs,
-      );
-      return;
+    while (true) {
+      this.assertCanHandleControlRequest();
+      const activeController = this.activeController;
+      if (activeController) {
+        await this.options.withTimeout(
+          async () => await activeController.setSessionMode(modeId),
+          timeoutMs,
+        );
+        return;
+      }
+      if (this.state === "idle") {
+        await this.runIdleControl(
+          async () => await this.options.setSessionModeFallback(modeId, timeoutMs),
+        );
+        return;
+      }
+      await this.waitForActiveControllerOrIdle(timeoutMs);
     }
-
-    await this.options.setSessionModeFallback(modeId, timeoutMs);
   }
 
   async setSessionModel(
     modelId: string,
     timeoutMs?: number,
   ): Promise<SetSessionConfigOptionResponse | undefined> {
-    this.assertCanHandleControlRequest();
-    const activeController = this.activeController;
-    if (activeController) {
-      return await this.options.withTimeout(
-        async () => await activeController.setSessionModel(modelId),
-        timeoutMs,
-      );
+    while (true) {
+      this.assertCanHandleControlRequest();
+      const activeController = this.activeController;
+      if (activeController) {
+        return await this.options.withTimeout(
+          async () => await activeController.setSessionModel(modelId),
+          timeoutMs,
+        );
+      }
+      if (this.state === "idle") {
+        return await this.runIdleControl(
+          async () => await this.options.setSessionModelFallback(modelId, timeoutMs),
+        );
+      }
+      await this.waitForActiveControllerOrIdle(timeoutMs);
     }
-
-    return await this.options.setSessionModelFallback(modelId, timeoutMs);
   }
 
   async setSessionConfigOption(
@@ -242,16 +249,22 @@ export class QueueOwnerTurnController {
     value: string,
     timeoutMs?: number,
   ): Promise<SetSessionConfigOptionResponse> {
-    this.assertCanHandleControlRequest();
-    const activeController = this.activeController;
-    if (activeController) {
-      return await this.options.withTimeout(
-        async () => await activeController.setSessionConfigOption(configId, value),
-        timeoutMs,
-      );
+    while (true) {
+      this.assertCanHandleControlRequest();
+      const activeController = this.activeController;
+      if (activeController) {
+        return await this.options.withTimeout(
+          async () => await activeController.setSessionConfigOption(configId, value),
+          timeoutMs,
+        );
+      }
+      if (this.state === "idle") {
+        return await this.runIdleControl(
+          async () => await this.options.setSessionConfigOptionFallback(configId, value, timeoutMs),
+        );
+      }
+      await this.waitForActiveControllerOrIdle(timeoutMs);
     }
-
-    return await this.options.setSessionConfigOptionFallback(configId, value, timeoutMs);
   }
 
   async applySessionPreferences(
@@ -269,7 +282,10 @@ export class QueueOwnerTurnController {
         );
       }
       if (this.state === "idle") {
-        return await this.runIdlePreferenceUpdate(modelId, effort, timeoutMs);
+        return await this.runIdleControl(
+          async () =>
+            await this.options.applySessionPreferencesFallback(modelId, effort, timeoutMs),
+        );
       }
       await this.waitForActiveControllerOrIdle(timeoutMs);
     }

@@ -258,8 +258,9 @@ function effortSelectionForBoundSession(params: {
   record: SessionRecord;
   originalAcpx: SessionRecord["acpx"];
   configOptionsPresent: boolean;
+  desiredEffort?: string;
 }): { configId: string; effort: string } | undefined {
-  const desiredEffort = getDesiredEffort(params.record.acpx);
+  const desiredEffort = params.desiredEffort ?? getDesiredEffort(params.record.acpx);
   if (!desiredEffort) {
     return undefined;
   }
@@ -294,6 +295,7 @@ async function reapplyEffortOnBoundSession(params: {
   originalSessionId: string;
   originalAcpx: SessionRecord["acpx"];
   configOptionsPresent: boolean;
+  desiredEffort?: string;
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<ConfigReplayResult> {
@@ -456,6 +458,13 @@ function reconnectMetadataIsSparse(loadState: RuntimeSessionLoadState): boolean 
   return !loadState.configOptionsPresent && !loadState.legacyModelMetadataPresent;
 }
 
+function desiredEffortForBoundReplay(
+  loadState: RuntimeSessionLoadState,
+  originalAcpx: SessionRecord["acpx"],
+): string | undefined {
+  return reconnectMetadataIsSparse(loadState) ? getDesiredEffort(originalAcpx) : undefined;
+}
+
 function modelsForBoundReplay(
   loadState: RuntimeSessionLoadState,
   record: SessionRecord,
@@ -612,6 +621,7 @@ export async function connectAndLoadSession(
         loadState.configOptionsPresent,
         modelReplay,
       ),
+      desiredEffort: desiredEffortForBoundReplay(loadState, originalAcpx),
       timeoutMs: options.timeoutMs,
       verbose: options.verbose,
     });

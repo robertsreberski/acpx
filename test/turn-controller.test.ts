@@ -177,6 +177,57 @@ test("QueueOwnerTurnController routes setSessionConfigOption through fallback wh
   assert.deepEqual(response, { configOptions: [] });
 });
 
+test("QueueOwnerTurnController waits for turn setup before routing individual controls", async () => {
+  const activeCalls: string[] = [];
+  let fallbackCalls = 0;
+  const controller = createQueueOwnerTurnController({
+    setSessionModeFallback: async () => {
+      fallbackCalls += 1;
+    },
+    setSessionModelFallback: async () => {
+      fallbackCalls += 1;
+      return undefined;
+    },
+    setSessionConfigOptionFallback: async () => {
+      fallbackCalls += 1;
+      return { configOptions: [] };
+    },
+  });
+
+  await controller.beginTurn();
+  const controls = [
+    controller.setSessionMode("plan", 1_000),
+    controller.setSessionModel("smart-model", 1_000),
+    controller.setSessionConfigOption("reasoning_effort", "high", 1_000),
+  ];
+  await Promise.resolve();
+  assert.equal(fallbackCalls, 0);
+
+  controller.setActiveController(
+    makeActiveController({
+      setSessionMode: async (modeId) => {
+        activeCalls.push(`mode:${modeId}`);
+      },
+      setSessionModel: async (modelId) => {
+        activeCalls.push(`model:${modelId}`);
+        return undefined;
+      },
+      setSessionConfigOption: async (configId, value) => {
+        activeCalls.push(`${configId}:${value}`);
+        return { configOptions: [] };
+      },
+    }),
+  );
+
+  await Promise.all(controls);
+  assert.deepEqual(activeCalls.toSorted(), [
+    "mode:plan",
+    "model:smart-model",
+    "reasoning_effort:high",
+  ]);
+  assert.equal(fallbackCalls, 0);
+});
+
 test("QueueOwnerTurnController routes combined preferences through active and fallback controllers", async () => {
   const activeRequests: Array<[string | undefined, string]> = [];
   const fallbackRequests: Array<[string | undefined, string, number | undefined]> = [];
