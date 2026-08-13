@@ -189,6 +189,14 @@ function mimeType(path: string): string {
       return JSON_CONTENT_TYPE;
     case ".svg":
       return "image/svg+xml";
+    case ".png":
+      return "image/png";
+    case ".ico":
+      return "image/x-icon";
+    // Browsers ignore a manifest served as anything else, so installability
+    // depends on this exact type.
+    case ".webmanifest":
+      return "application/manifest+json";
     case ".woff2":
       return "font/woff2";
     default:

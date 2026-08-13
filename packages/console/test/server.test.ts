@@ -1530,3 +1530,31 @@ test("server close is memoized before a reentrant unsubscribe", async () => {
   assert.equal(disposed, 1);
   assert.equal(running.server.listening, false);
 });
+
+test("installable web app assets are served with the types browsers require", async () => {
+  const { root, running } = await fixture();
+  try {
+    // A manifest served as anything but application/manifest+json is ignored,
+    // and an icon served as octet-stream is not usable as one.
+    await writeFile(
+      join(root, "web", "manifest.webmanifest"),
+      JSON.stringify({ name: "ACPX Console", start_url: "/" }),
+    );
+    await writeFile(join(root, "web", "icon-192.png"), "not really a png");
+    await writeFile(join(root, "web", "sw.js"), "self.addEventListener('fetch', () => {});");
+
+    const manifest = await fetch(`${running.origin}/manifest.webmanifest`);
+    assert.equal(manifest.status, 200);
+    assert.equal(manifest.headers.get("content-type"), "application/manifest+json");
+
+    const icon = await fetch(`${running.origin}/icon-192.png`);
+    assert.equal(icon.status, 200);
+    assert.equal(icon.headers.get("content-type"), "image/png");
+
+    const worker = await fetch(`${running.origin}/sw.js`);
+    assert.equal(worker.status, 200);
+    assert.match(worker.headers.get("content-type") ?? "", /^text\/javascript/u);
+  } finally {
+    await running.close();
+  }
+});
