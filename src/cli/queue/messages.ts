@@ -56,7 +56,11 @@ export type QueueCancelRequest = {
   type: "cancel_prompt";
   requestId: string;
   ownerGeneration?: number;
+  targetTurnId?: string;
 };
+
+export const QUEUE_CANCEL_OUTCOMES = ["active", "queued", "not_found"] as const;
+export type QueueCancelOutcome = (typeof QUEUE_CANCEL_OUTCOMES)[number];
 
 export type QueueSetModeRequest = {
   type: "set_mode";
@@ -106,6 +110,13 @@ export type QueueListRequestsRequest = {
   ownerGeneration?: number;
 };
 
+/** Read the exact FIFO currently owned by this queue-owner generation. */
+export type QueueListPromptQueueRequest = {
+  type: "list_prompt_queue";
+  requestId: string;
+  ownerGeneration?: number;
+};
+
 export type QueueRespondRequest = {
   type: "respond_request";
   requestId: string;
@@ -124,6 +135,7 @@ export type QueueRequest =
   | QueueSetConfigOptionRequest
   | QueueCloseSessionRequest
   | QueueListRequestsRequest
+  | QueueListPromptQueueRequest
   | QueueRespondRequest;
 
 export type QueueOwnerAcceptedMessage = {
@@ -158,6 +170,8 @@ export type QueueOwnerCancelResultMessage = {
   requestId: string;
   ownerGeneration?: number;
   cancelled: boolean;
+  /** Present from queue protocol v4 onward; omitted by older owners. */
+  outcome?: QueueCancelOutcome;
 };
 
 export type QueueOwnerSetModeResultMessage = {
@@ -206,6 +220,91 @@ export type QueueOwnerListRequestsResultMessage = {
   requests: PendingRequest[];
 };
 
+export type QueuePromptSnapshot = {
+  turnId: string;
+  submittedAt: string;
+  promptText: string;
+  /** True when the owner shortened the prompt preview to keep IPC bounded. */
+  promptTruncated?: true;
+};
+
+/** Keep one prompt useful while leaving ample room below the 10 MiB IPC ceiling. */
+export const QUEUE_PROMPT_PREVIEW_MAX_BYTES = 4 * 1024;
+/** Maximum JSON-encoded size of the `prompts` array in one read-only snapshot. */
+export const QUEUE_PROMPT_SNAPSHOT_MAX_BYTES = 1024 * 1024;
+
+export type BoundedQueuePromptSnapshot = {
+  /** Exact owner depth, including entries whose controls could not fit in this response. */
+  queueDepth: number;
+  /** Entries with no returned control, including cancellations still being persisted. */
+  omittedCount: number;
+  prompts: QueuePromptSnapshot[];
+};
+
+export type QueueOwnerListPromptQueueResultMessage = {
+  type: "list_prompt_queue_result";
+  requestId: string;
+  ownerGeneration?: number;
+  queueDepth: number;
+  omittedCount: number;
+  prompts: QueuePromptSnapshot[];
+};
+
+const QUEUE_PROMPT_TRUNCATION_SUFFIX = "…";
+
+function truncateQueuePromptPreview(promptText: string): {
+  promptText: string;
+  promptTruncated?: true;
+} {
+  if (Buffer.byteLength(promptText, "utf8") <= QUEUE_PROMPT_PREVIEW_MAX_BYTES) {
+    return { promptText };
+  }
+
+  const encoded = Buffer.from(promptText, "utf8");
+  const suffixBytes = Buffer.byteLength(QUEUE_PROMPT_TRUNCATION_SUFFIX, "utf8");
+  let end = Math.max(0, QUEUE_PROMPT_PREVIEW_MAX_BYTES - suffixBytes);
+  while (end > 0 && (encoded[end] ?? 0) >= 0x80 && (encoded[end] ?? 0) < 0xc0) {
+    end -= 1;
+  }
+  return {
+    promptText: `${encoded.subarray(0, end).toString("utf8")}${QUEUE_PROMPT_TRUNCATION_SUFFIX}`,
+    promptTruncated: true,
+  };
+}
+
+/**
+ * Build the read-only FIFO projection without allowing prompt bodies to exceed
+ * the queue transport's bounded response buffer. A prefix is intentional: it
+ * preserves FIFO order and never exposes a later cancellation control while an
+ * earlier queued turn is hidden.
+ */
+export function boundQueuePromptSnapshot(
+  pendingPrompts: readonly QueuePromptSnapshot[],
+  queueDepth: number,
+): BoundedQueuePromptSnapshot {
+  const prompts: QueuePromptSnapshot[] = [];
+  let encodedBytes = 2; // JSON array brackets.
+
+  for (const pending of pendingPrompts) {
+    const preview = truncateQueuePromptPreview(pending.promptText);
+    const candidate: QueuePromptSnapshot = { ...pending, ...preview };
+    const candidateBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
+    const separatorBytes = prompts.length === 0 ? 0 : 1;
+    if (encodedBytes + separatorBytes + candidateBytes > QUEUE_PROMPT_SNAPSHOT_MAX_BYTES) {
+      break;
+    }
+    prompts.push(candidate);
+    encodedBytes += separatorBytes + candidateBytes;
+  }
+
+  const normalizedDepth = Math.max(pendingPrompts.length, Math.max(0, Math.trunc(queueDepth)));
+  return {
+    queueDepth: normalizedDepth,
+    omittedCount: normalizedDepth - prompts.length,
+    prompts,
+  };
+}
+
 export type QueueOwnerRespondResultMessage = {
   type: "respond_request_result";
   requestId: string;
@@ -239,6 +338,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerListRequestsResultMessage
+  | QueueOwnerListPromptQueueResultMessage
   | QueueOwnerRespondResultMessage
   | QueueOwnerErrorMessage;
 
@@ -527,6 +627,7 @@ function parsePositiveTimeout(value: unknown): number | undefined {
   return Math.round(value);
 }
 
+// oxlint-disable-next-line eslint/complexity -- Each wire request variant is validated independently.
 function parseTypedQueueRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
@@ -539,6 +640,9 @@ function parseTypedQueueRequest(
         type: "cancel_prompt",
         requestId: context.requestId,
         ownerGeneration: context.ownerGeneration,
+        ...(typeof request.targetTurnId === "string" && request.targetTurnId.length > 0
+          ? { targetTurnId: request.targetTurnId }
+          : {}),
       };
     case "close_session":
       return { type: "close_session", ...context };
@@ -562,6 +666,13 @@ function parsePendingRequestQueueRequest(
   if (request.type === "list_requests") {
     return {
       type: "list_requests",
+      requestId: context.requestId,
+      ownerGeneration: context.ownerGeneration,
+    };
+  }
+  if (request.type === "list_prompt_queue") {
+    return {
+      type: "list_prompt_queue",
       requestId: context.requestId,
       ownerGeneration: context.ownerGeneration,
     };
@@ -845,8 +956,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   event: parseEventOwnerMessage,
   permission_escalation: parsePermissionEscalationOwnerMessage,
   result: parseResultOwnerMessage,
-  cancel_result: (message, context) =>
-    parseBooleanResultOwnerMessage(message, context, "cancel_result", "cancelled"),
+  cancel_result: parseCancelResultOwnerMessage,
   close_session_result: (message, context) =>
     parseBooleanResultOwnerMessage(message, context, "close_session_result", "closed"),
   set_mode_result: (message, context) =>
@@ -855,6 +965,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   apply_session_preferences_result: parseApplySessionPreferencesOwnerMessage,
   set_config_option_result: parseSetConfigOptionOwnerMessage,
   list_requests_result: parseListRequestsOwnerMessage,
+  list_prompt_queue_result: parseListPromptQueueOwnerMessage,
   respond_request_result: parseRespondResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
@@ -896,7 +1007,7 @@ function parseResultOwnerMessage(
   return { type: "result", ...context, result };
 }
 
-function parseBooleanResultOwnerMessage<TType extends "cancel_result" | "close_session_result">(
+function parseBooleanResultOwnerMessage<TType extends "close_session_result">(
   message: Record<string, unknown>,
   context: QueueOwnerMessageContext,
   type: TType,
@@ -909,6 +1020,31 @@ function parseBooleanResultOwnerMessage<TType extends "cancel_result" | "close_s
     QueueOwnerMessage,
     { type: TType }
   >;
+}
+
+function parseCancelResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerCancelResultMessage | null {
+  if (typeof message.cancelled !== "boolean") {
+    return null;
+  }
+  if (message.outcome !== undefined && !isQueueCancelOutcome(message.outcome)) {
+    return null;
+  }
+  if (message.outcome !== undefined && message.cancelled !== (message.outcome !== "not_found")) {
+    return null;
+  }
+  return {
+    type: "cancel_result",
+    ...context,
+    cancelled: message.cancelled,
+    ...(message.outcome === undefined ? {} : { outcome: message.outcome }),
+  };
+}
+
+function isQueueCancelOutcome(value: unknown): value is QueueCancelOutcome {
+  return typeof value === "string" && QUEUE_CANCEL_OUTCOMES.includes(value as QueueCancelOutcome);
 }
 
 function parseStringResultOwnerMessage<TType extends "set_mode_result" | "set_model_result">(
@@ -1009,6 +1145,91 @@ function parseListRequestsOwnerMessage(
     requests.push(parsed);
   }
   return { type: "list_requests_result", ...context, requests };
+}
+
+function parseListPromptQueueOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerListPromptQueueResultMessage | null {
+  const prompts = parseQueuePromptSnapshots(message.prompts);
+  const bounds = prompts ? parseQueuePromptSnapshotBounds(message, prompts.length) : null;
+  if (!prompts || !bounds) {
+    return null;
+  }
+  return { type: "list_prompt_queue_result", ...context, ...bounds, prompts };
+}
+
+function parseQueuePromptSnapshots(value: unknown): QueuePromptSnapshot[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const prompts: QueuePromptSnapshot[] = [];
+  const turnIds = new Set<string>();
+  for (const raw of value) {
+    const prompt = parseQueuePromptSnapshot(raw);
+    if (!prompt || turnIds.has(prompt.turnId)) {
+      return null;
+    }
+    turnIds.add(prompt.turnId);
+    prompts.push(prompt);
+  }
+  if (Buffer.byteLength(JSON.stringify(prompts), "utf8") > QUEUE_PROMPT_SNAPSHOT_MAX_BYTES) {
+    return null;
+  }
+  return prompts;
+}
+
+function parseQueuePromptSnapshotBounds(
+  message: Record<string, unknown>,
+  promptCount: number,
+): Pick<QueueOwnerListPromptQueueResultMessage, "queueDepth" | "omittedCount"> | null {
+  const legacyShape = message.queueDepth === undefined && message.omittedCount === undefined;
+  if (legacyShape) {
+    return { queueDepth: promptCount, omittedCount: 0 };
+  }
+  const queueDepth = parseStrictNonNegativeInteger(message.queueDepth);
+  const omittedCount = parseStrictNonNegativeInteger(message.omittedCount);
+  if (queueDepth === null || omittedCount === null || queueDepth !== promptCount + omittedCount) {
+    return null;
+  }
+  return { queueDepth, omittedCount };
+}
+
+function parseQueuePromptSnapshot(value: unknown): QueuePromptSnapshot | null {
+  const prompt = asRecord(value);
+  if (!prompt) {
+    return null;
+  }
+  const turnId = parseNonEmptyString(prompt?.turnId);
+  const submittedAt = parseNonEmptyString(prompt?.submittedAt);
+  if (!turnId || !submittedAt || !isValidQueuePromptPreview(prompt, submittedAt)) {
+    return null;
+  }
+  return {
+    turnId,
+    submittedAt,
+    promptText: prompt.promptText,
+    ...(prompt.promptTruncated === true ? { promptTruncated: true } : {}),
+  };
+}
+
+function isValidQueuePromptPreview(
+  prompt: Record<string, unknown>,
+  submittedAt: string,
+): prompt is Record<string, unknown> & { promptText: string; promptTruncated?: true } {
+  return (
+    Number.isFinite(Date.parse(submittedAt)) &&
+    typeof prompt.promptText === "string" &&
+    Buffer.byteLength(prompt.promptText, "utf8") <= QUEUE_PROMPT_PREVIEW_MAX_BYTES &&
+    (prompt.promptTruncated === undefined || prompt.promptTruncated === true)
+  );
+}
+
+function parseStrictNonNegativeInteger(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    return null;
+  }
+  return value;
 }
 
 function parseRespondResultOwnerMessage(

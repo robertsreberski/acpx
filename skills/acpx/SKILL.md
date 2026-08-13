@@ -1,6 +1,6 @@
 ---
 name: acpx
-description: Use acpx as a headless ACP CLI for agent-to-agent communication, including prompt/exec/sessions workflows, session scoping, queueing, permissions, output formats, system-prompt overrides, and multi-agent flows authored with defineFlow/decision/decisionEdge.
+description: Use acpx as a headless ACP CLI or session-service backend for agent-to-agent communication, including prompt/exec/sessions workflows, session scoping, queueing, permissions, output formats, system-prompt overrides, the separate ACPX Console, and multi-agent flows authored with defineFlow/decision/decisionEdge.
 ---
 
 # acpx
@@ -40,6 +40,12 @@ Core capabilities:
 - Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`
 - Tool whitelist (`--allowed-tools`), turn cap (`--max-turns`), retry on transient failures (`--prompt-retries`)
 - Multi-agent flows via `acpx flow run` and the `acpx/flows` authoring API (`defineFlow`, `decision`, `decisionEdge`, `acp`, `action`, `compute`, `checkpoint`)
+- A public `acpx/sessions` service for exact-record session inventory, complete
+  transcript paging, queue-aware mutations, provider-session adoption, and
+  permission or elicitation responses
+- A separately installed `acpx-console` web workspace for human session
+  inspection and control; it has no mono-agent dependency and does not replace
+  the headless CLI
 
 ## Install
 
@@ -48,6 +54,20 @@ npm i -g acpx
 ```
 
 For normal session reuse, prefer a global install over `npx`.
+
+After its first independent release, install the optional standalone web
+console separately:
+
+```bash
+npm i -g acpx-console
+acpx-console start --open
+```
+
+The console reads and controls the same ACPX sessions through `acpx/sessions`.
+Stopping it never stops queue owners or active turns. It has no application
+login: localhost is the default, and any non-loopback listener requires the
+explicit `--trust-network` acknowledgement. Treat every browser that can reach
+that listener as a fully authorized operator.
 
 ## Command model
 

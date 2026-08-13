@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -83,4 +85,88 @@ test("test scripts build packaged output before running package-bin smoke tests"
 
   assert.match(pkg.scripts?.test ?? "", /^pnpm run build && pnpm run build:test && /);
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
+});
+
+test("the repository gate includes the independent console package", () => {
+  const pkg = readPackageJson();
+
+  assert.match(pkg.scripts?.check ?? "", /pnpm run console:check/);
+  assert.equal(pkg.scripts?.["console:check"], "pnpm --filter acpx-console check");
+  assert.equal(
+    pkg.scripts?.["smoke:console:package"],
+    "node scripts/smoke-acpx-console-package.mjs",
+  );
+});
+
+test("release workflow delegates tag and package selection to the tested release plan", () => {
+  const workflow = readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "release.yml"),
+    "utf8",
+  );
+
+  assert.match(workflow, /console-v\*\.\*\.\*/);
+  assert.match(workflow, /pnpm exec tsx scripts\/release-plan\.ts/);
+  assert.match(workflow, /origin\/\$\{BASE_BRANCH\}/);
+  assert.match(workflow, /npm publish --access public --provenance --tag fork/);
+  assert.match(workflow, /Verify console's exact acpx dependency on npm/);
+  assert.match(workflow, /Smoke installed acpx-console with registry acpx/);
+  assert.match(workflow, /pnpm run smoke:console:package -- --registry-acpx/);
+  assert.match(workflow, /working-directory: packages\/console/);
+  assert.match(workflow, /bootstrap_console:/);
+  assert.match(workflow, /scripts\/release-plan\.ts \\\n+\s+--console-auth/);
+  assert.match(workflow, /steps\.console_auth\.outputs\.bootstrap == 'true'/);
+  assert.match(workflow, /NODE_AUTH_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/);
+  assert.equal(
+    JSON.parse(readFileSync(path.join(process.cwd(), "package.json"), "utf8")).repository.url,
+    "https://github.com/robertsreberski/acpx",
+  );
+  assert.equal(
+    JSON.parse(
+      readFileSync(path.join(process.cwd(), "packages", "console", "package.json"), "utf8"),
+    ).repository.url,
+    "https://github.com/robertsreberski/acpx",
+  );
+});
+
+test("npm pack artifact extraction tolerates prepack output and resolves an existing tarball", () => {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "acpx-pack-artifact-test-"));
+  const outputFile = path.join(fixture, "pack-output.txt");
+  try {
+    writeFileSync(
+      path.join(fixture, "package.json"),
+      JSON.stringify({
+        name: "acpx-pack-noise-fixture",
+        version: "1.0.0",
+        scripts: { prepack: "node prepack.mjs" },
+      }),
+    );
+    writeFileSync(path.join(fixture, "index.js"), "export const fixture = true;\n");
+    writeFileSync(path.join(fixture, "prepack.mjs"), 'console.log("PREPACK BUILD OUTPUT");\n');
+
+    const packOutput = execFileSync("npm", ["pack", "--silent", "--json"], {
+      cwd: fixture,
+      encoding: "utf8",
+    });
+    assert.match(packOutput, /PREPACK BUILD OUTPUT/);
+    writeFileSync(outputFile, packOutput);
+
+    const artifact = execFileSync(
+      process.execPath,
+      [path.join(process.cwd(), "scripts", "resolve-npm-pack-artifact.mjs"), fixture, outputFile],
+      { encoding: "utf8" },
+    ).trim();
+    assert.equal(path.dirname(artifact), fixture);
+    assert.equal(path.basename(artifact), "acpx-pack-noise-fixture-1.0.0.tgz");
+    assert.equal(existsSync(artifact), true);
+    assert.equal(statSync(artifact).isFile(), true);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("CI validates both the upstream and fork base branches", () => {
+  const workflow = readFileSync(path.join(process.cwd(), ".github", "workflows", "ci.yml"), "utf8");
+
+  assert.match(workflow, /push:\n\s+branches: \[main, fork-main\]/);
+  assert.match(workflow, /pull_request:\n\s+branches: \[main, fork-main\]/);
 });

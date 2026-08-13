@@ -19,7 +19,8 @@ import {
   currentModelIdFromSetModelResponse,
 } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
-import { resolveSessionRecord, writeSessionRecord, isoNow } from "../../session/persistence.js";
+import { resolveSessionRecord, isoNow } from "../../session/persistence.js";
+import { writeSessionRecordWithLatestTimeline } from "../../session/timeline.js";
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
@@ -57,10 +58,11 @@ const execFileAsync = promisify(execFile);
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
 ): Promise<SessionCancelResult> {
-  const cancelled = await tryCancelOnRunningOwner(options);
+  const outcome = (await tryCancelOnRunningOwner(options)) ?? "not_found";
   return {
     sessionId: options.sessionId,
-    cancelled: cancelled === true,
+    cancelled: outcome !== "not_found",
+    outcome,
   };
 }
 
@@ -76,7 +78,7 @@ export async function setSessionMode(
   if (submittedToOwner) {
     const record = await resolveSessionRecord(options.sessionId);
     setDesiredModeId(record, options.modeId);
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       resumed: false,
@@ -127,7 +129,7 @@ export async function setSessionModel(
           ?.configId,
       });
     }
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       response: submittedToOwner.response,
@@ -177,7 +179,7 @@ export async function applySessionPreferences(
       setDesiredConfigOption(record, previousEffortConfigId, undefined);
     }
     setDesiredEffort(record, options.effort, ownerResult.effortConfigId);
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
     return {
       record,
       response: ownerResult.response,
@@ -253,7 +255,7 @@ async function applyOwnerConfigOptionResult(params: {
   } else {
     setDesiredConfigOption(record, options.configId, options.value);
   }
-  await writeSessionRecord(record);
+  await writeSessionRecordWithLatestTimeline(record);
   return {
     record,
     response,
@@ -391,11 +393,37 @@ function splitCommandLineLike(commandLine: string | undefined): string[] {
 
 export const sessionControlTestInternals = { firstAgentCommandToken, splitCommandLineLike };
 
-export async function closeSession(sessionId: string): Promise<SessionRecord> {
+export type SessionProviderCloseResult =
+  | { status: "confirmed" }
+  | {
+      status: "degraded";
+      reason: "owner_absent" | "unsupported" | "provider_error";
+    };
+
+export type SessionCloseResult = {
+  record: SessionRecord;
+  providerClose: SessionProviderCloseResult;
+};
+
+/**
+ * Soft-close locally even when the live adapter cannot confirm session/close,
+ * while retaining a browser-safe account of that provider-side outcome.
+ */
+export async function closeSessionWithResult(sessionId: string): Promise<SessionCloseResult> {
   const record = await resolveSessionRecord(sessionId);
-  await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
-    // Preserve local close semantics even if best-effort ACP session shutdown fails.
-  });
+  let providerClose: SessionProviderCloseResult;
+  try {
+    const closed = await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId });
+    providerClose =
+      closed === true
+        ? { status: "confirmed" }
+        : closed === false
+          ? { status: "degraded", reason: "unsupported" }
+          : { status: "degraded", reason: "owner_absent" };
+  } catch {
+    // Never expose adapter or transport error text through the public close receipt.
+    providerClose = { status: "degraded", reason: "provider_error" };
+  }
   await terminateQueueOwnerForSession(record.acpxRecordId);
 
   if (
@@ -409,7 +437,11 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   record.pid = undefined;
   record.closed = true;
   record.closedAt = isoNow();
-  await writeSessionRecord(record);
+  await writeSessionRecordWithLatestTimeline(record);
 
-  return record;
+  return { record, providerClose };
+}
+
+export async function closeSession(sessionId: string): Promise<SessionRecord> {
+  return (await closeSessionWithResult(sessionId)).record;
 }

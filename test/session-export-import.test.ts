@@ -8,6 +8,11 @@ import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { exportSession } from "../src/session/export.js";
 import { importSession } from "../src/session/import.js";
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
+import {
+  captureAcpTimelineEvent,
+  listSessionTimelinePage,
+  SessionTimelineWriter,
+} from "../src/session/timeline.js";
 import type { SessionRecord } from "../src/types.js";
 
 function makeSessionRecord(
@@ -203,6 +208,14 @@ test("exportSession scrubs source absolute paths from portable archives", async 
         last_write_at: "2026-01-01T00:00:00.000Z",
         last_write_error: null,
       },
+      timeline: {
+        schema: "acpx.session_timeline.v1",
+        epoch: "source-epoch",
+        last_seq: 0,
+        active_path: path.join(homeDir, ".acpx", "sessions", "private.timeline.ndjson"),
+        created_at: "2026-01-01T00:00:00.000Z",
+        legacy_retained: false,
+      },
     });
     await writeSessionRecordFile(homeDir, source);
 
@@ -229,6 +242,78 @@ test("exportSession scrubs source absolute paths from portable archives", async 
     assert.equal(archive.session?.cwd_absolute_original, undefined);
     assert.equal(archive.session?.state?.cwd, "workspace");
     assert.equal(archive.session?.state?.event_log?.active_path, ".stream.ndjson");
+    assert.equal(
+      (archive.session?.state as { timeline?: unknown } | undefined)?.timeline,
+      undefined,
+    );
+  });
+});
+
+test("exportSession and importSession preserve the authoritative timeline ledger", async () => {
+  await withTempHome("acpx-export-import-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const archivePath = path.join(homeDir, "archive.json");
+    await fs.mkdir(cwd, { recursive: true });
+    const source = makeSessionRecord({
+      acpxRecordId: "source-record",
+      acpSessionId: "provider-session",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+      name: "timeline",
+      eventLog: {
+        active_path: streamPath(homeDir, "source-record"),
+        segment_count: 1,
+        max_segment_bytes: 1024,
+        max_segments: 1,
+        last_write_error: null,
+      },
+    });
+    await writeSessionRecordFile(homeDir, source);
+    const message = {
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: source.acpSessionId,
+        update: { sessionUpdate: "available_commands_update", availableCommands: [] },
+      },
+    } as const;
+    const writer = await SessionTimelineWriter.open(source);
+    await writer.appendLifecycleEvent({ type: "turn_submitted" }, { turnId: "turn-1" });
+    await writer.appendAcpEvents([
+      captureAcpTimelineEvent("inbound", message, { turnId: "turn-1" }),
+    ]);
+    await writer.appendLifecycleEvent(
+      { type: "turn_completed", stop_reason: "end_turn" },
+      { turnId: "turn-1" },
+    );
+    await writer.close({ checkpoint: true });
+    const sourceTimelinePath = (await resolveSessionRecord(source.acpxRecordId)).timeline
+      ?.active_path;
+    assert.ok(sourceTimelinePath);
+
+    await exportSession({ agentCommand: AGENT_REGISTRY.codex, cwd, name: "timeline" }, archivePath);
+    const archivePayload = await fs.readFile(archivePath, "utf8");
+    assert.doesNotMatch(archivePayload, new RegExp(escapeRegExp(sourceTimelinePath)));
+    const archive = JSON.parse(archivePayload) as { timeline?: { events?: unknown[] } };
+    assert.equal(archive.timeline?.events?.length, 3);
+
+    await fs.rm(sessionFilePath(homeDir, source.acpxRecordId));
+    const imported = await importSession(archivePath);
+    const page = await listSessionTimelinePage(imported.record_id);
+    assert.equal(page.coverage, "complete");
+    assert.equal(page.items.length, 3);
+    assert.deepEqual(
+      page.items.flatMap((item) => ("payload" in item ? [item.payload] : [])),
+      [
+        { kind: "lifecycle", event: { type: "turn_submitted" } },
+        { kind: "acp", message },
+        { kind: "lifecycle", event: { type: "turn_completed", stop_reason: "end_turn" } },
+      ],
+    );
+    assert.notEqual(
+      (await resolveSessionRecord(imported.record_id)).timeline?.active_path,
+      sourceTimelinePath,
+    );
   });
 });
 

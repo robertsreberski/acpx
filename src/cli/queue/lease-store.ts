@@ -36,22 +36,31 @@ const QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS = 250;
  * 2: permission policies carry `defer` rules and permission_escalation events
  *    carry action "defer". A v1 owner drops unknown rule lists, so a request
  *    the user asked to park is instead settled by the permission mode.
- * 3: prompt session options carry `effort`, and clients may send the
- *    `apply_session_preferences` control request. A v2 owner silently drops
+ * 3: cancel requests may name the exact turn they target. Older owners would
+ *    ignore that field and could cancel a newer turn after a handoff race.
+ * 4: exact cancellation targets both active and queued turns. A v3 owner only
+ *    checks the active turn and would silently leave a queued target in place.
+ * 5: clients can read the exact queued prompt FIFO from its owning generation.
+ * 6: prompt session options carry `effort`, and clients may send the
+ *    `apply_session_preferences` control request. An older owner silently drops
  *    effort from prompt options and cannot apply the combined control.
  * 4: every submit_prompt result carries a discriminated completion status,
  *    including context-compaction incompleteness. A v1/v2/v3 owner can accept
  *    the request but cannot report that outcome safely.
  */
-export const QUEUE_PROTOCOL_VERSION = 4;
+export const QUEUE_PROTOCOL_VERSION = 7;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
+/** First protocol version that atomically cancels an exact active or queued turn. */
+export const QUEUE_PROTOCOL_EXACT_CANCEL_VERSION = 4;
+/** First protocol version that exposes the exact prompt FIFO read-only. */
+export const QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION = 5;
 /** First protocol version that understands effort-bearing requests. */
-export const QUEUE_PROTOCOL_EFFORT_VERSION = 3;
+export const QUEUE_PROTOCOL_EFFORT_VERSION = 6;
 /** First protocol version with discriminated prompt completion results. */
-export const QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION = 4;
+export const QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION = 7;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided
@@ -93,6 +102,8 @@ export type QueueOwnerRecord = {
   parking?: boolean;
   /** The owner's effective --defer-max-age, in ms. Owner-level, like parking. */
   parkingMaxAgeMs?: number;
+  /** This owner writes the authoritative session timeline alongside compatibility streams. */
+  timeline?: boolean;
 };
 
 export type QueueOwnerLease = {
@@ -105,6 +116,8 @@ export type QueueOwnerLease = {
   mcpConfigFingerprint?: string;
   parking?: boolean;
   parkingMaxAgeMs?: number;
+  /** Every lease created by this build owns authoritative timeline writes. */
+  timeline: true;
 };
 
 type QueueOwnerLeaseMutationState = {
@@ -141,6 +154,11 @@ function enqueueQueueOwnerLeaseMutation(
 /** Protocol version an owner speaks, defaulting to the pre-field behavior. */
 export function queueOwnerProtocolVersion(owner: QueueOwnerRecord): number {
   return owner.queueProtocol ?? LEGACY_QUEUE_PROTOCOL_VERSION;
+}
+
+/** Missing and explicit false both identify a pre-timeline owner. */
+export function queueOwnerWritesTimeline(owner: QueueOwnerRecord): boolean {
+  return owner.timeline === true;
 }
 
 export type QueueOwnerStatus = {
@@ -186,6 +204,7 @@ function parseQueueOwnerRecordMetadata(
   | "acpxVersion"
   | "parking"
   | "parkingMaxAgeMs"
+  | "timeline"
 > {
   return {
     ...(typeof record.mcpConfigPath === "string" ? { mcpConfigPath: record.mcpConfigPath } : {}),
@@ -198,6 +217,22 @@ function parseQueueOwnerRecordMetadata(
     ...(typeof record.parkingMaxAgeMs === "number" && Number.isFinite(record.parkingMaxAgeMs)
       ? { parkingMaxAgeMs: record.parkingMaxAgeMs }
       : {}),
+    ...parseTimelineCapability(record.timeline),
+  };
+}
+
+function parseTimelineCapability(value: unknown): Pick<QueueOwnerRecord, "timeline"> {
+  return typeof value === "boolean" ? { timeline: value } : {};
+}
+
+function currentQueueOwnerBuildMetadata(): Pick<
+  QueueOwnerRecord,
+  "queueProtocol" | "acpxVersion" | "timeline"
+> & { timeline: true } {
+  return {
+    queueProtocol: QUEUE_PROTOCOL_VERSION,
+    acpxVersion: getAcpxVersion(),
+    timeline: true,
   };
 }
 
@@ -815,8 +850,7 @@ export async function tryAcquireQueueOwnerLease(
       heartbeatAt: createdAt,
       ownerGeneration,
       queueDepth: 0,
-      queueProtocol: QUEUE_PROTOCOL_VERSION,
-      acpxVersion: getAcpxVersion(),
+      ...currentQueueOwnerBuildMetadata(),
       ...(parking ? { parking: true } : {}),
       ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
@@ -849,6 +883,7 @@ export async function tryAcquireQueueOwnerLease(
       socketPath,
       createdAt,
       ownerGeneration,
+      timeline: true,
       ...(parking ? { parking: true } : {}),
       ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
@@ -963,8 +998,7 @@ export function refreshQueueOwnerLease(
         heartbeatAt: nowIsoFactory(),
         ownerGeneration: lease.ownerGeneration,
         queueDepth: Math.max(0, Math.round(options.queueDepth)),
-        queueProtocol: QUEUE_PROTOCOL_VERSION,
-        acpxVersion: getAcpxVersion(),
+        ...currentQueueOwnerBuildMetadata(),
         ...(lease.parking ? { parking: true } : {}),
         ...(lease.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: lease.parkingMaxAgeMs }),
         ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),

@@ -30,6 +30,8 @@ import {
   isProcessAlive,
   QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION,
   QUEUE_PROTOCOL_DEFER_VERSION,
+  QUEUE_PROTOCOL_EXACT_CANCEL_VERSION,
+  QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION,
   QUEUE_PROTOCOL_EFFORT_VERSION,
   readLiveQueueOwner,
   type QueueOwnerRecord,
@@ -39,13 +41,16 @@ import {
 } from "./lease-store.js";
 import {
   parseQueueOwnerMessage,
+  type QueueCancelOutcome,
   type QueueApplySessionPreferencesRequest,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
+  type QueueListPromptQueueRequest,
   type QueueListRequestsRequest,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerApplySessionPreferencesResultMessage,
   type QueueOwnerCloseSessionResultMessage,
+  type QueueOwnerListPromptQueueResultMessage,
   type QueueOwnerListRequestsResultMessage,
   type QueueOwnerMessage,
   type QueueOwnerRespondResultMessage,
@@ -53,6 +58,7 @@ import {
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueRequest,
+  type QueuePromptSnapshot,
   type QueueRespondRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetModelRequest,
@@ -63,6 +69,49 @@ import { DEFAULT_DEFER_MAX_AGE_MS } from "./pending-request-manager.js";
 
 export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
+
+const DEFINITIVE_QUEUE_ADMISSION_FAILURES = new Set([
+  "QUEUE_CONNECT_TIMEOUT",
+  "QUEUE_NOT_ACCEPTING_REQUESTS",
+  "QUEUE_OWNER_CLOSED",
+  "QUEUE_OWNER_GENERATION_MISMATCH",
+  "QUEUE_OWNER_OVERLOADED",
+  "QUEUE_OWNER_PARKING_UNSUPPORTED",
+  "QUEUE_OWNER_PROTOCOL_MISMATCH",
+  "QUEUE_OWNER_SHUTTING_DOWN",
+]);
+
+/** Whether a submit error may have happened after the owner accepted the turn. */
+export function isQueueAdmissionOutcomeUnknown(error: unknown): boolean {
+  if (!(error instanceof QueueConnectionError) && !(error instanceof QueueProtocolError)) {
+    return false;
+  }
+  return !DEFINITIVE_QUEUE_ADMISSION_FAILURES.has(error.detailCode ?? "");
+}
+
+/**
+ * An explicit owner error is a completed rejection, not an ambiguous transport
+ * result. Keep that provenance in the type instead of trying to infer it later
+ * from an open-ended set of owner-provided detail codes.
+ */
+class QueueOwnerRequestRejectedError extends QueueConnectionError {}
+
+/** Whether an acknowledged pending answer may still be applied by its owner. */
+export function isPendingRequestAnswerOutcomeUnknown(
+  error: unknown,
+  ownerAccepted: boolean,
+): boolean {
+  if (!ownerAccepted) {
+    return false;
+  }
+  if (error instanceof PendingRequestAnswerTimeoutError) {
+    return error.answerOutcome === "unknown";
+  }
+  return (
+    (error instanceof QueueConnectionError || error instanceof QueueProtocolError) &&
+    !(error instanceof QueueOwnerRequestRejectedError)
+  );
+}
 export {
   isProcessAlive,
   releaseQueueOwnerLease,
@@ -399,7 +448,16 @@ async function runQueueOwnerRequest<TResult>(options: {
 
       if (buffer.length > MAX_MESSAGE_BUFFER_SIZE) {
         socket.destroy();
-        finishReject(new Error(`Message buffer exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes`));
+        finishReject(
+          new QueueConnectionError(
+            `Queue owner response exceeded ${MAX_MESSAGE_BUFFER_SIZE} bytes after request write`,
+            {
+              detailCode: "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE",
+              origin: "queue",
+              retryable: true,
+            },
+          ),
+        );
         return;
       }
 
@@ -416,8 +474,17 @@ async function runQueueOwnerRequest<TResult>(options: {
       }
     });
 
-    socket.once("error", (error: Error) => {
-      finishReject(error);
+    socket.once("error", () => {
+      // Once connected, the request write is initiated synchronously below.
+      // A transport error can therefore no longer prove the owner did not
+      // accept the turn and must remain an ambiguous admission.
+      finishReject(
+        new QueueConnectionError("Queue owner transport failed after request write", {
+          detailCode: "QUEUE_TRANSPORT_ERROR_AFTER_WRITE",
+          origin: "queue",
+          retryable: true,
+        }),
+      );
     });
 
     socket.once("close", () => {
@@ -433,6 +500,8 @@ async function runQueueOwnerRequest<TResult>(options: {
 
 export type SubmitToQueueOwnerOptions = {
   sessionId: string;
+  /** Stable caller-owned turn id used for queue admission and durable attribution. */
+  turnId?: string;
   message: string;
   prompt?: PromptInput;
   mcpConfigPath?: string;
@@ -521,7 +590,7 @@ async function submitToQueueOwner(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
-  const requestId = randomUUID();
+  const requestId = options.turnId ?? randomUUID();
   const request: QueueSubmitRequest = {
     type: "submit_prompt",
     requestId,
@@ -601,15 +670,17 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   request: QueueRequest,
   isExpectedResponse: (message: QueueOwnerMessage) => message is TResponse,
   responseTimeoutMs?: number,
+  onAccepted?: () => void,
 ): Promise<TResponse | undefined> {
   return await runQueueOwnerRequest<TResponse>({
     owner,
     request,
     ...(responseTimeoutMs === undefined ? {} : { responseTimeoutMs }),
+    ...(onAccepted === undefined ? {} : { onAccepted }),
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
-          new QueueConnectionError(message.message, {
+          new QueueOwnerRequestRejectedError(message.message, {
             outputCode: message.code,
             detailCode: message.detailCode,
             origin: message.origin ?? "queue",
@@ -667,11 +738,15 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
   });
 }
 
-async function submitCancelToQueueOwner(owner: QueueOwnerRecord): Promise<boolean | undefined> {
+async function submitCancelToQueueOwner(
+  owner: QueueOwnerRecord,
+  targetTurnId?: string,
+): Promise<QueueCancelOutcome | undefined> {
   const request: QueueCancelRequest = {
     type: "cancel_prompt",
     requestId: randomUUID(),
     ownerGeneration: owner.ownerGeneration,
+    targetTurnId,
   };
   const response = await submitControlToQueueOwner(
     owner,
@@ -688,7 +763,7 @@ async function submitCancelToQueueOwner(owner: QueueOwnerRecord): Promise<boolea
       retryable: true,
     });
   }
-  return response.cancelled;
+  return response.outcome ?? (response.cancelled ? "active" : "not_found");
 }
 
 async function submitSetModeToQueueOwner(
@@ -1154,21 +1229,36 @@ export async function tryCloseSessionOnRunningOwner(options: {
 
 export async function tryCancelOnRunningOwner(options: {
   sessionId: string;
+  turnId?: string;
   verbose?: boolean;
-}): Promise<boolean | undefined> {
+}): Promise<QueueCancelOutcome | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
     return undefined;
   }
 
-  const cancelled = await submitCancelToQueueOwner(owner);
-  if (cancelled !== undefined) {
+  if (
+    options.turnId !== undefined &&
+    queueOwnerProtocolVersion(owner) < QUEUE_PROTOCOL_EXACT_CANCEL_VERSION
+  ) {
+    throw new QueueConnectionError(
+      "Session queue owner cannot safely target cancellation to an exact turn; close the session so a new owner can start",
+      {
+        detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
+        origin: "queue",
+        retryable: false,
+      },
+    );
+  }
+
+  const outcome = await submitCancelToQueueOwner(owner, options.turnId);
+  if (outcome !== undefined) {
     if (options.verbose) {
       process.stderr.write(
         `[acpx] requested cancel on active owner pid ${owner.pid} for session ${options.sessionId}\n`,
       );
     }
-    return cancelled;
+    return outcome;
   }
 
   const health = await probeQueueOwnerHealth(options.sessionId);
@@ -1328,6 +1418,68 @@ export async function tryListRequestsOnRunningOwner(options: {
 }
 
 /**
+ * Exact queued prompt identities owned by the current queue generation.
+ *
+ * Older owners return `undefined` without receiving an unknown verb. Callers
+ * must keep their separately observed depth but omit turn controls in that
+ * case; timeline submissions are not proof of FIFO membership.
+ */
+export async function tryListPromptQueueOnRunningOwner(options: {
+  sessionId: string;
+  responseTimeoutMs?: number;
+  verbose?: boolean;
+}): Promise<
+  | {
+      ownerGeneration: number;
+      queueDepth: number;
+      omittedCount: number;
+      prompts: QueuePromptSnapshot[];
+    }
+  | undefined
+> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner || queueOwnerProtocolVersion(owner) < QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION) {
+    return undefined;
+  }
+
+  const request: QueueListPromptQueueRequest = {
+    type: "list_prompt_queue",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerListPromptQueueResultMessage =>
+      message.type === "list_prompt_queue_result",
+    options.responseTimeoutMs,
+  );
+  if (options.verbose && response) {
+    process.stderr.write(
+      `[acpx] listed ${response.prompts.length}/${response.queueDepth} queued prompt control(s) ` +
+        `on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+    );
+  }
+  const accepted = await requireAcceptingOwner(options.sessionId, response, "list_prompt_queue");
+  if (!accepted) {
+    return undefined;
+  }
+  if (accepted.ownerGeneration !== owner.ownerGeneration) {
+    throw new QueueProtocolError("Queue owner omitted its prompt queue generation", {
+      detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+      origin: "queue",
+      retryable: true,
+    });
+  }
+  return {
+    ownerGeneration: accepted.ownerGeneration,
+    queueDepth: accepted.queueDepth,
+    omittedCount: accepted.omittedCount,
+    prompts: accepted.prompts,
+  };
+}
+
+/**
  * Give up on the owner after the asked-for bound, turning it into its own error.
  *
  * A generic queue timeout would report as a runtime failure, which is the one
@@ -1345,17 +1497,20 @@ function pendingRequestAnswerTimeout(
     return new PendingRequestAnswerTimeoutError(
       `Queue owner could not be reached within ${options.responseTimeoutMs}ms; the answer to ` +
         `request ${options.pendingRequestId} was not delivered`,
+      "not_delivered",
     );
   }
   return new PendingRequestAnswerTimeoutError(
     `Queue owner did not confirm the answer to request ${options.pendingRequestId} within ` +
       `${options.responseTimeoutMs}ms; it may still be applied`,
+    "unknown",
   );
 }
 
 function isQueueBudgetTimeout(error: unknown): error is QueueConnectionError {
   return (
     error instanceof QueueConnectionError &&
+    !(error instanceof QueueOwnerRequestRejectedError) &&
     (error.detailCode === "QUEUE_RESPONSE_TIMEOUT" || error.detailCode === "QUEUE_CONNECT_TIMEOUT")
   );
 }
@@ -1363,7 +1518,11 @@ function isQueueBudgetTimeout(error: unknown): error is QueueConnectionError {
 async function submitRespondRequest(
   owner: QueueOwnerRecord,
   request: QueueRespondRequest,
-  options: { pendingRequestId: string; responseTimeoutMs?: number },
+  options: {
+    pendingRequestId: string;
+    responseTimeoutMs?: number;
+    onQueueAccepted?: () => void;
+  },
 ): Promise<QueueOwnerRespondResultMessage | undefined> {
   const responseTimeoutMs = options.responseTimeoutMs;
   try {
@@ -1373,6 +1532,7 @@ async function submitRespondRequest(
       (message): message is QueueOwnerRespondResultMessage =>
         message.type === "respond_request_result",
       responseTimeoutMs,
+      options.onQueueAccepted,
     );
   } catch (error) {
     if (isQueueBudgetTimeout(error) && responseTimeoutMs !== undefined) {
@@ -1398,6 +1558,8 @@ export async function tryRespondOnRunningOwner(options: {
   pendingRequestId: string;
   answer: PendingRequestAnswer;
   responseTimeoutMs?: number;
+  /** Fires only after the owner acknowledges that it accepted this answer. */
+  onQueueAccepted?: () => void;
   verbose?: boolean;
 }): Promise<PendingRequest | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);

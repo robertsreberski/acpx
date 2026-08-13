@@ -47,6 +47,7 @@ export class QueueOwnerTurnController {
   private state: QueueOwnerTurnState = "idle";
   private shuttingDown = false;
   private pendingCancel = false;
+  private activeTurnId?: string;
   private activeController?: QueueOwnerActiveSessionController;
   private controlTargetReady?: Promise<void>;
   private resolveControlTargetReady?: () => void;
@@ -67,14 +68,40 @@ export class QueueOwnerTurnController {
     return this.pendingCancel;
   }
 
-  async beginTurn(): Promise<void> {
-    while (this.idleControlsDone) {
-      await this.idleControlsDone;
-    }
+  /**
+   * Claim the turn before waiting on anything.
+   *
+   * The dequeue already removed this task from the pending FIFO, and a targeted
+   * cancel looks in the FIFO first and at `activeTurnId` second. Anything
+   * awaited before the claim therefore opens a window where the turn is in
+   * neither place and an exact cancel silently reports "not found" — a window
+   * that used to be zero, because starting a turn was synchronous, and that
+   * waiting for idle controls would otherwise stretch to the length of a
+   * control request. Cancellation also tests the state, so the state has to move
+   * with the id rather than after it.
+   */
+  async beginTurn(turnId?: string): Promise<void> {
     this.assertCanHandleControlRequest();
     this.state = "starting";
     this.pendingCancel = false;
+    this.activeTurnId = turnId;
     this.startControlTargetWait();
+    try {
+      while (this.idleControlsDone) {
+        await this.idleControlsDone;
+      }
+      // Shutdown can begin while idle controls drain.
+      this.assertCanHandleControlRequest();
+    } catch (error) {
+      // The turn never started, so release the claim. A rejected beginTurn
+      // never reaches endTurn, and a stale claim would leave a cancel matching
+      // a turn that is not running.
+      this.state = "idle";
+      this.pendingCancel = false;
+      this.activeTurnId = undefined;
+      this.finishControlTargetWait();
+      throw error;
+    }
   }
 
   markPromptActive(): void {
@@ -86,6 +113,7 @@ export class QueueOwnerTurnController {
   endTurn(): void {
     this.state = "idle";
     this.pendingCancel = false;
+    this.activeTurnId = undefined;
     this.finishControlTargetWait();
   }
 
@@ -101,6 +129,7 @@ export class QueueOwnerTurnController {
     this.prepareForShutdown();
     this.state = "closing";
     this.pendingCancel = false;
+    this.activeTurnId = undefined;
     this.activeController = undefined;
   }
 
@@ -179,7 +208,10 @@ export class QueueOwnerTurnController {
     }
   }
 
-  async requestCancel(): Promise<boolean> {
+  async requestCancel(targetTurnId?: string): Promise<boolean> {
+    if (targetTurnId !== undefined && targetTurnId !== this.activeTurnId) {
+      return false;
+    }
     const activeController = this.activeController;
     if (activeController?.hasActivePrompt()) {
       const cancelled = await activeController.requestCancelActivePrompt();

@@ -26,7 +26,8 @@ import {
   reapplyDesiredEffortAfterModelChange,
 } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
-import { resolveSessionRecord, writeSessionRecord } from "../../session/persistence.js";
+import { resolveSessionRecord } from "../../session/persistence.js";
+import { writeSessionRecordWithLatestTimeline } from "../../session/timeline.js";
 import type {
   AuthPolicy,
   McpServer,
@@ -120,7 +121,7 @@ function buildDirectConnectedSessionOptions<T>(
   return {
     sessionRecordId: options.sessionRecordId,
     loadRecord: resolveSessionRecord,
-    saveRecord: writeSessionRecord,
+    saveRecord: writeSessionRecordWithLatestTimeline,
     mcpServers: options.mcpServers,
     nonInteractivePermissions: options.nonInteractivePermissions,
     authCredentials: options.authCredentials,

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, fork-main]
   pull_request:
-    branches: [main]
+    branches: [main, fork-main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -107,6 +107,9 @@ jobs:
             command: pnpm run lint
           - name: Build
             command: pnpm run build
+          - name: Console
+            node_version: 22
+            command: pnpm --filter acpx-console check
           - name: Conformance Smoke
             command: pnpm run conformance:run -- --case acp.v1.initialize.handshake
           - name: Test

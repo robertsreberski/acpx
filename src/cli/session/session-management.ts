@@ -48,6 +48,12 @@ type CreatedSessionState = {
   requestedEffortResponse?: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>;
 };
 
+async function notifyProviderMutationDispatch(
+  callback: SessionCreateOptions["onProviderMutationDispatch"],
+): Promise<void> {
+  await callback?.();
+}
+
 async function applyRequestedCreationPreferences(params: {
   client: AcpClient;
   sessionId: string;
@@ -77,12 +83,13 @@ async function createSessionRecordWithClient(
     ? await resumeSessionRecordWithClient(client, options, cwd)
     : await createFreshSessionState(client, options, cwd);
   const { sessionId, agentSessionId } = createdState;
+  const acpxRecordId = options.acpxRecordId ?? sessionId;
 
   const lifecycle = client.getAgentLifecycleSnapshot();
   const now = isoNow();
   const record: SessionRecord = {
     schema: "acpx.session.v1",
-    acpxRecordId: sessionId,
+    acpxRecordId,
     acpSessionId: sessionId,
     agentSessionId,
     agentCommand: options.agentCommand,
@@ -93,7 +100,7 @@ async function createSessionRecordWithClient(
     lastUsedAt: now,
     lastSeq: 0,
     lastRequestId: undefined,
-    eventLog: defaultSessionEventLog(sessionId),
+    eventLog: defaultSessionEventLog(acpxRecordId),
     closed: false,
     closedAt: undefined,
     pid: lifecycle.running ? lifecycle.pid : undefined,
@@ -142,6 +149,7 @@ async function createFreshSessionState(
   options: SessionCreateOptions,
   cwd: string,
 ): Promise<CreatedSessionState> {
+  await notifyProviderMutationDispatch(options.onProviderMutationDispatch);
   const createdSession = await withTimeout(client.createSession(cwd), options.timeoutMs);
   const application = await applyRequestedCreationPreferences({
     client,
@@ -182,6 +190,7 @@ async function resumeSessionRecordWithClient(
   }
 
   try {
+    await notifyProviderMutationDispatch(options.onProviderMutationDispatch);
     const resumedSession = await withTimeout(
       resumeMethod === "session/resume"
         ? client.resumeSession(options.resumeSessionId, cwd)

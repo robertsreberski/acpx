@@ -46,17 +46,20 @@ typescript:
         - src/mcp-servers
         - src/perf-metrics
         - src/perf-metrics-capture
+        - src/permissions
         - src/permission-policy
         - src/process-liveness
         - src/prompt-content
         - src/runtime
         - src/session
         - src/types
+        - src/version
     - from: src/flows
       allow:
         - src/acp
         - src/async-control
         - src/cli
+        - src/errors
         - src/permissions
         - src/permission-policy
         - src/prompt-content

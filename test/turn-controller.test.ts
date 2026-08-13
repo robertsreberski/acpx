@@ -48,6 +48,28 @@ test("QueueOwnerTurnController cancels immediately for active prompts", async ()
   assert.equal(controller.hasPendingCancel, false);
 });
 
+test("QueueOwnerTurnController rejects cancellation for a different active turn", async () => {
+  const controller = createQueueOwnerTurnController();
+  let cancelCalls = 0;
+
+  controller.beginTurn("turn-b");
+  controller.setActiveController(
+    makeActiveController({
+      hasActivePrompt: () => true,
+      requestCancelActivePrompt: async () => {
+        cancelCalls += 1;
+        return true;
+      },
+    }),
+  );
+  controller.markPromptActive();
+
+  assert.equal(await controller.requestCancel("turn-a"), false);
+  assert.equal(cancelCalls, 0);
+  assert.equal(await controller.requestCancel("turn-b"), true);
+  assert.equal(cancelCalls, 1);
+});
+
 test("QueueOwnerTurnController defers cancel while turn is starting", async () => {
   const controller = createQueueOwnerTurnController();
   let promptActive = false;
@@ -333,8 +355,12 @@ test("QueueOwnerTurnController finishes idle preference updates before starting 
     turnStarted = true;
   });
   await Promise.resolve();
+  // The turn's work still waits for the idle preference update to finish, which
+  // is what this guards. The turn is nonetheless already claimed: the dequeue
+  // removed it from the pending FIFO, so leaving the controller "idle" until the
+  // gate opened would make an exact cancel for it report "not found".
   assert.equal(turnStarted, false);
-  assert.equal(controller.lifecycleState, "idle");
+  assert.equal(controller.lifecycleState, "starting");
 
   releaseFallback();
   await preference;
@@ -397,6 +423,7 @@ test("queue owner closes a handed-off task when shutdown aborts turn start", asy
   const task = queueOwnerRuntimeTestInternals.runQueueOwnerTask({
     turnController: controller,
     task: {
+      requestId: "turn-shutdown",
       close: () => {
         closed = true;
       },
@@ -422,6 +449,7 @@ test("queue owner leaves task closure to the runner after turn start", async () 
   const result = await queueOwnerRuntimeTestInternals.runQueueOwnerTask({
     turnController: controller,
     task: {
+      requestId: "turn-completed",
       close: () => {
         closeCalls += 1;
       },
@@ -562,3 +590,40 @@ function makeActiveController(
       })),
   };
 }
+
+test("an exact cancel still finds a turn whose start is waiting on idle controls", async () => {
+  // The dequeue has already removed this task from the pending FIFO, so if the
+  // turn is not claimed until after the idle-control gate, a targeted cancel
+  // finds it in neither place and reports "not found".
+  let releaseFallback = () => {};
+  const controller = createQueueOwnerTurnController({
+    setSessionModeFallback: async () => {
+      await new Promise<void>((resolve) => {
+        releaseFallback = resolve;
+      });
+    },
+  });
+
+  const idleControl = controller.setSessionMode("plan");
+  await Promise.resolve();
+
+  const started = controller.beginTurn("turn-42");
+  await Promise.resolve();
+
+  // The turn has not actually begun yet, but it is already cancellable by id.
+  assert.equal(await controller.requestCancel("turn-42"), true);
+  assert.equal(await controller.requestCancel("turn-other"), false);
+
+  releaseFallback();
+  await idleControl;
+  await started;
+  controller.endTurn();
+});
+
+test("a turn that never starts does not leave itself cancellable", async () => {
+  const controller = createQueueOwnerTurnController();
+  controller.prepareForShutdown();
+
+  await assert.rejects(controller.beginTurn("turn-99"), /Queue owner is closing/);
+  assert.equal(await controller.requestCancel("turn-99"), false);
+});

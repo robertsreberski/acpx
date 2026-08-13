@@ -68,6 +68,7 @@ export async function writeQueueOwnerLock(options: {
   acpxVersion?: string;
   parking?: boolean;
   parkingMaxAgeMs?: number;
+  timeline?: boolean;
 }): Promise<void> {
   const now = new Date().toISOString();
   const createdAt = options.createdAt ?? now;
@@ -96,6 +97,7 @@ export async function writeQueueOwnerLock(options: {
       ...(options.parkingMaxAgeMs === undefined
         ? {}
         : { parkingMaxAgeMs: options.parkingMaxAgeMs }),
+      ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
     })}\n`,
     "utf8",
   );
@@ -199,6 +201,7 @@ export async function nextJsonLine(
  * real owner rather than one per test.
  */
 export const noParkedRequestControlHandlers = {
+  cancelQueuedPrompt: async (): Promise<void> => {},
   applySessionPreferences: async () => ({
     effortConfigId: "reasoning_effort",
     response: { configOptions: [] },

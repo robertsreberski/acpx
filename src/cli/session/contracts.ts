@@ -18,6 +18,7 @@ import type {
   SessionResumePolicy,
   SessionRecord,
 } from "../../types.js";
+import type { QueueCancelOutcome } from "../queue/messages.js";
 
 type TimedRunOptions = {
   timeoutMs?: number;
@@ -64,6 +65,8 @@ export type RunOnceOptions = {
 } & TimedRunOptions;
 
 export type SessionCreateOptions = {
+  /** Optional caller-owned local record identity; provider session ids remain adapter-scoped. */
+  acpxRecordId?: string;
   agentCommand: string;
   agentArgv?: string[];
   cwd: string;
@@ -80,10 +83,14 @@ export type SessionCreateOptions = {
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
   onModelWarning?: (message: string) => void;
+  /** Awaited immediately before session/new, session/resume, or session/load is dispatched. */
+  onProviderMutationDispatch?: () => void | Promise<void>;
 } & TimedRunOptions;
 
 export type SessionSendOptions = {
   sessionId: string;
+  /** Stable caller-owned turn id, also used as the queue admission request id. */
+  turnId?: string;
   prompt: PromptInput;
   resumePolicy?: SessionResumePolicy;
   mcpServers?: McpServer[];
@@ -112,6 +119,8 @@ export type SessionSendOptions = {
   /** Milliseconds a parked request waits before expiring; 0 parks forever. */
   deferMaxAgeMs?: number;
   client?: AcpClient;
+  /** Internal executable arguments used by embedded services to start acpx's queue owner. */
+  queueOwnerSpawnArgs?: string[];
   promptRetries?: number;
   sessionOptions?: SessionAgentOptions;
 } & TimedRunOptions;
@@ -157,12 +166,15 @@ export type SessionListResult = AgentSessionListResult | undefined;
 
 export type SessionCancelOptions = {
   sessionId: string;
+  /** Cancel only this turn; a different active turn is left untouched. */
+  turnId?: string;
   verbose?: boolean;
 };
 
 export type SessionCancelResult = {
   sessionId: string;
   cancelled: boolean;
+  outcome: QueueCancelOutcome;
 };
 
 export type SessionSetModeOptions = {

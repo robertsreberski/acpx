@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { splitCommandLine } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
@@ -41,7 +42,7 @@ import {
   recordSessionUpdate as recordConversationSessionUpdate,
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
-import { SessionEventWriter } from "../../session/events.js";
+import { SessionEventAppendError, SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
   clearDesiredConfigOption,
@@ -63,6 +64,11 @@ import {
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
+import {
+  captureAcpTimelineEvent,
+  type CapturedAcpTimelineEvent,
+  type SessionTimelineLifecycleEvent,
+} from "../../session/timeline.js";
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
@@ -103,6 +109,36 @@ function oneShotInitialDrainIdleMs(
   return isCodexAcpCommand(parts.command, parts.args) ? undefined : ONE_SHOT_REPLY_IDLE_MS;
 }
 
+function completedTurnLifecycle(stopReason: string): SessionTimelineLifecycleEvent {
+  return stopReason === "cancelled"
+    ? { type: "turn_cancelled" }
+    : { type: "turn_completed", stop_reason: stopReason };
+}
+
+function stableTurnId(requested: string | undefined): string {
+  return requested ?? randomUUID();
+}
+
+async function appendImplicitSubmittedTimeline(params: {
+  eventWriter: SessionEventWriter;
+  callerTurnId?: string;
+  turnId: string;
+  requestId?: string;
+  capturedAt: string;
+}): Promise<void> {
+  if (params.callerTurnId) {
+    return;
+  }
+  await params.eventWriter.appendLifecycleEvent(
+    { type: "turn_submitted" },
+    {
+      capturedAt: params.capturedAt,
+      turnId: params.turnId,
+      requestId: params.requestId,
+    },
+  );
+}
+
 type RunSessionPromptOptions = Omit<
   SessionSendOptions,
   "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
@@ -119,6 +155,8 @@ type RunSessionPromptOptions = Omit<
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
+  turnId?: string;
+  requestId?: string;
 };
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
@@ -909,7 +947,7 @@ function emitIncompleteTurn(
   completion: TurnCompletionResult,
   output: OutputFormatter,
   permissionStats: RunPromptResult["permissionStats"],
-  pendingMessages?: AcpJsonRpcMessage[],
+  queueDurableMessage?: (message: AcpJsonRpcMessage) => void,
 ): void {
   if (completion.status !== "incomplete") {
     return;
@@ -918,7 +956,7 @@ function emitIncompleteTurn(
     reason: completion.reason,
     stopReason: completion.stopReason,
   });
-  pendingMessages?.push(notification);
+  queueDurableMessage?.(notification);
   if (!permissionDenialTakesPrecedence(permissionStats)) {
     output.onAcpMessage(notification);
   }
@@ -956,9 +994,10 @@ function registerPendingRequestSink(
   output: OutputFormatter,
   pendingMessages: AcpJsonRpcMessage[],
   markSideEffect: () => void,
+  captureMessage?: (message: AcpJsonRpcMessage) => void,
 ): void {
   options.onPendingRequestSink?.(
-    createPendingRequestSink({ output, pendingMessages, markSideEffect }),
+    createPendingRequestSink({ output, pendingMessages, markSideEffect, captureMessage }),
   );
 }
 
@@ -966,6 +1005,7 @@ function createPendingRequestSink(params: {
   output: OutputFormatter;
   pendingMessages: AcpJsonRpcMessage[];
   markSideEffect: () => void;
+  captureMessage?: (message: AcpJsonRpcMessage) => void;
 }): (event: PendingRequestEvent) => void {
   return (event) => {
     params.markSideEffect();
@@ -974,8 +1014,64 @@ function createPendingRequestSink(params: {
       request: pendingRequestForEventLog(event.request),
     });
     params.pendingMessages.push(notification);
+    params.captureMessage?.(notification);
     // Attached --format json clients see park/answer transitions live.
     params.output.onAcpMessage(notification);
+  };
+}
+
+/** Append one stable queue prefix; createCapturedMessageQueueFlusher owns serialization. */
+async function appendCapturedMessageQueueBatch(params: {
+  eventWriter: Pick<SessionEventWriter, "appendCapturedMessages">;
+  pendingMessages: AcpJsonRpcMessage[];
+  pendingTimelineEvents: CapturedAcpTimelineEvent[];
+  checkpoint?: boolean;
+}): Promise<void> {
+  // Sync is checked before the empty case on purpose: a message queued without
+  // its timeline event leaves this buffer empty, and returning early on that
+  // would drop the notification silently instead of reporting the desync.
+  if (params.pendingMessages.length !== params.pendingTimelineEvents.length) {
+    throw new Error("Session event buffers are out of sync");
+  }
+  if (params.pendingTimelineEvents.length === 0) {
+    return;
+  }
+
+  const captured = params.pendingTimelineEvents.slice();
+  let committedCount = 0;
+  try {
+    committedCount = await params.eventWriter.appendCapturedMessages(captured, {
+      checkpoint: params.checkpoint,
+    });
+  } catch (error) {
+    committedCount = error instanceof SessionEventAppendError ? error.committedCount : 0;
+    params.pendingMessages.splice(0, committedCount);
+    params.pendingTimelineEvents.splice(0, committedCount);
+    throw error;
+  }
+  params.pendingMessages.splice(0, committedCount);
+  params.pendingTimelineEvents.splice(0, committedCount);
+}
+
+function createCapturedMessageQueueFlusher(params: {
+  eventWriter: Pick<SessionEventWriter, "appendCapturedMessages">;
+  pendingMessages: AcpJsonRpcMessage[];
+  pendingTimelineEvents: CapturedAcpTimelineEvent[];
+}): (checkpoint?: boolean) => Promise<void> {
+  let flushTail = Promise.resolve();
+
+  return (checkpoint = false) => {
+    const flush = flushTail.then(async () => {
+      await appendCapturedMessageQueueBatch({
+        ...params,
+        checkpoint,
+      });
+    });
+    flushTail = flush.catch(() => {
+      // Keep the queue usable: the caller still observes this failure, while a
+      // later flush retries whichever suffix was not durably acknowledged.
+    });
+    return flush;
   };
 }
 
@@ -1012,6 +1108,8 @@ function buildQueuedTaskRunOptions(
     onPendingRequestSink: options.onPendingRequestSink,
     handleProcessInterrupts: options.handleProcessInterrupts,
     client: options.sharedClient,
+    turnId: task.requestId,
+    requestId: task.requestId,
   };
 }
 
@@ -1125,7 +1223,30 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const eventWriter = await measurePerf("session.events.open", async () => {
     return await SessionEventWriter.open(record);
   });
+  const turnId = stableTurnId(options.turnId);
+  const requestId = options.requestId;
+  await appendImplicitSubmittedTimeline({
+    eventWriter,
+    callerTurnId: options.turnId,
+    turnId,
+    requestId,
+    capturedAt: promptStartedAt,
+  });
   const pendingMessages: AcpJsonRpcMessage[] = [];
+  const pendingTimelineEvents: CapturedAcpTimelineEvent[] = [];
+  /**
+   * Queue an acpx-originated notification for the durable event log.
+   *
+   * The flusher appends the timeline events and splices both buffers by the
+   * same committed count, so the two have to be pushed together. Routing every
+   * internal notification through one function is what keeps them in step:
+   * pushing the message alone leaves the timeline buffer empty and the flush
+   * drops the notification without a word.
+   */
+  const queueInternalMessage = (message: AcpJsonRpcMessage): void => {
+    pendingMessages.push(message);
+    pendingTimelineEvents.push(captureAcpTimelineEvent("internal", message, { turnId }));
+  };
   const pendingConnectOutputMessages: BufferedAcpOutputMessage[] = [];
   const sessionOptions = mergeSessionOptions(
     options.sessionOptions,
@@ -1137,6 +1258,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const completionTracker = new TurnCompletionTracker();
   const acpErrors = new AcpErrorTracker();
   let eventWriterClosed = false;
+  let turnLifecycleSettled = false;
+  const settleFailedTimeline = async (error: unknown): Promise<void> => {
+    if (turnLifecycleSettled) {
+      return;
+    }
+    await eventWriter
+      .appendLifecycleEvent(
+        { type: "turn_failed", message: formatErrorMessage(error) },
+        { turnId, requestId },
+      )
+      .catch(() => {
+        // Preserve the original turn failure if timeline persistence also fails.
+      });
+    turnLifecycleSettled = true;
+  };
 
   const closeEventWriter = async (checkpoint: boolean): Promise<void> => {
     if (eventWriterClosed) {
@@ -1146,14 +1282,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await eventWriter.close({ checkpoint });
   };
 
-  const flushPendingMessages = async (checkpoint = false): Promise<void> => {
-    if (pendingMessages.length === 0) {
-      return;
-    }
+  const flushCapturedMessages = createCapturedMessageQueueFlusher({
+    eventWriter,
+    pendingMessages,
+    pendingTimelineEvents,
+  });
 
-    const batch = pendingMessages.splice(0);
+  const flushPendingMessages = async (checkpoint = false): Promise<void> => {
     await measurePerf("session.events.flush_pending", async () => {
-      await eventWriter.appendMessages(batch, { checkpoint });
+      await flushCapturedMessages(checkpoint);
     });
   };
   const preserveClosedState = async (): Promise<void> => {
@@ -1221,6 +1358,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   client.setEventHandlers({
     onAcpMessage: (direction, message) => {
       pendingMessages.push(message);
+      pendingTimelineEvents.push(captureAcpTimelineEvent(direction, message, { turnId }));
       options.onAcpMessage?.(direction, message);
     },
     onAcpOutputMessage: (direction, message) => {
@@ -1252,14 +1390,23 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     onPermissionEscalation: (event) => {
       // Also land it in the durable event log. The formatter is discarded for
       // --no-wait turns, so without this an escalation leaves no trace at all.
-      pendingMessages.push(acpxExtensionNotification("_acpx/permission_escalation", event));
+      const notification = acpxExtensionNotification("_acpx/permission_escalation", event);
+      queueInternalMessage(notification);
       output.onPermissionEscalation(event);
       options.onPermissionEscalation?.(event);
     },
   });
-  registerPendingRequestSink(options, output, pendingMessages, () => {
-    promptTurnHadSideEffects = true;
-  });
+  registerPendingRequestSink(
+    options,
+    output,
+    pendingMessages,
+    () => {
+      promptTurnHadSideEffects = true;
+    },
+    (message) => {
+      pendingTimelineEvents.push(captureAcpTimelineEvent("internal", message, { turnId }));
+    },
+  );
   let activeSessionIdForControl = record.acpSessionId;
   let notifiedClientAvailable = false;
   const activeController: ActiveSessionController = {
@@ -1371,6 +1518,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
             // is not in force is the durable log plus the live JSON stream.
             const notification = acpxExtensionNotification("_acpx/warning", warning);
             pendingMessages.push(notification);
+            pendingTimelineEvents.push(
+              captureAcpTimelineEvent("internal", notification, { turnId }),
+            );
             output.onAcpMessage(notification);
           },
         });
@@ -1458,6 +1608,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.lastUsedAt = isoNow();
     applyConversation(record, conversation);
     record.acpx = acpxState;
+    await eventWriter
+      .appendLifecycleEvent(
+        { type: "turn_failed", message: normalizedError.message },
+        { turnId, requestId },
+      )
+      .catch(() => {
+        // Preserve the original prompt failure if timeline persistence also fails.
+      });
+    turnLifecycleSettled = true;
     const propagated = error instanceof Error ? error : new Error(formatErrorMessage(error));
     attachAcpErrorPayload(propagated, normalizedError.acp);
     (propagated as { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted =
@@ -1468,6 +1627,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const runPromptWithRetries = async (sessionId: string) => {
     promptTurnActive = true;
+    await eventWriter.appendLifecycleEvent({ type: "turn_started" }, { turnId, requestId });
     for (let attempt = 0; ; attempt++) {
       try {
         return await runPromptAttempt(sessionId, attempt);
@@ -1483,7 +1643,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     response: Awaited<ReturnType<typeof runPromptTurn>>,
     permissionStats: PermissionStats,
   ) => {
-    emitIncompleteTurn(response, output, permissionStats, pendingMessages);
+    emitIncompleteTurn(response, output, permissionStats, queueInternalMessage);
     await flushPendingMessages(false);
     output.flush();
     const now = isoNow();
@@ -1495,6 +1655,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     record.acpx = acpxState;
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    await eventWriter.appendLifecycleEvent(completedTurnLifecycle(response.stopReason), {
+      turnId,
+      requestId,
+    });
+    turnLifecycleSettled = true;
     stopTotalTimer();
     return response;
   };
@@ -1550,6 +1715,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while process is being interrupted
     });
+    await eventWriter
+      .appendLifecycleEvent({ type: "turn_interrupted" }, { turnId, requestId })
+      .catch(() => {
+        // best effort while process is being interrupted
+      });
+    turnLifecycleSettled = true;
     output.flush();
     if (ownClient) {
       await client.close();
@@ -1566,6 +1737,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const matchedAcpError = acpErrors.match(error);
     attachAcpErrorPayload(error, matchedAcpError);
     markOutputAlreadyEmitted(error, matchedAcpError !== undefined && shouldMarkAcpErrorsEmitted);
+    await settleFailedTimeline(error);
     throw error;
   } finally {
     if (options.verbose) {
@@ -1586,8 +1758,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await liveCheckpoint.flush().catch(() => {
       // best effort on close
     });
-    await flushPendingMessages(false).catch(() => {
-      // best effort on close
+    await flushPendingMessages(false).catch((error) => {
+      // Cleanup must continue so clients and locks are released, but a failed
+      // authoritative flush must not look like complete history. The writer
+      // records the error in timeline metadata; stderr makes it immediately
+      // visible even if the following record checkpoint also fails.
+      process.stderr.write(
+        `[acpx] final session timeline flush failed; history may be incomplete: ${formatErrorMessage(error)}\n`,
+      );
     });
     await preserveClosedState().catch(() => {
       // best effort on close
@@ -1740,6 +1918,8 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
   return await runSessionPrompt({
     sessionRecordId: options.sessionId,
+    turnId: options.turnId,
+    requestId: options.turnId,
     prompt: options.prompt,
     mcpServers: options.mcpServers,
     permissionMode: options.permissionMode,
@@ -1768,6 +1948,7 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
 export const sessionRuntimeTestInternals = {
   shouldRetryRuntimePrompt,
   createPendingRequestSink,
+  createCapturedMessageQueueFlusher,
   mergeQueuedTaskSessionPreferences,
   oneShotInitialDrainIdleMs,
 };

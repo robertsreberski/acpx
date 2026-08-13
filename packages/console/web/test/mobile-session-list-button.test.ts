@@ -1,0 +1,36 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import React, { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+
+Object.assign(globalThis, { React });
+
+test("the mobile Sessions control exposes its dialog action without a dangling target", async () => {
+  const { MobileSessionListButton } = await import("../src/components/MobileSessionListButton");
+  const markup = renderToStaticMarkup(
+    createElement(MobileSessionListButton, { open: false, onOpen: () => undefined }),
+  );
+
+  assert.match(markup, /aria-label="Open sessions"/u);
+  assert.doesNotMatch(markup, /aria-controls=/u);
+  assert.match(markup, /aria-haspopup="dialog"/u);
+  assert.match(markup, /aria-expanded="false"/u);
+  // The design's back affordance is icon-only, so the accessible name is the
+  // aria-label rather than visible text.
+  assert.match(markup, /<svg[^>]*aria-hidden="true"/u);
+  assert.doesNotMatch(markup, />\s*Sessions\s*</u);
+});
+
+test("the mobile Sessions control invokes only its drawer-open action", async () => {
+  const { MobileSessionListButton } = await import("../src/components/MobileSessionListButton");
+  let openCount = 0;
+  const element = MobileSessionListButton({
+    open: false,
+    onOpen: () => {
+      openCount += 1;
+    },
+  });
+
+  element.props.onClick();
+  assert.equal(openCount, 1);
+});

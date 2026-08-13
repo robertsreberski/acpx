@@ -10,6 +10,23 @@ Repo: https://github.com/openclaw/acpx
 
 - Docs/readme: rewrite the project front door to the house standard and route detailed CLI guidance to the existing documentation.
 
+- Sessions/embedding: add the public `acpx/sessions` service and append-only
+  session event ledger for exact-record session inventory, durable turn
+  admission, complete transcript paging, provider-session adoption, queue-aware
+  prompts, and pending-request responses.
+
+- Console: add the separately installed `acpx-console` web product for live
+  session transcripts, create/adopt flows, queued prompts, cancellation, and
+  permission or elicitation answers.
+
+- Console/UI: build the workspace on the ACPX Console design system. The session
+  list groups by project rather than turn state and collapses finished work, a
+  blocking permission or elicitation request docks above the composer instead of
+  scrolling away with the transcript, earlier history pages in on scroll while
+  holding the reader's place, and the type scale, touch targets and palette come
+  from the design. Inter now ships with the console as a self-hosted variable
+  font, so the intended weights render under the console's own CSP.
+
 - CLI/effort: add portable `--effort <level>` selection across one-shot, persistent, queued, compare, flow, and embedded runtime paths; apply model before effort, validate against model-specific ACP config options, and persist explicit effort choices.
 
 ### Breaking
@@ -17,6 +34,18 @@ Repo: https://github.com/openclaw/acpx
 - CLI/sessions: persistent prompts now require the exact saved provider session to resume or load; reconnect failures no longer silently replace a conversation with `session/new`. A freshly created, untouched record whose adapter advertises no reuse method may still initialize its first prompt. Use `sessions new` explicitly to start over after any prompt attempt.
 
 ### Fixes
+
+- Sessions/console: hydrate retained pre-ledger transcripts on the first read,
+  including automatic bounded continuation for large histories, without
+  requiring a prompt mutation.
+
+- Sessions/console: bound individual timeline events and transcript pages by
+  serialized bytes, preserving oversized events as explicit chronological
+  truncation markers instead of allowing unbounded storage or response reads.
+
+- Console/workspaces: keep retained sessions visible and controllable after an
+  allowlisted workspace leaf is deleted or renamed, without weakening canonical
+  workspace-root and symlink boundaries.
 
 - Runtime/embedding: settle turn results only after lifecycle persistence and client cleanup attempts finish, including unexpected finalization failures.
 - Codex/turn completion: detect exact context-compaction metadata without a later final answer, report a typed incomplete result and exit `6` across prompt, exec, compare, queue, runtime, and flow paths, reject incompatible warm queue owners before submission, and preserve persistent prompt/control session continuity for an explicit follow-up.

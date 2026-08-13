@@ -8166,14 +8166,16 @@ test("integration: respond --timeout gives up on an owner that cannot answer", a
  *
  * A SIGSTOPped process still has connects completed for it by the kernel, up to
  * the backlog depth — which is why the plain suspended-owner case connects fine
- * and only the reply never comes. Once the backlog is full the kernel refuses
- * instead, and ECONNREFUSED is exactly what the connect retry loop retries. This
- * is the shape a genuinely wedged owner has, and the shape under which a bound
- * armed after the connect is no bound at all.
+ * and only the reply never comes. Once the backlog is full, a transient connect
+ * error (EAGAIN on Linux, ECONNREFUSED on macOS) is exactly what the retry loop
+ * handles. This is the shape a genuinely wedged owner has, and the shape under
+ * which a bound armed after the connect is no bound at all.
  */
 async function holdQueueOwnerBacklog(
   socketPath: string,
-  count = 400,
+  // Node 22's documented default listen backlog is 511. Exceed it even on
+  // hosts that do not clamp the queue to a lower OS limit.
+  count = 600,
 ): Promise<() => Promise<void>> {
   const held: net.Socket[] = [];
   for (let index = 0; index < count; index += 1) {
@@ -8211,10 +8213,15 @@ test("integration: respond --timeout holds its budget when the owner cannot be c
       // rather than degrading into a generic delivery failure.
       assert.equal(timedOut.code, 3, `${timedOut.stdout}${timedOut.stderr}`);
       const payload = JSON.parse(timedOut.stdout.trim()) as {
-        error: { data: { acpxCode: string; detailCode: string } };
+        error: { message: string; data: { acpxCode: string; detailCode: string } };
       };
       assert.equal(payload.error.data.acpxCode, "TIMEOUT");
       assert.equal(payload.error.data.detailCode, "PENDING_REQUEST_ANSWER_TIMEOUT");
+      assert.match(
+        payload.error.message,
+        /was not delivered/,
+        "the saturated backlog must exercise the connect-phase timeout",
+      );
       // The connect retry loop is 40 attempts x 50 ms, so an unbounded connect
       // cannot come back before ~2 s however small the asked-for budget is.
       assert.equal(

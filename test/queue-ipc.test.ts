@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { tryListRequestsOnRunningOwner, tryRespondOnRunningOwner } from "../src/cli/queue/ipc.js";
+import { shouldRetryQueueConnect } from "../src/cli/queue/ipc-transport.js";
+import {
+  tryListPromptQueueOnRunningOwner,
+  tryListRequestsOnRunningOwner,
+  tryRespondOnRunningOwner,
+} from "../src/cli/queue/ipc.js";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { PendingRequestAnswerTimeoutError } from "../src/errors.js";
 import {
   cleanupOwnerArtifacts,
@@ -17,6 +23,15 @@ import {
 type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
+
+test("queue connects retry transient Unix socket errors", () => {
+  for (const code of ["ENOENT", "ECONNREFUSED", "EAGAIN"]) {
+    assert.equal(shouldRetryQueueConnect(Object.assign(new Error(code), { code })), true, code);
+  }
+  for (const code of ["EACCES", "ECONNRESET", "ENAMETOOLONG"]) {
+    assert.equal(shouldRetryQueueConnect(Object.assign(new Error(code), { code })), false, code);
+  }
+});
 
 test("cancelSessionPrompt sends cancel request to active queue owner", async () => {
   await withTempHome(async (homeDir) => {
@@ -54,6 +69,7 @@ test("cancelSessionPrompt sends cancel request to active queue owner", async () 
     try {
       const result = await session.cancelSessionPrompt({ sessionId });
       assert.equal(result.cancelled, true);
+      assert.equal(result.outcome, "active");
       assert.equal(result.sessionId, sessionId);
     } finally {
       await closeServer(server);
@@ -140,6 +156,85 @@ test("tryListRequestsOnRunningOwner parses the parked requests the owner reports
   });
 });
 
+test("tryListPromptQueueOnRunningOwner returns only the owner's exact FIFO snapshot", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "prompt-queue-session";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      ownerGeneration: 78,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 2,
+    });
+    const prompts = [
+      {
+        turnId: "turn-cli",
+        submittedAt: "2026-08-13T10:00:00.000Z",
+        promptText: "CLI prompt",
+      },
+      {
+        turnId: "turn-service",
+        submittedAt: "2026-08-13T10:00:01.000Z",
+        promptText: "Service prompt",
+      },
+    ];
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "list_prompt_queue");
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "list_prompt_queue_result",
+          requestId: request.requestId,
+          ownerGeneration: 78,
+          queueDepth: 3,
+          omittedCount: 1,
+          prompts,
+        })}\n`,
+      );
+      socket.end();
+    });
+    await listenServer(server, socketPath);
+    try {
+      assert.deepEqual(await tryListPromptQueueOnRunningOwner({ sessionId }), {
+        ownerGeneration: 78,
+        queueDepth: 3,
+        omittedCount: 1,
+        prompts,
+      });
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("prompt queue snapshots fail closed for owners predating the read-only verb", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "legacy-prompt-queue-session";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      queueProtocol: 4,
+      queueDepth: 1,
+    });
+    try {
+      assert.equal(await tryListPromptQueueOnRunningOwner({ sessionId }), undefined);
+    } finally {
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("tryRespondOnRunningOwner sends the tagged answer and returns the terminal entry", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "requests-session";
@@ -215,6 +310,7 @@ test("the parked-request client verbs report no owner rather than an empty resul
     // No lease at all: "nothing to ask" must stay distinguishable from "the
     // owner says there is nothing parked".
     assert.equal(await tryListRequestsOnRunningOwner({ sessionId: "never-owned" }), undefined);
+    assert.equal(await tryListPromptQueueOnRunningOwner({ sessionId: "never-owned" }), undefined);
     assert.equal(
       await tryRespondOnRunningOwner({
         sessionId: "never-owned",
@@ -266,6 +362,7 @@ test("an asked-for respond bound covers connecting, not just the reply", async (
         // caller has to be able to tell "I stopped waiting" from "delivery
         // failed". A connect that outruns the budget must not degrade it.
         assert.equal(error instanceof PendingRequestAnswerTimeoutError, true, String(error));
+        assert.equal((error as PendingRequestAnswerTimeoutError).answerOutcome, "not_delivered");
         return true;
       },
     );

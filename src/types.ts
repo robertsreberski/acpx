@@ -208,6 +208,7 @@ export const QUEUE_ERROR_DETAIL_CODES = [
   "QUEUE_OWNER_CLOSED",
   "QUEUE_OWNER_SHUTTING_DOWN",
   "QUEUE_OWNER_OVERLOADED",
+  "QUEUE_PROMPT_CANCELLED",
   "QUEUE_OWNER_GENERATION_MISMATCH",
   "QUEUE_OWNER_PROTOCOL_MISMATCH",
   "QUEUE_OWNER_PARKING_UNSUPPORTED",
@@ -264,6 +265,39 @@ export type SessionEventLog = {
   max_segments: number;
   last_write_at?: string;
   last_write_error?: string | null;
+};
+
+export const SESSION_TIMELINE_SCHEMA = "acpx.session_timeline.v1" as const;
+
+export type SessionTimelineLegacyImportSource = {
+  /** Stable filesystem identity (`device:inode`) so rotations do not duplicate history. */
+  source_identity: string;
+  /** First byte not yet consumed from this compatibility stream. */
+  offset: number;
+  /** True while bounded reads are discarding an over-large malformed line. */
+  discarding_line?: boolean;
+  /** A bounded scan reached EOF with a newline-less fragment to retry if it grows. */
+  trailing_fragment?: boolean;
+};
+
+/** Durable metadata for the lossless, append-only session timeline. */
+export type SessionTimelineMetadata = {
+  schema: typeof SESSION_TIMELINE_SCHEMA;
+  epoch: string;
+  last_seq: number;
+  active_path: string;
+  created_at: string;
+  last_write_at?: string;
+  /** Last authoritative timeline write failure, cleared by the next successful append. */
+  last_write_error?: string | null;
+  /** True when events existed before the lossless timeline was enabled. */
+  legacy_retained: boolean;
+  /** True when compatibility streams were caught up after the last legacy owner disappeared. */
+  legacy_import_complete?: boolean;
+  /** Resumable compatibility-stream cursors, keyed by filesystem identity. */
+  legacy_import_sources?: SessionTimelineLegacyImportSource[];
+  /** True when corruption or truncation made the authoritative history incomplete. */
+  history_incomplete?: boolean;
 };
 
 export type PerfMetricSummary = {
@@ -479,6 +513,8 @@ export type SessionConversation = {
 };
 
 export type SessionAcpxState = {
+  /** Stable registry identity for sessions created through the public sessions service. */
+  agent_id?: string;
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;
@@ -519,6 +555,7 @@ export type SessionRecord = {
   lastSeq: number;
   lastRequestId?: string;
   eventLog: SessionEventLog;
+  timeline?: SessionTimelineMetadata;
   closed?: boolean;
   closedAt?: string;
   pid?: number;

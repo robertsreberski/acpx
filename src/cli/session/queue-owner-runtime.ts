@@ -12,11 +12,11 @@ import {
   sessionOptionsFromRecord,
 } from "../../runtime/engine/session-options.js";
 import { sweepPendingRequests } from "../../session/pending-requests.js";
+import { absolutePath, resolveSessionRecord } from "../../session/persistence.js";
 import {
-  absolutePath,
-  resolveSessionRecord,
-  writeSessionRecord,
-} from "../../session/persistence.js";
+  appendSessionTimelineLifecycleEvent,
+  writeSessionRecordWithLatestTimeline,
+} from "../../session/timeline.js";
 import type { AcpClientOptions, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
@@ -64,11 +64,13 @@ const QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS = 750;
 
 async function runQueueOwnerTask<T>(params: {
   turnController: QueueOwnerTurnController;
-  task: Pick<QueueTask, "close">;
+  task: Pick<QueueTask, "close" | "requestId">;
   run: () => Promise<T>;
 }): Promise<T> {
   try {
-    await params.turnController.beginTurn();
+    // Naming the turn is what lets a later cancel target this exact one rather
+    // than whatever happens to be running after a handoff.
+    await params.turnController.beginTurn(params.task.requestId);
   } catch (error) {
     // runQueuedTask owns close after turn startup. This earlier failure path
     // rejects before runQueuedTask can enter its cleanup boundary.
@@ -89,6 +91,7 @@ async function submitToRunningOwner(
 ): Promise<SessionSendOutcome | undefined> {
   return await trySubmitToRunningOwner({
     sessionId: options.sessionId,
+    turnId: options.turnId,
     message: promptToDisplayText(options.prompt),
     prompt: options.prompt,
     mcpConfigPath: options.mcpConfigPath,
@@ -404,10 +407,19 @@ async function writeQueueOwnerLifecycleSnapshot(
   try {
     const record = await resolveSessionRecord(sessionId);
     applyLifecycleSnapshotToRecord(record, sharedClient.getAgentLifecycleSnapshot());
-    await writeSessionRecord(record);
+    await writeSessionRecordWithLatestTimeline(record);
   } catch {
     // best effort - session may already be cleaned up
   }
+}
+
+async function cancelQueuedTimelineTurn(sessionId: string, turnId: string): Promise<void> {
+  const record = await resolveSessionRecord(sessionId);
+  await appendSessionTimelineLifecycleEvent(
+    record,
+    { type: "turn_cancelled" },
+    { turnId, requestId: turnId },
+  );
 }
 
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -664,13 +676,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     owner = await SessionQueueOwner.start(
       lease,
       {
-        cancelPrompt: async () => {
-          const accepted = await turnController.requestCancel();
+        cancelPrompt: async (targetTurnId?: string) => {
+          const accepted = await turnController.requestCancel(targetTurnId);
           if (!accepted) {
             return false;
           }
           await applyPendingCancel();
           return true;
+        },
+        cancelQueuedPrompt: async (turnId: string) => {
+          await cancelQueuedTimelineTurn(options.sessionId, turnId);
         },
         closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
         setSessionMode: async (modeId: string, timeoutMs?: number) => {
@@ -789,7 +804,10 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
     return queuedToOwner;
   }
 
-  const owner = spawnQueueOwnerProcess(queueOwnerRuntimeOptionsFromSend(options));
+  const owner = spawnQueueOwnerProcess(
+    queueOwnerRuntimeOptionsFromSend(options),
+    options.queueOwnerSpawnArgs,
+  );
   // Stop retaining diagnostics at first IPC accept (not after full turn completion).
   const onQueueAccepted = () => {
     owner.stopStartupCapture();
@@ -827,4 +845,8 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
 
 export type { QueueOwnerRuntimeOptions };
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
-export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal, runQueueOwnerTask };
+export const queueOwnerRuntimeTestInternals = {
+  cancelQueuedTimelineTurn,
+  queueOwnerExitIsFatal,
+  runQueueOwnerTask,
+};

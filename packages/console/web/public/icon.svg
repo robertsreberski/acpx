@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ACPX Console">
+  <!-- The product mark the console already uses: an ink tile whose bottom-left
+       corner is squared off, and the A in the panel colour. -->
+  <path
+    d="M156 0h200a156 156 0 0 1 156 156v200a156 156 0 0 1-156 156H57a57 57 0 0 1-57-57V156A156 156 0 0 1 156 0Z"
+    fill="#18211d"
+  />
+  <path d="M234 106h44l115 300h-63l-24-65H206l-24 65h-63L234 106Zm-8 182h60l-30-82-30 82Z" fill="#f4f7f4" />
+</svg>

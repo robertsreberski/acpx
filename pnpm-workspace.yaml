@@ -1,4 +1,14 @@
+packages:
+  - "packages/*"
+
+linkWorkspacePackages: true
+
 minimumReleaseAge: 2880
+minimumReleaseAgeExclude:
+  - "@assistant-ui/*"
+  - "assistant-cloud"
+  - "assistant-stream"
+  - "safe-content-frame"
 
 overrides:
   brace-expansion: 5.0.8

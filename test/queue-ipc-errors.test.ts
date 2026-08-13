@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import readline from "node:readline";
 import test from "node:test";
 import {
+  isQueueAdmissionOutcomeUnknown,
   MAX_MESSAGE_BUFFER_SIZE,
   SessionQueueOwner,
   releaseQueueOwnerLease,
@@ -11,6 +12,7 @@ import {
   trySetModeOnRunningOwner,
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
@@ -45,6 +47,93 @@ const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
     // no-op
   },
 };
+
+test("queue admission ambiguity distinguishes transport loss from explicit rejection", () => {
+  assert.equal(
+    isQueueAdmissionOutcomeUnknown(
+      new QueueConnectionError("disconnected", {
+        detailCode: "QUEUE_DISCONNECTED_BEFORE_ACK",
+        origin: "queue",
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    isQueueAdmissionOutcomeUnknown(
+      new QueueConnectionError("overloaded", {
+        detailCode: "QUEUE_OWNER_OVERLOADED",
+        origin: "queue",
+      }),
+    ),
+    false,
+  );
+  assert.equal(isQueueAdmissionOutcomeUnknown(new Error("not a queue error")), false);
+});
+
+test("an acknowledged prompt whose owner generation disappears is an ambiguous admission", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "ambiguous-owner-generation";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      ownerGeneration: 71,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      parking: true,
+      parkingMaxAgeMs: 86_400_000,
+    });
+
+    let acceptedRequests = 0;
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "submit_prompt");
+      acceptedRequests += 1;
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+          ownerGeneration: 71,
+        })}\n`,
+      );
+      // The owner accepted the exact turn but died before returning a result.
+      // The client must not classify this as a definitive retryable rejection.
+      socket.end();
+    });
+    await listenServer(server, socketPath);
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            turnId: "turn-ambiguous",
+            message: "hello",
+            permissionMode: "approve-reads",
+            permissionPolicy: { defaultAction: "defer" },
+            defer: true,
+            deferMaxAgeMs: 86_400_000,
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert.equal(
+            (error as { detailCode?: string }).detailCode,
+            "QUEUE_DISCONNECTED_BEFORE_COMPLETION",
+          );
+          assert.equal(isQueueAdmissionOutcomeUnknown(error), true);
+          return true;
+        },
+      );
+      assert.equal(acceptedRequests, 1);
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
 
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
@@ -364,8 +453,11 @@ test("trySubmitToRunningOwner rejects oversized queue messages", async () => {
             waitForCompletion: true,
           }),
         (error: unknown) => {
-          assert(error instanceof Error);
-          assert.match(error.message, /Message buffer exceeded/);
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE");
+          assert.equal(error.origin, "queue");
+          assert.equal(error.retryable, true);
+          assert.equal(isQueueAdmissionOutcomeUnknown(error), true);
           return true;
         },
       );

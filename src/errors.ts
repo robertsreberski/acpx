@@ -245,7 +245,13 @@ export class PendingRequestOwnerGoneError extends AcpxOperationalError {
  * answer could not be delivered" — the answer may still be applied.
  */
 export class PendingRequestAnswerTimeoutError extends AcpxOperationalError {
-  constructor(message: string, options?: AcpxErrorOptions) {
+  readonly answerOutcome: "not_delivered" | "unknown";
+
+  constructor(
+    message: string,
+    answerOutcome: "not_delivered" | "unknown",
+    options?: AcpxErrorOptions,
+  ) {
     super(message, {
       outputCode: "TIMEOUT",
       detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT",
@@ -253,6 +259,7 @@ export class PendingRequestAnswerTimeoutError extends AcpxOperationalError {
       retryable: true,
       ...options,
     });
+    this.answerOutcome = answerOutcome;
   }
 }
 

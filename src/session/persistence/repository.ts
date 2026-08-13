@@ -7,6 +7,7 @@ import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionRecord } from "../../types.js";
 import { deletePendingRequestsForSession } from "../pending-requests.js";
+import { deleteSessionTimelineWhileLocked, withSessionTimelineLock } from "../timeline.js";
 import { createAtomicWriteTempPath } from "./atomic-write.js";
 import {
   loadOrRebuildSessionIndex,
@@ -64,6 +65,59 @@ async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
     return await loadOrRebuildSessionIndex(sessionBaseDir());
   });
   return index.entries;
+}
+
+async function isWithinWorkspaceRoots(
+  cwd: string,
+  canonicalWorkspaceRoots: readonly string[],
+): Promise<boolean> {
+  let candidate: string;
+  try {
+    candidate = await fs.realpath(absolutePath(cwd));
+  } catch {
+    return false;
+  }
+  return canonicalWorkspaceRoots.some((root) => isWithinBoundary(root, candidate));
+}
+
+async function canonicalWorkspaceRoots(workspaceRoots: readonly string[]): Promise<string[]> {
+  const roots = await Promise.all(
+    workspaceRoots.map(async (root) => {
+      try {
+        return await fs.realpath(absolutePath(root));
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return roots.filter((root): root is string => root !== undefined);
+}
+
+/**
+ * Materialize only open records relevant to a live subscription. The session
+ * index is the inventory boundary, so closed history and records outside the
+ * embedding application's workspace roots are never re-read by its fast poll.
+ */
+export async function listOpenSessionsForSubscription(
+  workspaceRoots?: readonly string[],
+): Promise<SessionRecord[]> {
+  const openEntries = (await loadSessionIndexEntries()).filter((entry) => !entry.closed);
+  const roots =
+    workspaceRoots && workspaceRoots.length > 0
+      ? await canonicalWorkspaceRoots(workspaceRoots)
+      : undefined;
+  const allowedWorkspaces = roots
+    ? await Promise.all(
+        openEntries.map(async (entry) => await isWithinWorkspaceRoots(entry.cwd, roots)),
+      )
+    : undefined;
+  const entries = !allowedWorkspaces
+    ? openEntries
+    : openEntries.filter((_, index) => allowedWorkspaces[index]);
+  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  return records
+    .filter((entry): entry is SessionRecord => Boolean(entry))
+    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
 function matchesSessionEntry(
@@ -413,17 +467,24 @@ async function pruneSessionFiles(
   dirEntries: string[],
   includeHistory: boolean,
 ): Promise<number> {
-  const safeId = encodeURIComponent(record.acpxRecordId);
-  let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
-  if (includeHistory) {
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
-      bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
+  return await withSessionTimelineLock(record.acpxRecordId, async () => {
+    const safeId = encodeURIComponent(record.acpxRecordId);
+    let bytesFreed = 0;
+    if (includeHistory) {
+      for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+        bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
+      }
+      bytesFreed += await deleteSessionTimelineWhileLocked(record.acpxRecordId);
     }
-  }
-  // Parked requests belong to the record; leaving them would strand entries
-  // nothing can ever answer.
-  await deletePendingRequestsForSession(record.acpxRecordId).catch(() => undefined);
-  return bytesFreed;
+    // Parked requests belong to the record; leaving them would strand entries
+    // nothing can ever answer.
+    await deletePendingRequestsForSession(record.acpxRecordId).catch(() => undefined);
+    // The primary record is the existence boundary and is deleted last. A
+    // transcript read that waited behind this prune therefore fails closed
+    // instead of checkpointing a stale record and resurrecting the session.
+    bytesFreed += await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
+    return bytesFreed;
+  });
 }
 
 async function unlinkCountingBytes(filePath: string): Promise<number> {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -40,6 +40,7 @@ type ParsedCommand = {
 
 type MockAgentOptions = {
   hangOnNewSession: boolean;
+  fixedNewSessionId?: string;
   newSessionMeta?: Record<string, string>;
   loadSessionMeta?: Record<string, string>;
   resumeSessionMeta?: Record<string, string>;
@@ -53,6 +54,7 @@ type MockAgentOptions = {
   resumeSessionNotFound: boolean;
   loadSessionFailsOnEmpty: boolean;
   setSessionModeFails: boolean;
+  setSessionModeFailsOnceMarker?: string;
   setSessionModeInvalidParams: boolean;
   setSessionConfigInvalidParams: boolean;
   setSessionModelFails: boolean;
@@ -414,6 +416,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
   let setSessionModeFails = false;
+  let setSessionModeFailsOnceMarker: string | undefined;
   let setSessionModeInvalidParams = false;
   let setSessionConfigInvalidParams = false;
   let setSessionModelFails = false;
@@ -434,6 +437,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let closeDelayMs = 0;
   let cancelDelayMs = 0;
   let hangOnNewSession = false;
+  let fixedNewSessionId: string | undefined;
   let pidFile: string | undefined;
   let callLog: string | undefined;
 
@@ -442,6 +446,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--supports-load-session") {
       supportsLoadSession = true;
+      continue;
+    }
+
+    if (token === "--fixed-new-session-id") {
+      fixedNewSessionId = parseOptionValue(argv, index + 1, token);
+      index += 1;
       continue;
     }
 
@@ -470,6 +480,15 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--set-session-mode-fails") {
       setSessionModeFails = true;
+      continue;
+    }
+
+    if (token === "--set-session-mode-fails-once") {
+      setSessionModeFailsOnceMarker = argv[index + 1];
+      if (!setSessionModeFailsOnceMarker) {
+        throw new Error("--set-session-mode-fails-once requires a marker path");
+      }
+      index += 1;
       continue;
     }
 
@@ -652,6 +671,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
   return {
     hangOnNewSession,
+    fixedNewSessionId,
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
     loadSessionMeta: Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
     resumeSessionMeta:
@@ -666,6 +686,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     resumeSessionNotFound,
     loadSessionFailsOnEmpty,
     setSessionModeFails,
+    setSessionModeFailsOnceMarker,
     setSessionModeInvalidParams,
     setSessionConfigInvalidParams,
     setSessionModelFails,
@@ -889,11 +910,12 @@ class MockAgent implements Agent {
   }
 
   async newSession(): Promise<NewSessionResponse> {
+    this.logCall({ method: "session/new:received" });
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
-    const sessionId = randomUUID();
+    const sessionId = this.options.fixedNewSessionId ?? randomUUID();
     this.sessions.set(sessionId, createSessionState(false));
     this.logCall({ method: "session/new", sessionId });
 
@@ -1204,6 +1226,13 @@ class MockAgent implements Agent {
     }
     if (this.options.setSessionModeFails) {
       throw new Error("setSessionMode failed");
+    }
+    if (
+      this.options.setSessionModeFailsOnceMarker &&
+      !existsSync(this.options.setSessionModeFailsOnceMarker)
+    ) {
+      writeFileSync(this.options.setSessionModeFailsOnceMarker, "failed\n", "utf8");
+      throw new Error("setSessionMode failed once");
     }
     session.modeId = params.modeId;
     return {};

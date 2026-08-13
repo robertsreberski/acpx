@@ -4,9 +4,21 @@ on:
   push:
     tags:
       - "v*.*.*"
+      - "console-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
+      bootstrap_console:
+        description: Use the one-time token for the first acpx-console publication
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.ref }}
+  group: release-${{ github.workflow }}
   cancel-in-progress: false
 
 env:
@@ -17,9 +29,7 @@ jobs:
   release:
     # DO NOT change this job back to a self-hosted runner.
     # npm trusted publishing + provenance for GitHub Actions releases
-    # requires a GitHub-hosted runner, and publishing fails on self-hosted
-    # environments with:
-    # "Unsupported GitHub Actions runner environment: self-hosted".
+    # requires a GitHub-hosted runner.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,6 +38,31 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Validate release tag provenance before executing repository code
+        id: release_source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" =~ ^console-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            BASE_BRANCH=fork-main
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$ ]]; then
+            BASE_BRANCH=fork-main
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            BASE_BRANCH=main
+          else
+            echo "Release tag ${RELEASE_TAG} has an unsupported shape." >&2
+            exit 1
+          fi
+          RELEASE_SHA=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")
+          git fetch --no-tags origin "${BASE_BRANCH}"
+          git merge-base --is-ancestor "${RELEASE_SHA}" "origin/${BASE_BRANCH}" || {
+            echo "Tagged commit ${RELEASE_SHA} is not contained in origin/${BASE_BRANCH}." >&2
+            exit 1
+          }
+          echo "base_branch=${BASE_BRANCH}" >> "${GITHUB_OUTPUT}"
 
       - uses: pnpm/action-setup@v6.0.9
         with:
@@ -38,122 +73,176 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           check-latest: true
           cache: pnpm
+          registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Validate package metadata for trusted publishing
-        run: |
-          node - <<'NODE'
-          const { readFileSync } = require("node:fs");
-
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
-          const expectedRepoUrl = "https://github.com/openclaw/acpx";
-
-          const normalizeRepoUrl = (value) =>
-            String(value ?? "")
-              .trim()
-              .replace(/^git\+/, "")
-              .replace(/\.git$/i, "")
-              .replace(/\/+$/, "");
-
-          const actualRepoUrl = normalizeRepoUrl(pkg?.repository?.url);
-          const expectedRepoUrlNormalized = normalizeRepoUrl(expectedRepoUrl);
-
-          const errors = [];
-          if (actualRepoUrl !== expectedRepoUrlNormalized) {
-            errors.push(
-              `package.json repository.url must resolve to ${expectedRepoUrlNormalized}; found ${actualRepoUrl || "<missing>"}`
-            );
-          }
-          if ((pkg?.author ?? "") !== expectedAuthor) {
-            errors.push(
-              `package.json author must be exactly "${expectedAuthor}"; found "${pkg?.author ?? ""}"`
-            );
-          }
-
-          if (errors.length > 0) {
-            for (const err of errors) {
-              console.error(err);
-            }
-            process.exit(1);
-          }
-
-          console.log("Package metadata validated.");
-          NODE
-
-      - name: Validate release tag
+      - name: Resolve and validate release plan
+        id: release_plan
         env:
-          RELEASE_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          TRUSTED_BASE_BRANCH: ${{ steps.release_source.outputs.base_branch }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main --depth=1
-
-          node - <<'NODE'
-          const { execFileSync } = require("node:child_process");
-          const { readFileSync } = require("node:fs");
-
-          const releaseTag = process.env.RELEASE_TAG ?? "";
-          const releaseSha = process.env.RELEASE_SHA ?? "";
-          const semverTag = /^v\d+\.\d+\.\d+$/;
-
-          if (!semverTag.test(releaseTag)) {
-            console.error(
-              `Release tags must match vX.Y.Z; received ${releaseTag || "<missing>"}.`
-            );
-            process.exit(1);
-          }
-
-          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-          const expectedTag = `v${pkg.version}`;
-
-          if (releaseTag !== expectedTag) {
-            console.error(
-              `Release tag ${releaseTag} does not match package.json version ${pkg.version}; expected ${expectedTag}.`
-            );
-            process.exit(1);
-          }
-
-          try {
-            execFileSync(
-              "git",
-              ["merge-base", "--is-ancestor", releaseSha, "origin/main"],
-              { stdio: "ignore" }
-            );
-          } catch {
-            console.error(
-              `Tagged commit ${releaseSha} is not contained in origin/main.`
-            );
-            process.exit(1);
-          }
-
-          console.log(
-            `Release tag ${releaseTag} matches package.json and points to a commit on origin/main.`
-          );
-          NODE
-
-      - name: Ensure version is not already published
-        run: |
-          set -euo pipefail
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          error_log="$(mktemp)"
-
-          if npm view "acpx@${PACKAGE_VERSION}" version >/dev/null 2>"${error_log}"; then
-            echo "acpx@$PACKAGE_VERSION is already published on npm."
+          pnpm exec tsx scripts/release-plan.ts "${RELEASE_TAG}" "${GITHUB_OUTPUT}"
+          BASE_BRANCH=$(grep '^base_branch=' "${GITHUB_OUTPUT}" | cut -d= -f2-)
+          if [ "${BASE_BRANCH}" != "${TRUSTED_BASE_BRANCH}" ]; then
+            echo "Release plan selected ${BASE_BRANCH}, but provenance was verified against ${TRUSTED_BASE_BRANCH}." >&2
             exit 1
           fi
 
+      - name: Resolve console authentication mode
+        id: console_auth
+        if: steps.release_plan.outputs.publish_console == 'true'
+        env:
+          BOOTSTRAP_CONSOLE: ${{ inputs.bootstrap_console || 'false' }}
+        run: |
+          set -euo pipefail
+          error_log="$(mktemp)"
+          if npm view acpx-console version >/dev/null 2>"${error_log}"; then
+            PACKAGE_EXISTS=true
+          else
+            if ! grep -Eq "E404|404 Not Found" "${error_log}"; then
+              cat "${error_log}" >&2
+              exit 1
+            fi
+            PACKAGE_EXISTS=false
+          fi
+          pnpm exec tsx scripts/release-plan.ts \
+            --console-auth "${PACKAGE_EXISTS}" "${BOOTSTRAP_CONSOLE}" "${GITHUB_OUTPUT}"
+
+      - name: Validate root package metadata
+        if: steps.release_plan.outputs.publish_root == 'true'
+        run: |
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
+          const expectedRepoUrl = "https://github.com/robertsreberski/acpx";
+          const normalize = (value) => String(value ?? "").trim()
+            .replace(/^git\+/, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+          if (pkg.author !== expectedAuthor || normalize(pkg.repository?.url) !== expectedRepoUrl) {
+            throw new Error("acpx package metadata does not match trusted publishing ownership");
+          }
+          NODE
+
+      - name: Validate console package metadata
+        if: steps.release_plan.outputs.publish_console == 'true'
+        run: |
+          node - <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const pkg = JSON.parse(readFileSync("packages/console/package.json", "utf8"));
+          const expectedAuthor = "OpenClaw Team <dev@openclaw.ai>";
+          const expectedRepoUrl = "https://github.com/robertsreberski/acpx";
+          const normalize = (value) => String(value ?? "").trim()
+            .replace(/^git\+/, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+          if (
+            pkg.author !== expectedAuthor ||
+            normalize(pkg.repository?.url) !== expectedRepoUrl ||
+            pkg.repository?.directory !== "packages/console"
+          ) {
+            throw new Error("acpx-console package metadata does not match trusted publishing ownership");
+          }
+          NODE
+
+      - name: Ensure selected version is not already published
+        env:
+          PACKAGE_NAME: ${{ steps.release_plan.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.release_plan.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          error_log="$(mktemp)"
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>"${error_log}"; then
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} is already published on npm." >&2
+            exit 1
+          fi
           if ! grep -Eq "E404|404 Not Found" "${error_log}"; then
             cat "${error_log}" >&2
             exit 1
           fi
 
-          echo "Publishing acpx@$PACKAGE_VERSION"
+      - name: Validate root package
+        if: steps.release_plan.outputs.publish_root == 'true'
+        run: |
+          pnpm run lint
+          pnpm run typecheck
+          pnpm run build
 
-      - run: pnpm run lint
-      - run: pnpm run typecheck
-      - run: pnpm run build
-
-      - name: Publish
+      - name: Publish stable acpx
+        if: steps.release_plan.outputs.release_kind == 'stable'
         run: npm publish --access public --provenance
+
+      - name: Publish fork acpx without changing latest
+        if: steps.release_plan.outputs.release_kind == 'fork'
+        run: npm publish --access public --provenance --tag fork
+
+      - name: Verify acpx on npm
+        if: steps.release_plan.outputs.publish_root == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.release_plan.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            PUBLISHED_VERSION=$(npm view "acpx@${PACKAGE_VERSION}" version 2>/dev/null || true)
+            if [ "${PUBLISHED_VERSION}" = "${PACKAGE_VERSION}" ]; then
+              echo "Verified acpx@$PACKAGE_VERSION on npm."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "acpx@$PACKAGE_VERSION was not registry-visible after publish." >&2
+          exit 1
+
+      - name: Verify console's exact acpx dependency on npm
+        if: steps.release_plan.outputs.publish_console == 'true'
+        run: |
+          set -euo pipefail
+          ACPX_VERSION=$(node -p "require('./packages/console/package.json').dependencies.acpx")
+          PUBLISHED_VERSION=$(npm view "acpx@${ACPX_VERSION}" version)
+          if [ "${PUBLISHED_VERSION}" != "${ACPX_VERSION}" ]; then
+            echo "Required acpx@$ACPX_VERSION is not registry-visible." >&2
+            exit 1
+          fi
+
+      - name: Validate and build acpx-console
+        if: steps.release_plan.outputs.publish_console == 'true'
+        run: pnpm --filter acpx-console check
+
+      - name: Smoke installed acpx-console with registry acpx
+        if: steps.release_plan.outputs.publish_console == 'true'
+        run: pnpm run smoke:console:package -- --registry-acpx
+
+      - name: Publish acpx-console with trusted publishing
+        if: steps.release_plan.outputs.publish_console == 'true' && steps.console_auth.outputs.bootstrap == 'false'
+        working-directory: packages/console
+        run: npm publish --access public --provenance
+
+      - name: Bootstrap the first acpx-console release
+        if: steps.release_plan.outputs.publish_console == 'true' && steps.console_auth.outputs.bootstrap == 'true'
+        working-directory: packages/console
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is required only to bootstrap the first acpx-console release." >&2
+            exit 1
+          fi
+          npm publish --access public --provenance
+
+      - name: Verify acpx-console on npm
+        if: steps.release_plan.outputs.publish_console == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.release_plan.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            PUBLISHED_VERSION=$(npm view "acpx-console@${PACKAGE_VERSION}" version 2>/dev/null || true)
+            if [ "${PUBLISHED_VERSION}" = "${PACKAGE_VERSION}" ]; then
+              echo "Verified acpx-console@$PACKAGE_VERSION on npm."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "acpx-console@$PACKAGE_VERSION was not registry-visible after publish." >&2
+          exit 1
