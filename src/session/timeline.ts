@@ -829,9 +829,9 @@ export class SessionTimelineWriter {
       // compatibility twin, causing that twin to be imported a second time.
       const legacyOwnerCanAppend = (await options.legacyOwnerCanAppend?.()) === true;
       if (
-        record.timeline?.legacy_import_complete === true &&
         !legacyOwnerCanAppend &&
-        (record.timeline !== undefined || record.lastSeq === 0)
+        (record.timeline?.legacy_import_complete === true ||
+          (!record.timeline && record.lastSeq === 0))
       ) {
         return false;
       }
