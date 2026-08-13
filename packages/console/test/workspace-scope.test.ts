@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -22,6 +23,8 @@ async function fixture() {
     writeFile(join(web, "index.html"), "ok"),
   ]);
   const canonicalProject = await realpath(project);
+  const configuredWorkspaceRoots = [workspaceRoot];
+  const configuredAllowedHosts = ["127.0.0.1"];
   const service = new MockSessionService(project);
   const outsideSession: ConsoleSession = {
     ...baseSession,
@@ -39,8 +42,8 @@ async function fixture() {
       host: "127.0.0.1",
       port: 0,
       trustNetwork: false,
-      allowedHosts: ["127.0.0.1"],
-      workspaceRoots: [await realpath(workspaceRoot)],
+      allowedHosts: configuredAllowedHosts,
+      workspaceRoots: configuredWorkspaceRoots,
       stateDir: join(root, "state"),
       staticDir: web,
     },
@@ -49,6 +52,8 @@ async function fixture() {
   });
   return {
     escape,
+    configuredWorkspaceRoots,
+    configuredAllowedHosts,
     outside,
     project: canonicalProject,
     projectAlias,
@@ -77,6 +82,26 @@ function mutationHeaders(credentials: { cookie: string; csrfToken: string }, key
     "X-CSRF-Token": credentials.csrfToken,
     "Idempotency-Key": key,
   };
+}
+
+async function getWithHost(origin: string, host: string): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const target = new URL(origin);
+    const outgoing = request(
+      {
+        host: target.hostname,
+        port: Number(target.port),
+        path: "/healthz",
+        headers: { Host: host },
+      },
+      (response) => {
+        response.resume();
+        response.once("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    outgoing.once("error", reject);
+    outgoing.end();
+  });
 }
 
 test("configured roots scope session inventories and every retained-session operation", async () => {
@@ -169,6 +194,66 @@ test("configured roots scope session inventories and every retained-session oper
       assert.equal(response.status, 404, mutation.path);
     }
     assert.deepEqual(invoked, []);
+  } finally {
+    await running.close();
+  }
+});
+
+test("server startup canonicalizes a configured symlink root exactly once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-scope-root-alias-"));
+  const workspaceRoot = join(root, "allowed");
+  const workspaceAlias = join(root, "allowed-alias");
+  const project = join(workspaceRoot, "project");
+  const outside = join(root, "outside");
+  const web = join(root, "web");
+  await Promise.all([mkdir(project, { recursive: true }), mkdir(outside), mkdir(web)]);
+  await writeFile(join(web, "index.html"), "ok");
+  await symlink(workspaceRoot, workspaceAlias, "dir");
+  const service = new MockSessionService(project);
+  const running = await startAcpxConsoleServer({
+    config: {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [workspaceAlias],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  try {
+    const credentials = await auth(running.origin);
+    assert.deepEqual(
+      credentials.sessions.map((session) => session.acpxRecordId),
+      ["record-1"],
+    );
+
+    await rm(workspaceAlias);
+    await symlink(outside, workspaceAlias, "dir");
+    const detail = await fetch(`${running.origin}/api/v1/sessions/record-1`);
+    assert.equal(detail.status, 200);
+  } finally {
+    await running.close();
+  }
+});
+
+test("server startup owns its workspace-root snapshot", async () => {
+  const { configuredAllowedHosts, configuredWorkspaceRoots, outside, running } = await fixture();
+
+  try {
+    configuredWorkspaceRoots.splice(0, configuredWorkspaceRoots.length, outside);
+    configuredAllowedHosts.splice(0, configuredAllowedHosts.length, "evil.example.test");
+    const credentials = await auth(running.origin);
+    assert.deepEqual(
+      credentials.sessions.map((session) => session.acpxRecordId),
+      ["record-1"],
+    );
+    const outsideDetail = await fetch(`${running.origin}/api/v1/sessions/outside-record`);
+    assert.equal(outsideDetail.status, 404);
+    assert.equal(await getWithHost(running.origin, "evil.example.test"), 403);
   } finally {
     await running.close();
   }

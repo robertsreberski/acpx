@@ -639,7 +639,19 @@ export async function startAcpxConsoleServer(
   options: AcpxConsoleServerOptions,
 ): Promise<RunningAcpxConsoleServer> {
   const logger = options.logger ?? console;
-  const selectedDisplayHost = consoleDisplayHost(options.config);
+  const workspaceRoots = await Promise.all(
+    options.config.workspaceRoots.map(async (root) => await realpath(root)),
+  );
+  Object.freeze(workspaceRoots);
+  const allowedHosts = [...options.config.allowedHosts];
+  Object.freeze(allowedHosts);
+  const config: ResolvedConsoleConfig = {
+    ...options.config,
+    workspaceRoots,
+    allowedHosts,
+  };
+  Object.freeze(config);
+  const selectedDisplayHost = consoleDisplayHost(config);
   const csrfToken = randomBytes(32).toString("base64url");
   const mutationRateLimiter = new MutationRateLimiter(
     options.mutationRateLimit?.maxRequests,
@@ -673,7 +685,7 @@ export async function startAcpxConsoleServer(
       .then(async () => {
         if (event.acpxRecordId) {
           try {
-            await requireAllowedSession(options.service, options.config, event.acpxRecordId);
+            await requireAllowedSession(options.service, config, event.acpxRecordId);
           } catch (error) {
             if (error instanceof HttpError && error.code === "SESSION_NOT_FOUND") {
               return;
@@ -744,9 +756,9 @@ export async function startAcpxConsoleServer(
   const server = createServer(async (request, response) => {
     applySecurityHeaders(response);
     try {
-      assertAllowedHost(request, options.config.allowedHosts);
+      assertAllowedHost(request, config.allowedHosts);
       const handled = await handleApi(request, response, {
-        config: options.config,
+        config,
         service: options.service,
         csrfToken,
         mutationRateLimiter,
@@ -762,12 +774,7 @@ export async function startAcpxConsoleServer(
             "Only GET and HEAD are allowed for web assets",
           );
         }
-        await serveStatic(
-          url.pathname,
-          request.method ?? "GET",
-          response,
-          options.config.staticDir,
-        );
+        await serveStatic(url.pathname, request.method ?? "GET", response, config.staticDir);
       }
     } catch (error) {
       if (response.headersSent) {
@@ -795,7 +802,7 @@ export async function startAcpxConsoleServer(
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(options.config.port, options.config.host, () => {
+      server.listen(config.port, config.host, () => {
         server.off("error", reject);
         resolve();
       });
@@ -813,13 +820,13 @@ export async function startAcpxConsoleServer(
     throw error;
   }
   const address = server.address();
-  const port = typeof address === "object" && address ? address.port : options.config.port;
+  const port = typeof address === "object" && address ? address.port : config.port;
   const displayHost = selectedDisplayHost.includes(":")
     ? `[${selectedDisplayHost}]`
     : selectedDisplayHost;
   const origin = `http://${displayHost}:${port}`;
   logger.info(`ACPX Console listening at ${origin}`);
-  if (options.config.trustNetwork && !options.config.host.startsWith("127.")) {
+  if (config.trustNetwork && !config.host.startsWith("127.")) {
     logger.warn(
       "Network trust enabled: every browser that can reach this address has session-control authority.",
     );
