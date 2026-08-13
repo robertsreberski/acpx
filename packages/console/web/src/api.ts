@@ -158,6 +158,7 @@ const persistedMutationKey = (value: unknown): PersistedMutationKey => {
 export class ConsoleApi {
   #csrfToken: string | undefined;
   readonly #ambiguousMutationKeys = new Map<string, PersistedMutationKey>();
+  readonly #inFlightMutations = new Map<string, Promise<unknown>>();
   readonly #storage: MutationRetryStorage | undefined;
   readonly #now: () => number;
   #retryStateError: MutationRetryStateError | undefined;
@@ -187,21 +188,15 @@ export class ConsoleApi {
       if (record.schema !== AMBIGUOUS_MUTATION_SCHEMA || !Array.isArray(record.entries)) {
         throw new Error("Mutation retry state has an unsupported schema.");
       }
-      const now = this.#now();
-      const activeEntries = record.entries.map(persistedMutationKey).filter((entry) => {
-        return entry.expires_at > now;
-      });
-      if (activeEntries.length > MAX_AMBIGUOUS_MUTATIONS) {
+      const entries = record.entries.map(persistedMutationKey);
+      if (entries.length > MAX_AMBIGUOUS_MUTATIONS) {
         throw new MutationRetryStateError("CAPACITY_REACHED");
       }
-      for (const entry of activeEntries) {
+      for (const entry of entries) {
         if (this.#ambiguousMutationKeys.has(entry.fingerprint)) {
           throw new Error("Mutation retry state contains a duplicate fingerprint.");
         }
         this.#ambiguousMutationKeys.set(entry.fingerprint, entry);
-      }
-      if (activeEntries.length !== record.entries.length) {
-        this.#persistMutationKeys(this.#ambiguousMutationKeys);
       }
     } catch (error) {
       this.#ambiguousMutationKeys.clear();
@@ -235,26 +230,14 @@ export class ConsoleApi {
     }
   }
 
-  #pruneExpiredMutationKeys(): void {
+  #assertRetryStateAvailable(): void {
     if (this.#retryStateError) {
       throw this.#retryStateError;
-    }
-    const now = this.#now();
-    const activeEntries = new Map(
-      [...this.#ambiguousMutationKeys].filter(([, entry]) => entry.expires_at > now),
-    );
-    if (activeEntries.size === this.#ambiguousMutationKeys.size) {
-      return;
-    }
-    this.#persistMutationKeys(activeEntries);
-    this.#ambiguousMutationKeys.clear();
-    for (const [fingerprint, entry] of activeEntries) {
-      this.#ambiguousMutationKeys.set(fingerprint, entry);
     }
   }
 
   #reserveMutationKey(fingerprint: string, requestedKey?: string): string {
-    this.#pruneExpiredMutationKeys();
+    this.#assertRetryStateAvailable();
     const existing = this.#ambiguousMutationKeys.get(fingerprint);
     if (existing) {
       return existing.key;
@@ -300,9 +283,45 @@ export class ConsoleApi {
     method: "DELETE" | "PATCH" | "POST" | "PUT" = "POST",
     key?: string,
     allowCsrfRefresh = true,
+    decode?: (body: unknown) => T,
   ): Promise<T> {
     const serializedBody = JSON.stringify(body);
-    const fingerprint = await mutationFingerprint(method, path, serializedBody);
+    const inFlightIdentity = `${method}\n${path}\n${serializedBody ?? ""}`;
+    const inFlight = this.#inFlightMutations.get(inFlightIdentity);
+    if (inFlight) {
+      return (await inFlight) as T;
+    }
+    const mutation = mutationFingerprint(method, path, serializedBody).then(
+      async (fingerprint) =>
+        await this.#performMutation(
+          path,
+          serializedBody,
+          method,
+          fingerprint,
+          key,
+          allowCsrfRefresh,
+          decode,
+        ),
+    );
+    this.#inFlightMutations.set(inFlightIdentity, mutation);
+    try {
+      return await mutation;
+    } finally {
+      if (this.#inFlightMutations.get(inFlightIdentity) === mutation) {
+        this.#inFlightMutations.delete(inFlightIdentity);
+      }
+    }
+  }
+
+  async #performMutation<T>(
+    path: string,
+    serializedBody: string | undefined,
+    method: "DELETE" | "PATCH" | "POST" | "PUT",
+    fingerprint: string,
+    key: string | undefined,
+    allowCsrfRefresh: boolean,
+    decode: ((body: unknown) => T) | undefined,
+  ): Promise<T> {
     const requestKey = this.#reserveMutationKey(fingerprint, key);
     const headers: Record<string, string> = {
       Accept: "application/json",
@@ -340,10 +359,19 @@ export class ConsoleApi {
         throw error;
       }
       this.setCsrfToken(snapshot.csrfToken);
-      return await this.mutate<T>(path, body, method, requestKey, false);
+      return await this.#performMutation(
+        path,
+        serializedBody,
+        method,
+        fingerprint,
+        requestKey,
+        false,
+        decode,
+      );
     }
     try {
-      const result = await json<T>(response);
+      const body = await json<unknown>(response);
+      const result = decode ? decode(body) : (body as T);
       this.#releaseMutationKey(fingerprint, requestKey);
       return result;
     } catch (error) {
@@ -409,10 +437,17 @@ export class ConsoleApi {
 
   createSession(input: CreateSessionInput): Promise<SessionDetail> {
     const { permissionPolicy: policy, ...fields } = input;
-    return this.mutate<{ readonly session: WireSession }>("/api/v1/sessions", {
-      ...fields,
-      policy,
-    }).then(({ session }) => sessionDetail(session));
+    return this.mutate(
+      "/api/v1/sessions",
+      {
+        ...fields,
+        policy,
+      },
+      "POST",
+      undefined,
+      true,
+      decodeSessionMutation(input),
+    );
   }
 
   providerSessions(
@@ -452,44 +487,57 @@ export class ConsoleApi {
   }
 
   adoptSession(input: AdoptSessionInput): Promise<SessionDetail> {
-    return this.mutate<{ readonly session: WireSession }>("/api/v1/sessions/adopt", input).then(
-      ({ session }) => sessionDetail(session),
+    return this.mutate(
+      "/api/v1/sessions/adopt",
+      input,
+      "POST",
+      undefined,
+      true,
+      decodeSessionMutation(input),
     );
   }
 
   sendPrompt(sessionId: string, text: string): Promise<MutationReceipt> {
-    return this.mutate<WireMutationReceipt>(
+    return this.mutate(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns`,
       { text },
-    ).then((receipt) => ({
-      accepted: true,
-      sessionId,
-      turnId: receipt.turnId,
-      state: receipt.admission,
-    }));
+      "POST",
+      undefined,
+      true,
+      decodePromptMutation(sessionId),
+    );
   }
 
   cancelTurn(sessionId: string, turnId: string): Promise<void> {
     return this.mutate(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/cancel`,
       {},
+      "POST",
+      undefined,
+      true,
+      decodeCancelMutation(turnId),
     );
   }
 
   closeSession(sessionId: string): Promise<CloseSessionResult> {
-    return this.mutate<{ readonly close: WireCloseSessionResult }>(
+    return this.mutate(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/close`,
       {},
-    ).then(({ close }) => ({
-      ...close,
-      session: sessionDetail(close.session),
-    }));
+      "POST",
+      undefined,
+      true,
+      decodeCloseMutation(sessionId),
+    );
   }
 
   answerInteraction(sessionId: string, requestId: string, answer: unknown): Promise<void> {
     return this.mutate(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/pending/${encodeURIComponent(requestId)}/responses`,
       { response: answer },
+      "POST",
+      undefined,
+      true,
+      decodePendingMutation(sessionId, requestId),
     );
   }
 }
@@ -574,11 +622,260 @@ interface WireMutationReceipt {
   readonly admission: "started" | "queued" | "unknown";
 }
 
-interface WireCloseSessionResult {
-  readonly session: WireSession;
-  readonly localClose: "closed";
-  readonly providerClose: CloseSessionResult["providerClose"];
-}
+const mutationRecord = (value: unknown, name: string): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${name} response is not an object.`);
+  }
+  return value as Record<string, unknown>;
+};
+
+const mutationString = (record: Record<string, unknown>, field: string, name: string): string => {
+  const value = record[field];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${name} response has an invalid ${field}.`);
+  }
+  return value;
+};
+
+const mutationTimestamp = (
+  record: Record<string, unknown>,
+  field: string,
+  name: string,
+): string => {
+  const value = mutationString(record, field, name);
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new Error(`${name} response has an invalid ${field} timestamp.`);
+  }
+  return value;
+};
+
+const optionalMutationString = (
+  record: Record<string, unknown>,
+  field: string,
+  name: string,
+): void => {
+  if (record[field] !== undefined && typeof record[field] !== "string") {
+    throw new Error(`${name} response has an invalid ${field}.`);
+  }
+};
+
+const mutationNonnegativeInteger = (
+  record: Record<string, unknown>,
+  field: string,
+  name: string,
+): number => {
+  const value = record[field];
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`${name} response has an invalid ${field}.`);
+  }
+  return value as number;
+};
+
+const mutationEnum = <T extends string>(
+  record: Record<string, unknown>,
+  field: string,
+  values: ReadonlySet<T>,
+  name: string,
+): T => {
+  const value = mutationString(record, field, name);
+  if (!values.has(value as T)) {
+    throw new Error(`${name} response has an unsupported ${field}.`);
+  }
+  return value as T;
+};
+
+const SESSION_STATES = new Set<SessionSummary["sessionState"]>(["open", "closed"]);
+const OWNER_STATES = new Set<SessionSummary["ownerState"]>([
+  "absent",
+  "starting",
+  "online",
+  "unreachable",
+  "dead",
+]);
+const TURN_STATES = new Set<SessionSummary["turnState"]>([
+  "idle",
+  "queued",
+  "starting",
+  "running",
+  "waiting_permission",
+  "waiting_elicitation",
+  "cancelling",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "unknown",
+]);
+const MODE_STATES = new Set<SessionDetail["modeState"]>([
+  "unmanaged",
+  "stored",
+  "unverified",
+  "conflict",
+]);
+const ADMISSION_STATES = new Set<WireMutationReceipt["admission"]>([
+  "started",
+  "queued",
+  "unknown",
+]);
+const CANCEL_STATES = new Set(["cancelling", "cancelled", "completed", "unknown"] as const);
+const PENDING_KINDS = new Set<WirePendingInteraction["kind"]>(["permission", "elicitation"]);
+const TERMINAL_PENDING_STATES = new Set<PendingInteraction["state"]>([
+  "answered",
+  "cancelled",
+  "expired",
+  "orphaned",
+]);
+
+// oxlint-disable-next-line eslint/complexity -- Mutation success must validate the complete server-owned session shape before releasing its retry key.
+const decodeWireSession = (value: unknown): WireSession => {
+  const session = mutationRecord(value, "Session mutation");
+  mutationString(session, "acpxRecordId", "Session mutation");
+  mutationString(session, "agentId", "Session mutation");
+  mutationString(session, "cwd", "Session mutation");
+  mutationTimestamp(session, "updatedAt", "Session mutation");
+  mutationEnum(session, "sessionState", SESSION_STATES, "Session mutation");
+  mutationEnum(session, "ownerState", OWNER_STATES, "Session mutation");
+  mutationEnum(session, "turnState", TURN_STATES, "Session mutation");
+  if (session.modeState !== undefined) {
+    mutationEnum(session, "modeState", MODE_STATES, "Session mutation");
+  }
+  if (session.pendingCount !== undefined) {
+    mutationNonnegativeInteger(session, "pendingCount", "Session mutation");
+  }
+  for (const field of [
+    "acpSessionId",
+    "agentSessionId",
+    "name",
+    "title",
+    "repo",
+    "branch",
+    "model",
+    "mode",
+    "desiredMode",
+    "effectiveMode",
+    "modeRemediation",
+    "activeTurnId",
+    "providerSessionId",
+    "closeReason",
+  ]) {
+    optionalMutationString(session, field, "Session mutation");
+  }
+  if (session.createdAt !== undefined) {
+    mutationTimestamp(session, "createdAt", "Session mutation");
+  }
+  const queue = mutationRecord(session.queue, "Session queue");
+  const queueDepth = mutationNonnegativeInteger(queue, "depth", "Session queue");
+  if (!Array.isArray(queue.turns)) {
+    throw new Error("Session mutation response has invalid queued turns.");
+  }
+  const turnIds = new Set<string>();
+  for (const value of queue.turns) {
+    const turn = mutationRecord(value, "Session queued turn");
+    const turnId = mutationString(turn, "turnId", "Session queued turn");
+    mutationTimestamp(turn, "submittedAt", "Session queued turn");
+    if (turn.promptText !== undefined && typeof turn.promptText !== "string") {
+      throw new Error("Session mutation response has invalid queued prompt text.");
+    }
+    if (turnIds.has(turnId)) {
+      throw new Error("Session mutation response has duplicate queued turn IDs.");
+    }
+    turnIds.add(turnId);
+  }
+  if (queueDepth < queue.turns.length) {
+    throw new Error("Session mutation response has an inconsistent queue depth.");
+  }
+  return session as unknown as WireSession;
+};
+
+const decodeSessionMutation =
+  (input: { readonly agentId: string }): ((value: unknown) => SessionDetail) =>
+  (value) => {
+    const response = mutationRecord(value, "Session mutation");
+    const session = decodeWireSession(response.session);
+    if (session.agentId !== input.agentId) {
+      throw new Error("Session mutation response has the wrong agent identity.");
+    }
+    return sessionDetail(session);
+  };
+
+const decodePromptMutation =
+  (sessionId: string): ((value: unknown) => MutationReceipt) =>
+  (value) => {
+    const receipt = mutationRecord(value, "Prompt mutation");
+    return {
+      accepted: true,
+      sessionId,
+      turnId: mutationString(receipt, "turnId", "Prompt mutation"),
+      state: mutationEnum(receipt, "admission", ADMISSION_STATES, "Prompt mutation"),
+    };
+  };
+
+const decodeCancelMutation =
+  (turnId: string): ((value: unknown) => void) =>
+  (value) => {
+    const receipt = mutationRecord(value, "Cancel mutation");
+    if (mutationString(receipt, "turnId", "Cancel mutation") !== turnId) {
+      throw new Error("Cancel mutation response has the wrong turnId.");
+    }
+    mutationEnum(receipt, "state", CANCEL_STATES, "Cancel mutation");
+  };
+
+const decodeProviderClose = (value: unknown): CloseSessionResult["providerClose"] => {
+  const providerClose = mutationRecord(value, "Close mutation provider result");
+  const status = mutationEnum(
+    providerClose,
+    "status",
+    new Set(["confirmed", "degraded"] as const),
+    "Close mutation provider result",
+  );
+  if (status === "confirmed") {
+    return { status };
+  }
+  return {
+    status,
+    reason: mutationEnum(
+      providerClose,
+      "reason",
+      new Set(["owner_absent", "unsupported", "provider_error"] as const),
+      "Close mutation provider result",
+    ),
+  };
+};
+
+const decodeCloseMutation =
+  (sessionId: string): ((value: unknown) => CloseSessionResult) =>
+  (value) => {
+    const response = mutationRecord(value, "Close mutation");
+    const close = mutationRecord(response.close, "Close mutation");
+    if (close.localClose !== "closed") {
+      throw new Error("Close mutation response has an invalid localClose.");
+    }
+    const session = decodeWireSession(close.session);
+    if (session.acpxRecordId !== sessionId) {
+      throw new Error("Close mutation response has the wrong session identity.");
+    }
+    return {
+      session: sessionDetail(session),
+      localClose: "closed",
+      providerClose: decodeProviderClose(close.providerClose),
+    };
+  };
+
+const decodePendingMutation =
+  (sessionId: string, requestId: string): ((value: unknown) => void) =>
+  (value) => {
+    const response = mutationRecord(value, "Pending response mutation");
+    const pending = mutationRecord(response.pending, "Pending response mutation");
+    if (
+      mutationString(pending, "acpxRecordId", "Pending response mutation") !== sessionId ||
+      mutationString(pending, "requestId", "Pending response mutation") !== requestId
+    ) {
+      throw new Error("Pending response mutation returned the wrong request identity.");
+    }
+    mutationTimestamp(pending, "createdAt", "Pending response mutation");
+    mutationEnum(pending, "kind", PENDING_KINDS, "Pending response mutation");
+    mutationEnum(pending, "state", TERMINAL_PENDING_STATES, "Pending response mutation");
+  };
 
 const sessionSummary = (session: WireSession): SessionSummary => ({
   id: session.acpxRecordId,

@@ -66,6 +66,14 @@ const SESSION = {
   updatedAt: "2026-08-12T10:00:00.000Z",
 };
 
+const ANSWERED_PENDING = {
+  requestId: "request-1",
+  acpxRecordId: "record-1",
+  kind: "permission",
+  state: "answered",
+  createdAt: "2026-08-12T10:01:00.000Z",
+};
+
 const requestUrl = (input: RequestInfo | URL): string =>
   typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 
@@ -224,7 +232,7 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
       if (requestUrl(input).includes("/agents/")) {
         return response({ sessions: [] });
       }
-      return response({ pending: {} });
+      return response({ pending: ANSWERED_PENDING });
     },
     async () => {
       await api.providerSessions("codex", "/work/checkout");
@@ -280,6 +288,33 @@ test("sends an explicit custom-agent mode for both session creation paths", asyn
   ]);
 });
 
+test("accepts the legacy-compatible optional session mutation fields", async () => {
+  const legacySession = {
+    acpxRecordId: "record-legacy",
+    agentId: "codex",
+    cwd: "/work/checkout",
+    sessionState: "open",
+    ownerState: "absent",
+    turnState: "idle",
+    queue: { depth: 0, turns: [] },
+    updatedAt: "2026-08-12T10:00:00.000Z",
+  };
+  await withFetch(
+    async () => response({ session: legacySession }, 201),
+    async () => {
+      const created = await client().createSession({
+        agentId: "codex",
+        cwd: "/work/checkout",
+        permissionPolicy: "defer-risky",
+      });
+      assert.equal(created.id, "record-legacy");
+      assert.equal(created.createdAt, legacySession.updatedAt);
+      assert.equal(created.modeState, "unmanaged");
+      assert.equal(created.pendingCount, 0);
+    },
+  );
+});
+
 test("a network retry reuses the same idempotency key", async () => {
   const api = client();
   const keys: string[] = [];
@@ -291,7 +326,7 @@ test("a network retry reuses the same idempotency key", async () => {
       if (attempts === 1) {
         throw new TypeError("network disconnected");
       }
-      return response({ pending: {} });
+      return response({ pending: ANSWERED_PENDING });
     },
     async () => {
       await api.answerInteraction("record-1", "request-1", { type: "cancel" });
@@ -359,6 +394,102 @@ test("a malformed successful response retains the mutation idempotency key", asy
   assert.equal(attempts, 2);
   assert.ok(keys[0]);
   assert.equal(keys[1], keys[0]);
+});
+
+test("semantically invalid successful mutation responses retain each action key", async () => {
+  const actions: ReadonlyArray<{
+    readonly name: string;
+    readonly run: (api: ConsoleApi) => Promise<unknown>;
+  }> = [
+    {
+      name: "create",
+      run: async (api) =>
+        await api.createSession({
+          agentId: "codex",
+          cwd: "/work/checkout",
+          permissionPolicy: "defer-risky",
+        }),
+    },
+    {
+      name: "adopt",
+      run: async (api) =>
+        await api.adoptSession({
+          agentId: "codex",
+          providerSessionId: "provider-1",
+          cwd: "/work/checkout",
+        }),
+    },
+    { name: "prompt", run: async (api) => await api.sendPrompt("record-1", "hello") },
+    { name: "cancel", run: async (api) => await api.cancelTurn("record-1", "turn-1") },
+    { name: "close", run: async (api) => await api.closeSession("record-1") },
+    {
+      name: "answer",
+      run: async (api) => await api.answerInteraction("record-1", "request-1", { type: "cancel" }),
+    },
+  ];
+
+  for (const action of actions) {
+    const api = client();
+    const keys: string[] = [];
+    await withFetch(
+      async (_input, init) => {
+        keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+        return response({});
+      },
+      async () => {
+        await assert.rejects(action.run(api), MutationTransportUnknownError, action.name);
+        await assert.rejects(action.run(api), MutationTransportUnknownError, action.name);
+      },
+    );
+    assert.equal(keys.length, 2, action.name);
+    assert.ok(keys[0], action.name);
+    assert.equal(keys[1], keys[0], action.name);
+  }
+});
+
+test("concurrent identical mutations cannot split into success and unknown outcomes", async () => {
+  const api = client();
+  let requests = 0;
+  let markDispatched: (() => void) | undefined;
+  let finishRequest: ((value: Response) => void) | undefined;
+  const dispatched = new Promise<void>((resolve) => {
+    markDispatched = resolve;
+  });
+  const responseGate = new Promise<Response>((resolve) => {
+    finishRequest = resolve;
+  });
+
+  await withFetch(
+    async () => {
+      requests += 1;
+      markDispatched?.();
+      if (requests > 1) {
+        throw new TypeError("a concurrent duplicate would have an unknown outcome");
+      }
+      return await responseGate;
+    },
+    async () => {
+      const first = api.sendPrompt("record-1", "same action");
+      const second = api.sendPrompt("record-1", "same action");
+      await dispatched;
+      finishRequest?.(response({ turnId: "turn-shared", admission: "started" }, 202));
+      assert.deepEqual(await Promise.all([first, second]), [
+        {
+          accepted: true,
+          sessionId: "record-1",
+          turnId: "turn-shared",
+          state: "started",
+        },
+        {
+          accepted: true,
+          sessionId: "record-1",
+          turnId: "turn-shared",
+          state: "started",
+        },
+      ]);
+    },
+  );
+  assert.equal(requests, 1);
 });
 
 test("an ambiguous mutation keeps its exact key across a page reload", async () => {
@@ -479,30 +610,37 @@ test("a full retry ledger fails closed without dispatching or evicting", async (
   assert.equal(requests, 130);
 });
 
-test("expired retry keys are removed and no longer consume capacity", async () => {
+test("aged retry keys remain exact and are never silently expired", async () => {
   const storage = new MemoryStorage();
   let now = 1_000;
   const keys: string[] = [];
+  let requests = 0;
   await withFetch(
     async (_input, init) => {
+      requests += 1;
       keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
-      throw new TypeError("response lost");
+      if (requests <= 2) {
+        throw new TypeError("response lost");
+      }
+      return response({ turnId: "turn-aged", admission: "started" }, 202);
     },
     async () => {
       await assert.rejects(
         async () => await client(storage, () => now).sendPrompt("record-1", "expires"),
         MutationTransportUnknownError,
       );
+      const serialized = storage.values()[0];
+      assert.ok(serialized);
+      const state = JSON.parse(serialized) as {
+        readonly entries: readonly { readonly expires_at: number }[];
+      };
+      now = state.entries[0]?.expires_at ?? Number.MAX_SAFE_INTEGER;
+      await client(storage, () => now).sendPrompt("record-1", "expires");
+      assert.deepEqual(keys, [keys[0], keys[0], keys[0]]);
+      assert.equal(storage.values().length, 0);
     },
   );
-  const serialized = storage.values()[0];
-  assert.ok(serialized);
-  const state = JSON.parse(serialized) as {
-    readonly entries: readonly { readonly expires_at: number }[];
-  };
-  now = state.entries[0]?.expires_at ?? Number.MAX_SAFE_INTEGER;
-  client(storage, () => now);
-  assert.equal(storage.values().length, 0);
+  assert.equal(requests, 3);
 });
 
 test("unavailable session storage blocks mutations before dispatch", async () => {
@@ -588,7 +726,7 @@ test("a stale CSRF 403 refreshes bootstrap once and preserves idempotency", asyn
       mutations.push(new Headers(init?.headers));
       return mutations.length === 1
         ? response({ error: { message: "stale CSRF" } }, 403)
-        : response({ pending: {} });
+        : response({ pending: ANSWERED_PENDING });
     },
     async () => {
       await api.answerInteraction("record-1", "request-1", { type: "cancel" });
