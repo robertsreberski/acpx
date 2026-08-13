@@ -644,7 +644,9 @@ export async function startAcpxConsoleServer(
             if (error instanceof HttpError && error.code === "SESSION_NOT_FOUND") {
               return;
             }
-            throw error;
+            logger.error(error);
+            publishAllowed({ type: "reset" });
+            return;
           }
         }
         publishAllowed(event);
@@ -652,7 +654,7 @@ export async function startAcpxConsoleServer(
       .catch((error: unknown) => logger.error(error));
   };
 
-  const publishAllowed = (event: ServiceInvalidation): void => {
+  const publishAllowed = (event: BufferedEvent["event"]): void => {
     const item = { id: nextEventId++, event };
     events.push(item);
     if (events.length > SSE_REPLAY_LIMIT) {

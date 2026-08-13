@@ -964,6 +964,55 @@ test("event streams replay retained ids and reset clients outside the replay win
   }
 });
 
+test("event streams reset and remain usable after a transient session projection failure", async () => {
+  const { running, service } = await fixture();
+  const originalGetSession = service.getSession.bind(service);
+  let failOnce = true;
+  service.getSession = async (input) => {
+    if (failOnce) {
+      failOnce = false;
+      throw new Error("transient projection failure");
+    }
+    return await originalGetSession(input);
+  };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(`${running.origin}/api/v1/events`, {
+      signal: controller.signal,
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+
+    service.emit({ type: "session", acpxRecordId: "record-1" });
+    service.emit({ type: "session", acpxRecordId: "outside-record" });
+    service.emit({ type: "session", acpxRecordId: "record-1" });
+
+    while (!body.includes("id: 2\nevent: session\n")) {
+      const next = await reader.read();
+      if (next.done) {
+        break;
+      }
+      body += decoder.decode(next.value, { stream: true });
+    }
+
+    assert.match(body, /id: 1\nevent: reset\ndata: {"type":"reset"}\n\n/);
+    assert.match(
+      body,
+      /id: 2\nevent: session\ndata: {"type":"session","acpxRecordId":"record-1"}\n\n/,
+    );
+    assert.doesNotMatch(body.match(/event: reset\ndata: ([^\n]+)/)?.[1] ?? "", /acpxRecordId/);
+    assert.doesNotMatch(body, /outside-record/);
+    await reader.cancel();
+  } finally {
+    clearTimeout(timeout);
+    await running.close();
+  }
+});
+
 test("server close destroys a lingering partial HTTP connection", async () => {
   const { running } = await fixture();
   const url = new URL(running.origin);
