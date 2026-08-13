@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   ensureOwnerIsUsable,
   isProcessAlive,
+  queueOwnerWritesTimeline,
   readLiveQueueOwner,
   readQueueOwnerRecord,
   readQueueOwnerStatus,
@@ -40,11 +41,49 @@ test("readQueueOwnerRecord returns undefined for missing and malformed lock file
   });
 });
 
+test("queue owner timeline capability is optional, boolean, and fail-closed", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "timeline-capability-record";
+    const lockPath = queueLockFilePath(sessionId, homeDir);
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    const base = {
+      pid: process.pid,
+      sessionId,
+      socketPath: "/tmp/acpx-timeline-capability.sock",
+      createdAt: "2026-08-13T10:00:00.000Z",
+      heartbeatAt: "2026-08-13T10:00:00.000Z",
+      ownerGeneration: 1,
+      queueDepth: 0,
+    };
+
+    for (const [rawTimeline, expected] of [
+      [undefined, undefined],
+      [false, false],
+      [true, true],
+      ["yes", undefined],
+    ] as const) {
+      await fs.writeFile(
+        lockPath,
+        `${JSON.stringify({
+          ...base,
+          ...(rawTimeline === undefined ? {} : { timeline: rawTimeline }),
+        })}\n`,
+        "utf8",
+      );
+      const record = await readQueueOwnerRecord(sessionId);
+      assert(record);
+      assert.equal(record.timeline, expected);
+      assert.equal(queueOwnerWritesTimeline(record), expected === true);
+    }
+  });
+});
+
 test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and released", async () => {
   await withTempHome(async () => {
     const lease = await tryAcquireQueueOwnerLease("lease-create");
     assert(lease);
     assert.equal(lease.sessionId, "lease-create");
+    assert.equal(lease.timeline, true);
 
     await refreshQueueOwnerLease(
       lease,
@@ -58,6 +97,7 @@ test("tryAcquireQueueOwnerLease creates a lease that can be refreshed and releas
     assert(record);
     assert.equal(record.queueDepth, 2);
     assert.equal(record.heartbeatAt, "2026-03-26T00:00:00.000Z");
+    assert.equal(record.timeline, true);
 
     await releaseQueueOwnerLease(lease);
     assert.equal(await readQueueOwnerRecord("lease-create"), undefined);

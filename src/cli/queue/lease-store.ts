@@ -86,6 +86,8 @@ export type QueueOwnerRecord = {
   parking?: boolean;
   /** The owner's effective --defer-max-age, in ms. Owner-level, like parking. */
   parkingMaxAgeMs?: number;
+  /** This owner writes the authoritative session timeline alongside compatibility streams. */
+  timeline?: boolean;
 };
 
 export type QueueOwnerLease = {
@@ -98,11 +100,18 @@ export type QueueOwnerLease = {
   mcpConfigFingerprint?: string;
   parking?: boolean;
   parkingMaxAgeMs?: number;
+  /** Every lease created by this build owns authoritative timeline writes. */
+  timeline: true;
 };
 
 /** Protocol version an owner speaks, defaulting to the pre-field behavior. */
 export function queueOwnerProtocolVersion(owner: QueueOwnerRecord): number {
   return owner.queueProtocol ?? LEGACY_QUEUE_PROTOCOL_VERSION;
+}
+
+/** Missing and explicit false both identify a pre-timeline owner. */
+export function queueOwnerWritesTimeline(owner: QueueOwnerRecord): boolean {
+  return owner.timeline === true;
 }
 
 export type QueueOwnerStatus = {
@@ -148,6 +157,7 @@ function parseQueueOwnerRecordMetadata(
   | "acpxVersion"
   | "parking"
   | "parkingMaxAgeMs"
+  | "timeline"
 > {
   return {
     ...(typeof record.mcpConfigPath === "string" ? { mcpConfigPath: record.mcpConfigPath } : {}),
@@ -160,6 +170,22 @@ function parseQueueOwnerRecordMetadata(
     ...(typeof record.parkingMaxAgeMs === "number" && Number.isFinite(record.parkingMaxAgeMs)
       ? { parkingMaxAgeMs: record.parkingMaxAgeMs }
       : {}),
+    ...parseTimelineCapability(record.timeline),
+  };
+}
+
+function parseTimelineCapability(value: unknown): Pick<QueueOwnerRecord, "timeline"> {
+  return typeof value === "boolean" ? { timeline: value } : {};
+}
+
+function currentQueueOwnerBuildMetadata(): Pick<
+  QueueOwnerRecord,
+  "queueProtocol" | "acpxVersion" | "timeline"
+> & { timeline: true } {
+  return {
+    queueProtocol: QUEUE_PROTOCOL_VERSION,
+    acpxVersion: getAcpxVersion(),
+    timeline: true,
   };
 }
 
@@ -421,8 +447,7 @@ export async function tryAcquireQueueOwnerLease(
       heartbeatAt: createdAt,
       ownerGeneration,
       queueDepth: 0,
-      queueProtocol: QUEUE_PROTOCOL_VERSION,
-      acpxVersion: getAcpxVersion(),
+      ...currentQueueOwnerBuildMetadata(),
       ...(parking ? { parking: true } : {}),
       ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
@@ -445,6 +470,7 @@ export async function tryAcquireQueueOwnerLease(
       socketPath,
       createdAt,
       ownerGeneration,
+      timeline: true,
       ...(parking ? { parking: true } : {}),
       ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
@@ -549,8 +575,7 @@ export async function refreshQueueOwnerLease(
       heartbeatAt: nowIsoFactory(),
       ownerGeneration: lease.ownerGeneration,
       queueDepth: Math.max(0, Math.round(options.queueDepth)),
-      queueProtocol: QUEUE_PROTOCOL_VERSION,
-      acpxVersion: getAcpxVersion(),
+      ...currentQueueOwnerBuildMetadata(),
       ...(lease.parking ? { parking: true } : {}),
       ...(lease.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: lease.parkingMaxAgeMs }),
       ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),

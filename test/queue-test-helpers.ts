@@ -66,6 +66,7 @@ export async function writeQueueOwnerLock(options: {
   acpxVersion?: string;
   parking?: boolean;
   parkingMaxAgeMs?: number;
+  timeline?: boolean;
 }): Promise<void> {
   const now = new Date().toISOString();
   const createdAt = options.createdAt ?? now;
@@ -92,6 +93,7 @@ export async function writeQueueOwnerLock(options: {
       ...(options.parkingMaxAgeMs === undefined
         ? {}
         : { parkingMaxAgeMs: options.parkingMaxAgeMs }),
+      ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
     })}\n`,
     "utf8",
   );

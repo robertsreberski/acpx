@@ -5,6 +5,7 @@ import {
   QUEUE_PROTOCOL_RULE_KEY_COUNT,
   QUEUE_PROTOCOL_VERSION,
   queueOwnerProtocolVersion,
+  queueOwnerWritesTimeline,
   readQueueOwnerRecord,
   refreshQueueOwnerLease,
   tryAcquireQueueOwnerLease,
@@ -77,6 +78,7 @@ async function withFakeOwner(
     acpxVersion?: string;
     parking?: boolean;
     parkingMaxAgeMs?: number;
+    timeline?: boolean;
   },
   run: () => Promise<void>,
 ): Promise<void> {
@@ -229,6 +231,9 @@ test("a freshly acquired lease stamps the queue protocol version and acpx build"
     assert(owner);
     assert.equal(owner.queueProtocol, QUEUE_PROTOCOL_VERSION);
     assert.equal(queueOwnerProtocolVersion(owner), QUEUE_PROTOCOL_VERSION);
+    assert.equal(lease.timeline, true);
+    assert.equal(owner.timeline, true);
+    assert.equal(queueOwnerWritesTimeline(owner), true);
     assert.equal(typeof owner.acpxVersion, "string");
     assert.equal((owner.acpxVersion ?? "").length > 0, true);
   });
@@ -334,6 +339,8 @@ test("a lease stamps effective parking metadata on acquire and on heartbeat", as
     assert.equal(refreshed?.parking, true);
     assert.equal(refreshed?.parkingMaxAgeMs, 1_500);
     assert.equal(refreshed?.queueDepth, 3);
+    assert.equal(refreshed?.timeline, true);
+    assert.equal(refreshed ? queueOwnerWritesTimeline(refreshed) : false, true);
   });
 });
 
@@ -344,5 +351,6 @@ test("a lease without parking records no parking metadata", async () => {
     const record = await readQueueOwnerRecord("owner-plain-stamp");
     assert.equal(record?.parking, undefined);
     assert.equal(record?.parkingMaxAgeMs, undefined);
+    assert.equal(record?.timeline, true);
   });
 });
