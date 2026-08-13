@@ -6,9 +6,9 @@ const QUEUE_CONNECT_ATTEMPTS = 40;
 export const QUEUE_CONNECT_RETRY_MS = 50;
 export const SOCKET_CONNECTION_TIMEOUT_MS = 5000;
 
-function shouldRetryQueueConnect(error: unknown): boolean {
+export function shouldRetryQueueConnect(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
-  return code === "ENOENT" || code === "ECONNREFUSED";
+  return code === "ENOENT" || code === "ECONNREFUSED" || code === "EAGAIN";
 }
 
 async function connectToSocket(

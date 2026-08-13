@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { shouldRetryQueueConnect } from "../src/cli/queue/ipc-transport.js";
 import {
   tryListPromptQueueOnRunningOwner,
   tryListRequestsOnRunningOwner,
@@ -22,6 +23,15 @@ import {
 type SessionModule = typeof import("../src/session/session.js");
 
 const SESSION_MODULE_URL = new URL("../src/session/session.js", import.meta.url);
+
+test("queue connects retry transient Unix socket errors", () => {
+  for (const code of ["ENOENT", "ECONNREFUSED", "EAGAIN"]) {
+    assert.equal(shouldRetryQueueConnect(Object.assign(new Error(code), { code })), true, code);
+  }
+  for (const code of ["EACCES", "ECONNRESET", "ENAMETOOLONG"]) {
+    assert.equal(shouldRetryQueueConnect(Object.assign(new Error(code), { code })), false, code);
+  }
+});
 
 test("cancelSessionPrompt sends cancel request to active queue owner", async () => {
   await withTempHome(async (homeDir) => {
