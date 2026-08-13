@@ -913,9 +913,13 @@ test("event streams have an explicit client cap", async () => {
 
 test("event streams replay retained ids and reset clients outside the replay window", async () => {
   const { running, service } = await fixture();
-  const readUntil = async (headers: HeadersInit, pattern: RegExp): Promise<string> => {
+  const readUntil = async (
+    headers: HeadersInit,
+    pattern: RegExp,
+    afterConnect?: () => void,
+  ): Promise<string> => {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2_000);
+    const timeout = setTimeout(() => controller.abort(), 10_000);
     const response = await fetch(`${running.origin}/api/v1/events`, {
       headers,
       signal: controller.signal,
@@ -925,6 +929,7 @@ test("event streams replay retained ids and reset clients outside the replay win
     const decoder = new TextDecoder();
     let body = "";
     try {
+      afterConnect?.();
       while (!pattern.test(body)) {
         const next = await reader.read();
         if (next.done) {
@@ -939,15 +944,19 @@ test("event streams replay retained ids and reset clients outside the replay win
     }
   };
   try {
-    service.emit({ type: "sessions" });
-    service.emit({ type: "session", acpxRecordId: "record-1" });
+    await readUntil({}, /id: 2\n/, () => {
+      service.emit({ type: "sessions" });
+      service.emit({ type: "session", acpxRecordId: "record-1" });
+    });
     const replay = await readUntil({ "Last-Event-ID": "1" }, /id: 2\n/);
     assert.doesNotMatch(replay, /id: 1\n/);
     assert.match(replay, /event: session\n/);
 
-    for (let index = 0; index < 512; index++) {
-      service.emit({ type: "timeline", acpxRecordId: "record-1", cursor: String(index) });
-    }
+    await readUntil({ "Last-Event-ID": "2" }, /id: 514\n/, () => {
+      for (let index = 0; index < 512; index++) {
+        service.emit({ type: "timeline", acpxRecordId: "record-1", cursor: String(index) });
+      }
+    });
     const reset = await readUntil({ "Last-Event-ID": "0" }, /event: reset\n/);
     assert.match(reset, /event: reset\n/);
   } finally {
