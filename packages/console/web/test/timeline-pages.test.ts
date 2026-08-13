@@ -165,3 +165,25 @@ test("an epoch reset discards the stale projection and reports the lost continui
     events("epoch-new", 1, 20).map((item) => item.id),
   );
 });
+
+test("an epoch reset does not carry stale durable-history diagnostics into the new epoch", () => {
+  const reset = mergeRefreshedTimelinePage(
+    {
+      epoch: "epoch-corrupt",
+      events: events("epoch-corrupt", 1, 80),
+      coverage: "incomplete",
+      gap: { reason: "corrupt", message: "The old epoch was corrupt." },
+      writeError: "The old epoch failed its last write.",
+    },
+    {
+      epoch: "epoch-clean",
+      events: events("epoch-clean", 1, 20),
+      coverage: "complete",
+    },
+  );
+
+  assert.equal(reset.coverage, "complete");
+  assert.equal(reset.gap, undefined);
+  assert.equal(reset.writeError, undefined);
+  assert.equal(reset.continuityIssue?.reason, "epoch_changed");
+});

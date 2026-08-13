@@ -117,10 +117,7 @@ export const mergeRefreshedTimelinePage = (
   ) {
     return {
       ...normalizedLatest,
-      coverage: mergedCoverage(normalizedCurrent.coverage, normalizedLatest.coverage),
-      gap: normalizedLatest.gap ?? normalizedCurrent.gap,
       continuityIssue: epochChangeIssue(),
-      writeError: normalizedLatest.writeError ?? normalizedCurrent.writeError,
     };
   }
   const currentRange = sequenceRange(normalizedCurrent.events);
