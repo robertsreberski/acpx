@@ -382,7 +382,11 @@ async function readRetirementMarker(
 async function retirementMarkerIsActive(marker: QueueOwnerRetirementMarker): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     const socket = net.createConnection(marker.livenessPath);
-    const timeout = setTimeout(() => finish(false), QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS);
+    const timeout = setTimeout(() => {
+      // A timeout is inconclusive. Preserve the marker and socket rather than
+      // risk unlinking a live listener whose accept backlog is temporarily full.
+      finish(true);
+    }, QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS);
     const finish = (active: boolean): void => {
       clearTimeout(timeout);
       socket.destroy();
@@ -459,6 +463,7 @@ async function inspectSharedRetirementMarker(
     await restoreQuarantinedRetirementMarker(lockPath, quarantinePath);
     return quarantined;
   }
+  await removeInactiveRetirementLiveness(quarantined);
   await fs.unlink(quarantinePath).catch(() => undefined);
   return undefined;
 }
@@ -470,6 +475,7 @@ async function inspectUniqueRetirementMarker(
   if (marker && (await retirementMarkerIsActive(marker))) {
     return marker;
   }
+  await removeInactiveRetirementLiveness(marker);
   await fs.unlink(markerPath).catch(() => undefined);
   return undefined;
 }
@@ -516,6 +522,21 @@ function retirementMarkerLivenessPath(markerId: string): string {
   return process.platform === "win32"
     ? `\\\\.\\pipe\\acpx-retire-${markerId}`
     : path.join("/tmp", `acpx-retire-${markerId}.sock`);
+}
+
+async function removeInactiveRetirementLiveness(
+  marker: QueueOwnerRetirementMarker | undefined,
+): Promise<void> {
+  if (
+    process.platform === "win32" ||
+    !marker ||
+    marker.livenessPath !== retirementMarkerLivenessPath(marker.markerId)
+  ) {
+    return;
+  }
+  await removeSocketFile(marker.livenessPath).catch(() => {
+    // Best effort after kernel-backed liveness has already proved inactive.
+  });
 }
 
 async function startRetirementMarkerLiveness(
@@ -975,6 +996,9 @@ export function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
       if (result === "failed") {
         throw new Error(`Failed to release queue owner lease for session ${lease.sessionId}`);
       }
+      // SessionQueueOwner.close() removes its Unix socket. Do not unlink the
+      // deterministic path here: after the identity-safe lock quarantine, a
+      // legacy replacement may already have bound the same socket path.
     } catch (error) {
       // Teardown remains a one-way barrier for refreshes, but a transient
       // filesystem failure must not prevent a later release attempt.
