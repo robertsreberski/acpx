@@ -225,9 +225,11 @@ function PermissionRequest({ interaction }: { readonly interaction: PendingInter
               {option.label}
             </button>
           ))}
+          {/* Protocol answers stay available but sit under the agent's own
+              options, which are the ones it actually offered. */}
           <button
             type="button"
-            className="request-dock-secondary"
+            className="request-dock-secondary is-quiet"
             disabled={disabled}
             onClick={() => answer({ type: "decline" })}
           >

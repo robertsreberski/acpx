@@ -140,8 +140,15 @@ export function SessionSidebar({
           </div>
           <div>
             <strong>ACPX Console</strong>
-            <span>
-              {bootstrap.sessions.length} local session{bootstrap.sessions.length === 1 ? "" : "s"}
+            <span className="sidebar-status">
+              <i
+                className={`connection-dot${loading || connectionState === "connecting" ? " is-loading" : connectionState === "offline" ? " is-offline" : ""}`}
+              />
+              {connectionState === "offline"
+                ? "Live updates disconnected"
+                : loading || connectionState === "connecting"
+                  ? "Refreshing…"
+                  : `${bootstrap.sessions.length} local session${bootstrap.sessions.length === 1 ? "" : "s"}`}
             </span>
           </div>
           <button
@@ -252,16 +259,6 @@ export function SessionSidebar({
             </p>
           )}
         </nav>
-        <footer className="sidebar-footer">
-          <span
-            className={`connection-dot${loading || connectionState === "connecting" ? " is-loading" : connectionState === "offline" ? " is-offline" : ""}`}
-          />
-          {connectionState === "offline"
-            ? "Live updates disconnected"
-            : loading || connectionState === "connecting"
-              ? "Refreshing…"
-              : `${liveCount} active`}
-        </footer>
         <div className="sidebar-actions">
           <button type="button" className="primary-button" onClick={onCreate}>
             <Icon name="plus" size={18} /> New session

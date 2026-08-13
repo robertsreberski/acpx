@@ -147,11 +147,6 @@ button:disabled {
   clip-path: inset(50%);
   white-space: nowrap;
 }
-.mobile-only,
-.mobile-back {
-  display: none;
-}
-
 /* Section labels: repo headings, drawer kickers, permission kickers. */
 .section-label {
   color: var(--muted);
@@ -162,13 +157,16 @@ button:disabled {
   text-transform: uppercase;
 }
 
+/* Flex, not grid rows: the network warning is conditional, and a two-row grid
+   drops the body into the `auto` row whenever the warning is absent. */
 .app-shell {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  display: flex;
   height: 100%;
+  flex-direction: column;
   background: var(--canvas);
 }
 .network-warning {
+  flex: 0 0 auto;
   padding: 9px 20px;
   color: #fff5dd;
   background: #5c3c13;
@@ -180,6 +178,7 @@ button:disabled {
   display: flex;
   min-width: 0;
   min-height: 0;
+  flex: 1;
 }
 
 /* Controls
@@ -325,11 +324,6 @@ button:disabled {
   background: transparent;
   font-size: 14px;
 }
-/* The header toggle only exists where the input is collapsed. */
-.sidebar-search-toggle {
-  display: none;
-}
-
 /* Project filter chips. 36px matches the design; the row's block padding keeps
    the touch band at 44px. */
 .repo-filters {
@@ -514,6 +508,7 @@ button:disabled {
   white-space: nowrap;
 }
 .state-dot {
+  display: inline-block;
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
@@ -533,16 +528,13 @@ button:disabled {
   font-size: var(--text-meta);
   line-height: 1.55;
 }
-.sidebar-footer {
+.sidebar-header .sidebar-status {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 40px;
-  padding: 10px 20px;
-  color: var(--muted);
-  font-size: var(--text-id);
+  gap: 7px;
 }
 .connection-dot {
+  display: inline-block;
   width: 7px;
   height: 7px;
   flex: 0 0 auto;
@@ -686,9 +678,6 @@ button:disabled {
 .session-status.is-waiting_permission i,
 .session-status.is-waiting_elicitation i {
   background: var(--attention);
-}
-.sidebar-toggle {
-  display: none;
 }
 
 /* Welcome
@@ -848,6 +837,7 @@ button:disabled {
 }
 .message-row.is-user .message-bubble {
   max-width: 84%;
+  min-width: 0;
   border-radius: 16px 4px 16px 16px;
   padding: 12px 16px;
   background: var(--accent-soft);
@@ -856,6 +846,7 @@ button:disabled {
   color: var(--ink);
   font-size: var(--text-body);
   line-height: 1.65;
+  overflow-wrap: break-word;
   text-wrap: pretty;
 }
 .message-row.is-user .message-text {
@@ -925,8 +916,20 @@ button:disabled {
   background: var(--surface-sunken);
   box-shadow: var(--card-shadow);
 }
-.activity-card + .activity-card {
-  margin-top: -1px;
+/* The design draws a run of tool calls as one grouped list. Each activity is its
+   own assistant message here, so the run is joined across message rows rather
+   than inside a wrapper component. */
+.message-row:has(.activity-card):has(+ .message-row .activity-card) {
+  padding-bottom: 0;
+}
+.message-row:has(.activity-card):has(+ .message-row .activity-card) .activity-card {
+  border-bottom-right-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.message-row:has(.activity-card) + .message-row:has(.activity-card) .activity-card {
+  border-top: 1px solid var(--line);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
 }
 .activity-card > summary {
   display: grid;
@@ -1613,6 +1616,15 @@ fieldset.elicitation-field {
   display: contents;
 }
 
+/* Narrow-viewport affordances. Declared after the component rules so the
+   component's own `display` never wins on source order. */
+.mobile-only,
+.mobile-back,
+.sidebar-toggle,
+.sidebar-search-toggle {
+  display: none;
+}
+
 @keyframes pulse {
   50% {
     opacity: 0.35;
@@ -1737,6 +1749,10 @@ fieldset.elicitation-field {
     align-items: flex-start;
     flex-direction: column;
     gap: 0;
+  }
+  /* The header is already three lines deep on a phone; mode lives in details. */
+  .workspace-title > .mode-badge {
+    display: none;
   }
   .workspace-title h1 {
     font-size: var(--text-body);
