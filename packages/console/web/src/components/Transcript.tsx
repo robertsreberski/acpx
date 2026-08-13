@@ -6,10 +6,13 @@ import {
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { activityDurations, formatDuration } from "../activity-durations";
 import { shouldSubmitComposerKey } from "../composer-submit";
 import { booleanElicitationChoices, readElicitationField } from "../elicitation";
 import { interactionAvailability } from "../interaction-availability";
+import { orderPermissionOptions } from "../permission-options";
 import { unavailableQueuedControlsMessage } from "../queued-prompts";
+import { distanceFromBottom, restoreScrollAnchor, scrollableAncestor } from "../scroll-anchor";
 import { useSessionStore } from "../session-store";
 import type { ElicitationProperty, PendingInteraction } from "../types";
 import { consumeUiAction } from "../ui-actions";
@@ -29,64 +32,6 @@ function TranscriptText(_props: TextMessagePartProps) {
 
 const interactionIdFromToolName = (toolName: string): string | undefined =>
   toolName.startsWith("acpx:interaction:") ? toolName.slice("acpx:interaction:".length) : undefined;
-
-function PermissionCard({ interaction }: { readonly interaction: PendingInteraction }) {
-  const { answerInteraction, actionBusy, selectedSession } = useSessionStore();
-  const availability = interactionAvailability(interaction, selectedSession?.ownerState);
-  return (
-    <section
-      className={`interaction-card permission-card is-${interaction.state}`}
-      aria-label="Permission request"
-    >
-      <header>
-        <span className="interaction-kicker">Permission request</span>
-        <span className={`interaction-state is-${interaction.state}`}>{interaction.state}</span>
-      </header>
-      <h2>{interaction.title}</h2>
-      {interaction.detail && <p>{interaction.detail}</p>}
-      {availability.reason && (
-        <p className="interaction-unavailable" role="note">
-          {availability.reason}
-        </p>
-      )}
-      {interaction.state === "pending" && (
-        <div className="interaction-actions">
-          {interaction.options?.map((option) => (
-            <button
-              type="button"
-              key={option.id}
-              className={option.kind?.startsWith("allow") ? "approve-button" : "secondary-button"}
-              disabled={actionBusy || !availability.answerable}
-              onClick={() =>
-                consumeUiAction(
-                  answerInteraction(interaction.id, { type: "select", option_id: option.id }),
-                )
-              }
-            >
-              {option.label}
-            </button>
-          ))}
-          <button
-            type="button"
-            className="secondary-button"
-            disabled={actionBusy || !availability.answerable}
-            onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "decline" }))}
-          >
-            Decline
-          </button>
-          <button
-            type="button"
-            className="ghost-button"
-            disabled={actionBusy || !availability.answerable}
-            onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "cancel" }))}
-          >
-            Cancel
-          </button>
-        </div>
-      )}
-    </section>
-  );
-}
 
 const choicesFor = (property: ElicitationProperty): readonly { value: string; label: string }[] => {
   if (property.oneOf) {
@@ -249,7 +194,70 @@ function ElicitationField({
   );
 }
 
-function ElicitationCard({ interaction }: { readonly interaction: PendingInteraction }) {
+function PermissionRequest({ interaction }: { readonly interaction: PendingInteraction }) {
+  const { answerInteraction, actionBusy, selectedSession } = useSessionStore();
+  const availability = interactionAvailability(interaction, selectedSession?.ownerState);
+  const { primary, secondary } = orderPermissionOptions(interaction.options);
+  const disabled = actionBusy || !availability.answerable;
+  const answer = (value: unknown) => consumeUiAction(answerInteraction(interaction.id, value));
+  return (
+    <div className="request-dock-inner">
+      <div className="request-dock-copy">
+        <span className="interaction-kicker">Permission request</span>
+        <h2>{interaction.title}</h2>
+        {interaction.detail && <p>{interaction.detail}</p>}
+        {availability.reason && (
+          <p className="interaction-unavailable" role="note">
+            {availability.reason}
+          </p>
+        )}
+      </div>
+      <div className="request-dock-actions">
+        <div className="request-dock-secondary-row">
+          {secondary.map((option) => (
+            <button
+              type="button"
+              key={option.id}
+              className="request-dock-secondary"
+              disabled={disabled}
+              onClick={() => answer({ type: "select", option_id: option.id })}
+            >
+              {option.label}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="request-dock-secondary"
+            disabled={disabled}
+            onClick={() => answer({ type: "decline" })}
+          >
+            Decline
+          </button>
+          <button
+            type="button"
+            className="request-dock-secondary is-quiet"
+            disabled={disabled}
+            onClick={() => answer({ type: "cancel" })}
+          >
+            Cancel
+          </button>
+        </div>
+        {primary && (
+          <button
+            type="button"
+            className="approve-button"
+            disabled={disabled}
+            onClick={() => answer({ type: "select", option_id: primary.id })}
+          >
+            {primary.label}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ElicitationRequest({ interaction }: { readonly interaction: PendingInteraction }) {
   const { answerInteraction, actionBusy, selectedSession } = useSessionStore();
   const [error, setError] = useState<string | null>(null);
   const elicitation = interaction.elicitation;
@@ -262,6 +270,7 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
       return reason ? `${property.title ?? name}: ${reason}` : undefined;
     })
     .find((reason) => reason !== undefined);
+  const disabled = actionBusy || !availability.answerable;
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -292,26 +301,20 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
   };
 
   return (
-    <section
-      className={`interaction-card elicitation-card is-${interaction.state}`}
-      aria-label="Agent question"
-    >
-      <header>
+    <div className="request-dock-inner is-form">
+      <div className="request-dock-copy">
         <span className="interaction-kicker">Agent question</span>
-        <span className={`interaction-state is-${interaction.state}`}>{interaction.state}</span>
-      </header>
-      <h2>{elicitation?.message ?? interaction.title}</h2>
-      {availability.reason && (
-        <p className="interaction-unavailable" role="note">
-          {availability.reason}
-        </p>
-      )}
-      {unsupported && (
-        <p className="interaction-unavailable" role="alert">
-          This form cannot be answered safely here. {unsupported} Decline or cancel it instead.
-        </p>
-      )}
-      {interaction.state === "pending" && (
+        <h2>{elicitation?.message ?? interaction.title}</h2>
+        {availability.reason && (
+          <p className="interaction-unavailable" role="note">
+            {availability.reason}
+          </p>
+        )}
+        {unsupported && (
+          <p className="interaction-unavailable" role="alert">
+            This form cannot be answered safely here. {unsupported} Decline or cancel it instead.
+          </p>
+        )}
         <form onSubmit={submit}>
           {!unsupported &&
             fields.map(([name, property]) => (
@@ -327,65 +330,133 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
               {error}
             </p>
           )}
-          <div className="interaction-actions">
+          <div className="request-dock-actions">
+            <div className="request-dock-secondary-row">
+              <button
+                type="button"
+                className="request-dock-secondary"
+                disabled={disabled}
+                onClick={() =>
+                  consumeUiAction(answerInteraction(interaction.id, { type: "decline" }))
+                }
+              >
+                Decline
+              </button>
+              <button
+                type="button"
+                className="request-dock-secondary is-quiet"
+                disabled={disabled}
+                onClick={() =>
+                  consumeUiAction(answerInteraction(interaction.id, { type: "cancel" }))
+                }
+              >
+                Cancel
+              </button>
+            </div>
             <button
               type="submit"
               className="approve-button"
-              disabled={actionBusy || !availability.answerable || unsupported !== undefined}
+              disabled={disabled || unsupported !== undefined}
             >
               Accept
             </button>
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={actionBusy || !availability.answerable}
-              onClick={() =>
-                consumeUiAction(answerInteraction(interaction.id, { type: "decline" }))
-              }
-            >
-              Decline
-            </button>
-            <button
-              type="button"
-              className="ghost-button"
-              disabled={actionBusy || !availability.answerable}
-              onClick={() => consumeUiAction(answerInteraction(interaction.id, { type: "cancel" }))}
-            >
-              Cancel
-            </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A turn stalls until the request is answered, so the pending card leaves the
+ * scroll and docks above the composer. Older pending requests keep their place
+ * in the count; the oldest is the one actually blocking the turn.
+ */
+function RequestDock() {
+  const { pending } = useSessionStore();
+  const waiting = pending.filter((interaction) => interaction.state === "pending");
+  const blocking = waiting[0];
+  if (!blocking) {
+    return null;
+  }
+  return (
+    <section className="request-dock" aria-label="Waiting request">
+      {blocking.kind === "permission" ? (
+        <PermissionRequest interaction={blocking} />
+      ) : (
+        <ElicitationRequest interaction={blocking} />
+      )}
+      {waiting.length > 1 && (
+        <p className="request-dock-count">{waiting.length - 1} more waiting after this one.</p>
       )}
     </section>
   );
 }
 
-function ActivityTool({
+/** Answered, cancelled and expired requests stay in the transcript as history. */
+function AnsweredInteraction({ interaction }: { readonly interaction: PendingInteraction }) {
+  return (
+    <section
+      className={`interaction-card is-${interaction.state}`}
+      aria-label={interaction.kind === "permission" ? "Permission request" : "Agent question"}
+    >
+      <header>
+        <span className="interaction-kicker">
+          {interaction.kind === "permission" ? "Permission request" : "Agent question"}
+        </span>
+        <span className={`interaction-state is-${interaction.state}`}>{interaction.state}</span>
+      </header>
+      <h2>{interaction.elicitation?.message ?? interaction.title}</h2>
+      {interaction.detail && <p>{interaction.detail}</p>}
+    </section>
+  );
+}
+
+function ReasoningActivity({ durationMs }: { readonly durationMs?: number }) {
+  return (
+    <details className="reasoning-card">
+      <summary>
+        {durationMs === undefined
+          ? "Thought about it"
+          : `Thought for ${formatDuration(durationMs)}`}
+        <Icon name="chevron" size={15} />
+      </summary>
+      <div className="reasoning-body">
+        <MessagePrimitive.Parts components={{ Text: TranscriptText }} />
+      </div>
+    </details>
+  );
+}
+
+function ToolActivity({
   toolName,
   toolCallId,
   args,
   result,
   isError,
   status,
-}: ToolCallMessagePartProps) {
-  const { pending } = useSessionStore();
-  const interactionId = interactionIdFromToolName(toolName);
-  const interaction = interactionId ? pending.find((item) => item.id === interactionId) : undefined;
-  if (interaction?.kind === "permission") {
-    return <PermissionCard interaction={interaction} />;
-  }
-  if (interaction?.kind === "elicitation") {
-    return <ElicitationCard interaction={interaction} />;
-  }
-
+  durationMs,
+}: ToolCallMessagePartProps & { readonly durationMs?: number }) {
   const running = status.type === "running";
-  const title = toolName.startsWith("acpx:") ? toolName.slice(5).replaceAll("_", " ") : toolName;
+  const label = toolName.startsWith("acpx:") ? toolName.slice(5).replaceAll("_", " ") : toolName;
+  const state = running
+    ? "running"
+    : isError
+      ? "failed"
+      : durationMs === undefined
+        ? "done"
+        : formatDuration(durationMs);
   return (
-    <details className={`activity-card${isError ? " is-error" : ""}`} open={running}>
+    <details
+      className={`activity-card${isError ? " is-error" : ""}${running ? " is-running" : ""}`}
+      open={running}
+    >
       <summary>
-        <span className={`activity-indicator${running ? " is-running" : ""}`} />
-        <strong>{title}</strong>
-        <span>{running ? "active" : isError ? "failed" : "complete"}</span>
+        <span
+          className={`activity-indicator${running ? " is-running" : ""}${isError ? " is-error" : ""}`}
+        />
+        <strong>{label}</strong>
+        <span className="activity-duration">{state}</span>
         <Icon name="chevron" size={15} />
       </summary>
       <div className="activity-payload">
@@ -408,7 +479,30 @@ function ActivityTool({
   );
 }
 
-const MESSAGE_COMPONENTS = { Text: TranscriptText, tools: { Fallback: ActivityTool } };
+const useTranscriptActivity = () => {
+  const { pending, timeline } = useSessionStore();
+  const durations = useMemo(() => activityDurations(timeline?.events ?? []), [timeline?.events]);
+  return { pending, durations };
+};
+
+function ActivityPart(props: ToolCallMessagePartProps) {
+  const { pending, durations } = useTranscriptActivity();
+  const interactionId = interactionIdFromToolName(props.toolName);
+  const interaction = interactionId ? pending.find((item) => item.id === interactionId) : undefined;
+  if (interaction) {
+    // The dock owns the pending card; rendering it here too would duplicate it.
+    return interaction.state === "pending" ? null : (
+      <AnsweredInteraction interaction={interaction} />
+    );
+  }
+  const durationMs = durations.get(props.toolCallId);
+  if (props.toolName === "acpx:reasoning") {
+    return <ReasoningActivity durationMs={durationMs} />;
+  }
+  return <ToolActivity {...props} durationMs={durationMs} />;
+}
+
+const MESSAGE_COMPONENTS = { Text: TranscriptText, tools: { Fallback: ActivityPart } };
 
 function UserMessage() {
   return (
@@ -432,6 +526,56 @@ function AssistantMessage() {
   );
 }
 
+/**
+ * Page earlier history as the reader approaches the top of the transcript.
+ * There is no Load earlier button by design; the viewport says quietly that it
+ * is fetching and holds the reader's place across the prepend.
+ */
+function useAutoLoadEarlier(
+  sentinel: HTMLDivElement | null,
+  canLoadEarlier: boolean,
+  loadEarlier: () => Promise<void>,
+): boolean {
+  const loadingRef = useRef(false);
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    if (!sentinel || !canLoadEarlier) {
+      return undefined;
+    }
+    const scroller = scrollableAncestor(sentinel);
+    if (!scroller) {
+      return undefined;
+    }
+    let cancelled = false;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (loadingRef.current || !entries.some((entry) => entry.isIntersecting)) {
+          return;
+        }
+        loadingRef.current = true;
+        setLoading(true);
+        const anchor = distanceFromBottom(scroller);
+        void loadEarlier().finally(() => {
+          requestAnimationFrame(() => {
+            restoreScrollAnchor(scroller, anchor);
+            loadingRef.current = false;
+            if (!cancelled) {
+              setLoading(false);
+            }
+          });
+        });
+      },
+      { root: scroller, rootMargin: "240px 0px 0px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [sentinel, canLoadEarlier, loadEarlier]);
+  return loading;
+}
+
 export function Transcript() {
   const store = useSessionStore();
   const session = store.selectedSession;
@@ -444,6 +588,12 @@ export function Transcript() {
   const unavailableQueueControls = unavailableQueuedControlsMessage(
     session?.queuedCount ?? 0,
     store.queuedPrompts.length,
+  );
+  const [sentinel, setSentinel] = useState<HTMLDivElement | null>(null);
+  const loadingEarlier = useAutoLoadEarlier(
+    sentinel,
+    store.timeline?.previousCursor !== undefined,
+    store.loadEarlier,
   );
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const composerDraft = session ? store.composerDraftFor(session.id) : "";
@@ -479,10 +629,12 @@ export function Transcript() {
     <ThreadPrimitive.Root className="thread-root">
       <ThreadPrimitive.Viewport className="thread-viewport">
         <div className="timeline-boundary">
-          {store.timeline?.previousCursor && (
-            <button type="button" className="load-earlier" onClick={() => void store.loadEarlier()}>
-              Load earlier
-            </button>
+          <div ref={setSentinel} aria-hidden="true" />
+          {loadingEarlier && (
+            <p className="timeline-loading" role="status">
+              <i />
+              Loading earlier turns
+            </p>
           )}
           {store.timeline?.continuityIssue && (
             <div className="history-gap is-error" role="alert">
@@ -512,7 +664,7 @@ export function Transcript() {
         <ThreadPrimitive.Empty>
           <div className="empty-thread">
             <div className="empty-thread-mark">
-              <Icon name="spark" size={25} />
+              <Icon name="spark" size={26} />
             </div>
             <h2>
               {store.timeline?.legacyImportPending === true
@@ -554,13 +706,9 @@ export function Transcript() {
           Jump to latest
         </ThreadPrimitive.ScrollToBottom>
       </ThreadPrimitive.Viewport>
+      <RequestDock />
       {session?.sessionState === "open" && (
         <div className="composer-shell">
-          {store.pending.some((item) => item.state === "pending") && (
-            <p className="composer-note is-attention">
-              Answer the waiting request above to unblock this turn.
-            </p>
-          )}
           <form className="composer" onSubmit={submitPrompt}>
             <textarea
               ref={composerInput}
@@ -570,41 +718,31 @@ export function Transcript() {
                 session && store.setComposerDraft(session.id, event.target.value)
               }
               onKeyDown={composerKeyDown}
-              placeholder={
-                isBusy
-                  ? "Queue a follow-up for after the current turn…"
-                  : "Ask the agent to work on something…"
-              }
+              placeholder={isBusy ? "Queue a follow-up…" : "Ask the agent to work on something…"}
               aria-label="Prompt"
               rows={1}
             />
-            <div className="composer-actions">
-              {isBusy && session.activeTurnId && (
-                <button
-                  type="button"
-                  className="composer-stop"
-                  onClick={() => consumeUiAction(store.cancelTurn())}
-                  disabled={store.actionBusy}
-                >
-                  <Icon name="stop" size={15} /> Stop
-                </button>
-              )}
+            {isBusy && session.activeTurnId && (
               <button
-                type="submit"
-                className="composer-send"
-                disabled={store.actionBusy || composerDraft.trim() === ""}
-                aria-label={sendLabel}
+                type="button"
+                className="composer-stop"
+                aria-label="Stop the current turn"
+                onClick={() => consumeUiAction(store.cancelTurn())}
+                disabled={store.actionBusy}
               >
-                <span>{sendLabel}</span>
-                <Icon name="send" size={16} />
+                <Icon name="stop" size={17} />
               </button>
-            </div>
+            )}
+            <button
+              type="submit"
+              className="composer-send"
+              disabled={store.actionBusy || composerDraft.trim() === ""}
+              aria-label={sendLabel}
+            >
+              <Icon name="send" size={19} />
+            </button>
           </form>
-          {isBusy && (
-            <p className="composer-note">
-              Queued follow-ups start after the current turn finishes.
-            </p>
-          )}
+          {isBusy && <p className="composer-note">Follow-ups start after this turn finishes.</p>}
         </div>
       )}
     </ThreadPrimitive.Root>

@@ -989,6 +989,10 @@ const sessionSummary = (session: WireSession): SessionSummary => ({
   sessionState: session.sessionState,
   ownerState: session.ownerState,
   turnState: session.turnState,
+  model: session.model,
+  mode: session.mode,
+  desiredMode: session.desiredMode,
+  effectiveMode: session.effectiveMode,
   pendingCount: session.pendingCount ?? 0,
   queuedCount: session.queue.depth,
   queuedTurns: (session.queue.turns ?? []).map((turn) => ({
@@ -1005,12 +1009,8 @@ const sessionSummary = (session: WireSession): SessionSummary => ({
 const sessionDetail = (session: WireSession): SessionDetail => ({
   ...sessionSummary(session),
   providerSessionId: session.providerSessionId ?? session.acpSessionId,
-  mode: session.mode,
-  desiredMode: session.desiredMode,
-  effectiveMode: session.effectiveMode,
   modeState: session.modeState ?? "unmanaged",
   modeRemediation: session.modeRemediation,
-  model: session.model,
   permissionPolicy: session.permissionPolicy,
   closeReason: session.closeReason,
 });

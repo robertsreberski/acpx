@@ -38,6 +38,11 @@ export interface SessionSummary {
   readonly sessionState: SessionState;
   readonly ownerState: OwnerState;
   readonly turnState: TurnState;
+  /** Harness identity. The session list renders these, so they live on the summary. */
+  readonly model?: string;
+  readonly mode?: string;
+  readonly desiredMode?: string;
+  readonly effectiveMode?: string;
   readonly pendingCount: number;
   readonly queuedCount: number;
   readonly queuedTurns: readonly {
@@ -54,12 +59,8 @@ export interface SessionSummary {
 
 export interface SessionDetail extends SessionSummary {
   readonly providerSessionId?: string;
-  readonly mode?: string;
-  readonly desiredMode?: string;
-  readonly effectiveMode?: string;
   readonly modeState: ModeState;
   readonly modeRemediation?: string;
-  readonly model?: string;
   readonly permissionPolicy?: unknown;
   readonly closeReason?: string;
 }

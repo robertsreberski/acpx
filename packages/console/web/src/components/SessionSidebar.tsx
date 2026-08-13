@@ -1,29 +1,73 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useDismissibleLayer } from "../dismissible-layer";
+import {
+  displayRepo,
+  groupSessionsByRepo,
+  harnessLine,
+  modeBadge,
+  sessionStatus,
+} from "../session-presentation";
 import { sessionGroup, useSessionStore } from "../session-store";
-import { absoluteSessionTime, relativeSessionTime } from "../session-time";
+import { absoluteSessionTime, compactSessionTime } from "../session-time";
 import type { SessionSummary } from "../types";
 import { Icon } from "./Icon";
 
-const GROUPS = [
-  { id: "needs", label: "Needs you" },
-  { id: "working", label: "Working" },
-  { id: "open", label: "Open" },
-  { id: "history", label: "History" },
-] as const;
-
-const displayRepo = (session: SessionSummary): string =>
-  session.repo ?? session.cwd.split("/").findLast(Boolean) ?? session.cwd;
-
-const stateLabel = (session: SessionSummary): string => {
-  if (session.pendingCount > 0) {
-    return `${session.pendingCount} waiting`;
-  }
-  if (session.queuedCount > 0) {
-    return `${session.queuedCount} queued`;
-  }
-  return session.turnState.replaceAll("_", " ");
+/** Live and waiting work stays on screen; finished and idle sessions collapse. */
+const isLiveWork = (session: SessionSummary): boolean => {
+  const group = sessionGroup(session);
+  return group === "needs" || group === "working";
 };
+
+const matchesQuery = (session: SessionSummary, needle: string): boolean =>
+  !needle ||
+  [session.name, session.agentLabel, session.cwd, session.repo, session.branch, session.model].some(
+    (value) => value?.toLocaleLowerCase().includes(needle),
+  );
+
+function SessionRow({
+  session,
+  selected,
+  now,
+  onSelect,
+}: {
+  readonly session: SessionSummary;
+  readonly selected: boolean;
+  readonly now: number;
+  readonly onSelect: () => void;
+}) {
+  const badge = modeBadge(session);
+  const status = sessionStatus(session);
+  const harness = harnessLine(session);
+  return (
+    <button
+      type="button"
+      className={`session-row${selected ? " is-selected" : ""}`}
+      aria-current={selected ? "page" : undefined}
+      onClick={onSelect}
+    >
+      <span className="session-row-head">
+        <strong>{session.name || displayRepo(session)}</strong>
+        <time
+          dateTime={session.lastActivityAt}
+          title={absoluteSessionTime(session.lastActivityAt)}
+          aria-label={`Last activity: ${absoluteSessionTime(session.lastActivityAt)}`}
+        >
+          {compactSessionTime(session.lastActivityAt, now)}
+        </time>
+      </span>
+      <span className="session-row-state">
+        {badge && (
+          <span className={`mode-badge${badge.canWrite ? " is-write" : ""}`}>{badge.label}</span>
+        )}
+        <span className={`session-row-status is-${status.tone}`}>
+          <i className={`state-dot is-${status.tone}`} />
+          {status.text}
+        </span>
+      </span>
+      {harness && <span className="session-row-harness">{harness}</span>}
+    </button>
+  );
+}
 
 export function SessionSidebar({
   open,
@@ -41,27 +85,46 @@ export function SessionSidebar({
   const sidebarLayerRef = useRef<HTMLDivElement>(null);
   useDismissibleLayer(open, onClose, sidebarLayerRef);
   const [query, setQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [repoFilter, setRepoFilter] = useState<string | null>(null);
+  const [showDone, setShowDone] = useState(false);
   const [relativeTimeNow, setRelativeTimeNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setRelativeTimeNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, []);
-  const groups = useMemo(() => {
+
+  const { live, done, repos } = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
-    const filtered = bootstrap.sessions.filter(
-      (session) =>
-        !needle ||
-        [session.name, session.agentLabel, session.cwd, session.repo, session.branch].some(
-          (value) => value?.toLocaleLowerCase().includes(needle),
-        ),
-    );
-    return new Map(
-      GROUPS.map((group) => [
-        group.id,
-        filtered.filter((session) => sessionGroup(session) === group.id),
-      ]),
-    );
-  }, [bootstrap.sessions, query]);
+    const matched = bootstrap.sessions.filter((session) => matchesQuery(session, needle));
+    const liveSessions = matched.filter(isLiveWork);
+    const counts = new Map<string, number>();
+    for (const session of liveSessions) {
+      const repo = displayRepo(session);
+      counts.set(repo, (counts.get(repo) ?? 0) + 1);
+    }
+    const inFilter = (session: SessionSummary) =>
+      repoFilter === null || displayRepo(session) === repoFilter;
+    return {
+      live: groupSessionsByRepo(liveSessions.filter(inFilter)),
+      done: matched.filter((session) => !isLiveWork(session)).filter(inFilter),
+      repos: [...counts.entries()].toSorted((left, right) => left[0].localeCompare(right[0])),
+    };
+  }, [bootstrap.sessions, query, repoFilter]);
+
+  // A filtered-away repo would otherwise leave the list permanently empty.
+  useEffect(() => {
+    if (repoFilter !== null && !repos.some(([repo]) => repo === repoFilter)) {
+      setRepoFilter(null);
+    }
+  }, [repoFilter, repos]);
+
+  const liveCount = repos.reduce((total, [, count]) => total + count, 0);
+  const nothingMatches = live.length === 0 && done.length === 0;
+  const select = (id: string) => {
+    selectSession(id);
+    onClose();
+  };
 
   return (
     <div ref={sidebarLayerRef} className="sidebar-layer">
@@ -77,8 +140,19 @@ export function SessionSidebar({
           </div>
           <div>
             <strong>ACPX Console</strong>
-            <span>Coding sessions</span>
+            <span>
+              {bootstrap.sessions.length} local session{bootstrap.sessions.length === 1 ? "" : "s"}
+            </span>
           </div>
+          <button
+            type="button"
+            className="icon-button sidebar-search-toggle"
+            aria-label={searchOpen ? "Hide session search" : "Search sessions"}
+            aria-expanded={searchOpen}
+            onClick={() => setSearchOpen((value) => !value)}
+          >
+            <Icon name="search" size={20} />
+          </button>
           <button
             className="icon-button mobile-only"
             type="button"
@@ -88,16 +162,8 @@ export function SessionSidebar({
             <Icon name="close" />
           </button>
         </header>
-        <div className="sidebar-actions">
-          <button type="button" className="primary-button" onClick={onCreate}>
-            <Icon name="plus" size={16} /> New session
-          </button>
-          <button type="button" className="secondary-button" onClick={onAdopt}>
-            Adopt session
-          </button>
-        </div>
-        <label className="session-search">
-          <Icon name="search" size={15} />
+        <label className={`session-search${searchOpen ? " is-open" : ""}`}>
+          <Icon name="search" size={18} />
           <span className="sr-only">Search sessions</span>
           <input
             value={query}
@@ -105,6 +171,30 @@ export function SessionSidebar({
             placeholder="Search sessions"
           />
         </label>
+        {repos.length > 1 && (
+          <div className="repo-filters" role="group" aria-label="Filter by project">
+            <button
+              type="button"
+              className={`repo-chip${repoFilter === null ? " is-active" : ""}`}
+              aria-pressed={repoFilter === null}
+              onClick={() => setRepoFilter(null)}
+            >
+              All<span>{liveCount}</span>
+            </button>
+            {repos.map(([repo, count]) => (
+              <button
+                type="button"
+                key={repo}
+                className={`repo-chip${repoFilter === repo ? " is-active" : ""}`}
+                aria-pressed={repoFilter === repo}
+                onClick={() => setRepoFilter(repo)}
+              >
+                {repo}
+                <span>{count}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <nav className="session-groups" aria-label="Session list">
           {loading && bootstrap.sessions.length === 0 && (
             <p className="sidebar-empty">Loading sessions…</p>
@@ -112,55 +202,54 @@ export function SessionSidebar({
           {!loading && bootstrap.sessions.length === 0 && (
             <p className="sidebar-empty">No sessions yet.</p>
           )}
-          {GROUPS.map((group) => {
-            const sessions = groups.get(group.id) ?? [];
-            if (sessions.length === 0) {
-              return null;
-            }
-            return (
-              <section className="session-group" key={group.id}>
-                <h2>
-                  {group.label}
-                  <span>{sessions.length}</span>
-                </h2>
+          {live.map((group) => (
+            <section className="session-group" key={group.repo}>
+              <h2>{group.repo}</h2>
+              <ul>
+                {group.sessions.map((session) => (
+                  <li key={session.id}>
+                    <SessionRow
+                      session={session}
+                      selected={selectedSessionId === session.id}
+                      now={relativeTimeNow}
+                      onSelect={() => select(session.id)}
+                    />
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+          {done.length > 0 && (
+            <section className="session-done">
+              <button
+                type="button"
+                className="show-done"
+                aria-expanded={showDone}
+                onClick={() => setShowDone((value) => !value)}
+              >
+                {showDone ? "Hide" : "Show"} {done.length} done
+                <Icon name="chevron" size={16} />
+              </button>
+              {showDone && (
                 <ul>
-                  {sessions.map((session) => (
+                  {done.map((session) => (
                     <li key={session.id}>
-                      <button
-                        type="button"
-                        className={`session-row${selectedSessionId === session.id ? " is-selected" : ""}`}
-                        aria-current={selectedSessionId === session.id ? "page" : undefined}
-                        onClick={() => {
-                          selectSession(session.id);
-                          onClose();
-                        }}
-                      >
-                        <span className={`state-dot is-${sessionGroup(session)}`} />
-                        <span className="session-row-copy">
-                          <strong>{session.name || displayRepo(session)}</strong>
-                          <span>
-                            {displayRepo(session)} · {session.agentLabel}
-                          </span>
-                          <span className="session-row-meta">
-                            <em>{stateLabel(session)}</em>
-                            <time
-                              dateTime={session.lastActivityAt}
-                              title={absoluteSessionTime(session.lastActivityAt)}
-                              aria-label={`Last activity: ${absoluteSessionTime(session.lastActivityAt)}`}
-                            >
-                              {relativeSessionTime(session.lastActivityAt, relativeTimeNow)}
-                            </time>
-                          </span>
-                        </span>
-                      </button>
+                      <SessionRow
+                        session={session}
+                        selected={selectedSessionId === session.id}
+                        now={relativeTimeNow}
+                        onSelect={() => select(session.id)}
+                      />
                     </li>
                   ))}
                 </ul>
-              </section>
-            );
-          })}
-          {query && [...groups.values()].every((sessions) => sessions.length === 0) && (
-            <p className="sidebar-empty">No sessions match “{query}”.</p>
+              )}
+            </section>
+          )}
+          {bootstrap.sessions.length > 0 && nothingMatches && (
+            <p className="sidebar-empty">
+              {query ? `No sessions match “${query}”.` : "No sessions in this project."}
+            </p>
           )}
         </nav>
         <footer className="sidebar-footer">
@@ -171,8 +260,16 @@ export function SessionSidebar({
             ? "Live updates disconnected"
             : loading || connectionState === "connecting"
               ? "Refreshing…"
-              : `${bootstrap.sessions.length} local session${bootstrap.sessions.length === 1 ? "" : "s"}`}
+              : `${liveCount} active`}
         </footer>
+        <div className="sidebar-actions">
+          <button type="button" className="primary-button" onClick={onCreate}>
+            <Icon name="plus" size={18} /> New session
+          </button>
+          <button type="button" className="ghost-button" onClick={onAdopt}>
+            Adopt
+          </button>
+        </div>
       </aside>
       {open && <button className="sidebar-scrim" aria-label="Close sessions" onClick={onClose} />}
     </div>

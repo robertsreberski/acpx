@@ -7,9 +7,32 @@ import { SessionSelectionFallback } from "./components/SessionSelectionFallback"
 import { SessionSidebar } from "./components/SessionSidebar";
 import { Transcript } from "./components/Transcript";
 import { AcpxRuntimeProvider } from "./runtime";
+import { displayRepo, harnessLine, modeBadge, sessionStatus } from "./session-presentation";
 import { useSessionStore } from "./session-store";
+import type { SessionDetail } from "./types";
 
-const turnLabel = (state: string): string => state.replaceAll("_", " ");
+function WorkspaceTitle({ session }: { readonly session: SessionDetail }) {
+  const status = sessionStatus(session);
+  const badge = modeBadge(session);
+  const harness = harnessLine(session);
+  return (
+    <div className="workspace-title">
+      <div>
+        <h1>{session.name}</h1>
+        <div className="workspace-meta">
+          <span>
+            <i className={`state-dot is-${status.tone}`} />
+            {[status.text, displayRepo(session), session.branch].filter(Boolean).join(" · ")}
+          </span>
+          {harness && <span className="workspace-harness">{harness}</span>}
+        </div>
+      </div>
+      {badge && (
+        <span className={`mode-badge${badge.canWrite ? " is-write" : ""}`}>{badge.label}</span>
+      )}
+    </div>
+  );
+}
 
 function Welcome({
   onCreate,
@@ -86,18 +109,7 @@ export default function App() {
                     setSidebarOpen(true);
                   }}
                 />
-                <div className="workspace-title">
-                  <div>
-                    <h1>{session.name}</h1>
-                    <span>
-                      {session.agentLabel} · {session.repo ?? session.cwd}
-                    </span>
-                  </div>
-                  <span className={`session-status is-${session.turnState}`}>
-                    <i />
-                    {turnLabel(session.turnState)}
-                  </span>
-                </div>
+                <WorkspaceTitle session={session} />
                 <button
                   type="button"
                   className="icon-button"
@@ -114,7 +126,9 @@ export default function App() {
               <div className="workspace-title">
                 <div>
                   <h1>Sessions</h1>
-                  <span>Local ACP agent work</span>
+                  <div className="workspace-meta">
+                    <span>Local ACP agent work</span>
+                  </div>
                 </div>
               </div>
             )}

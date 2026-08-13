@@ -15,7 +15,10 @@ test("the mobile Sessions control exposes its dialog action without a dangling t
   assert.doesNotMatch(markup, /aria-controls=/u);
   assert.match(markup, /aria-haspopup="dialog"/u);
   assert.match(markup, /aria-expanded="false"/u);
-  assert.match(markup, /> Sessions<\/button>/u);
+  // The design's back affordance is icon-only, so the accessible name is the
+  // aria-label rather than visible text.
+  assert.match(markup, /<svg[^>]*aria-hidden="true"/u);
+  assert.doesNotMatch(markup, />\s*Sessions\s*</u);
 });
 
 test("the mobile Sessions control invokes only its drawer-open action", async () => {

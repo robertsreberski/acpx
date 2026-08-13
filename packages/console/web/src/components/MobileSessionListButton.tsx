@@ -16,7 +16,7 @@ export function MobileSessionListButton({
       aria-expanded={open}
       onClick={onOpen}
     >
-      <Icon name="back" /> Sessions
+      <Icon name="back" size={22} />
     </button>
   );
 }

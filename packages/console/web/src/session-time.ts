@@ -30,6 +30,31 @@ export const relativeSessionTime = (
   return formatter.format(roundRelative(hours / 24), "day");
 };
 
+/**
+ * Compact age for the session list, where a full "2 minutes ago" would crowd the
+ * row title. Falls back to an em dash rather than a sentence when unparseable.
+ */
+export const compactSessionTime = (value: string, now = Date.now()): string => {
+  const parsed = timestamp(value);
+  if (parsed === undefined) {
+    return "—";
+  }
+  const seconds = Math.max(0, Math.round((now - parsed) / 1_000));
+  if (seconds < 45) {
+    return "now";
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `${Math.max(1, minutes)}m`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h`;
+  }
+  const days = Math.round(hours / 24);
+  return days < 7 ? `${days}d` : `${Math.round(days / 7)}w`;
+};
+
 export const absoluteSessionTime = (value: string, locales?: Intl.LocalesArgument): string => {
   const parsed = timestamp(value);
   if (parsed === undefined) {
