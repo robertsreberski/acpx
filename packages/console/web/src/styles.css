@@ -115,6 +115,9 @@ body,
 body {
   min-width: 320px;
   overflow: hidden;
+  /* iOS still rubber-bands the document even with overflow hidden, which drags
+     the whole app away from the notch while a transcript scrolls inside it. */
+  overscroll-behavior: none;
   -webkit-font-smoothing: antialiased;
 }
 button,
@@ -167,7 +170,11 @@ button:disabled {
    drops the body into the `auto` row whenever the warning is absent. */
 .app-shell {
   display: flex;
-  height: 100%;
+  /* Shrink above the keyboard rather than padding the composer: the scroller is
+     a flex child, so the transcript gives up the height and every fixed row —
+     composer, dock — stays on screen. `--keyboard-inset` is 0 everywhere that
+     has no soft keyboard. */
+  height: calc(100% - var(--keyboard-inset, 0px));
   flex-direction: column;
   background: var(--canvas);
 }
@@ -374,6 +381,45 @@ button:disabled {
 .session-done {
   margin-top: 4px;
 }
+.hidden-workspaces {
+  margin-top: 4px;
+}
+.hidden-workspaces ul {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.hidden-workspaces li {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin-top: 8px;
+  background: var(--panel);
+}
+.hidden-workspace-path {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-id);
+}
+.hidden-workspace-note {
+  margin: 4px 0 0;
+  color: var(--faint);
+  font-size: var(--text-meta);
+}
+.hidden-workspaces .secondary-button {
+  width: 100%;
+  margin-top: 10px;
+}
+.hidden-workspace-error {
+  padding: 10px 14px;
+  border: 1px solid var(--danger);
+  border-radius: 12px;
+  margin-top: 8px;
+  color: var(--danger);
+  font-size: var(--text-meta);
+}
 .show-done {
   display: flex;
   width: 100%;
@@ -566,7 +612,10 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 14px 20px 20px;
+  /* Bottom row of a full-screen drawer on a phone: without the inset the home
+     indicator sits on top of these controls. */
+  padding: 14px calc(20px + env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom))
+    calc(20px + env(safe-area-inset-left));
   border-top: 1px solid var(--line);
 }
 .sidebar-actions .primary-button {
@@ -597,13 +646,15 @@ button:disabled {
 }
 .workspace-header {
   display: flex;
-  /* Installed on iOS the page runs under the status bar and Dynamic Island, so
-     the first row has to clear the top inset or its controls sit beneath them. */
-  padding-top: env(safe-area-inset-top);
   min-height: 76px;
   align-items: center;
   gap: 12px;
-  padding: 14px 28px;
+  /* Installed on iOS the page runs under the status bar and Dynamic Island, so
+     the first row has to clear the top inset or its controls sit beneath them.
+     The inset belongs inside the shorthand: declared separately it is silently
+     dropped by any later `padding` here or in a breakpoint below. */
+  padding: calc(14px + env(safe-area-inset-top)) calc(28px + env(safe-area-inset-right)) 14px
+    calc(28px + env(safe-area-inset-left));
   border-bottom: 1px solid var(--line);
   background: var(--panel);
 }
@@ -753,8 +804,15 @@ button:disabled {
   min-height: 0;
   flex: 1;
   overflow-y: auto;
+  /* Reaching the top of the transcript must not hand the gesture to the page. */
+  overscroll-behavior-y: contain;
   padding: 24px 28px 0;
   scroll-behavior: smooth;
+}
+/* Auto-paging restores scroll position by assignment; `smooth` would animate
+   that correction and read as the lurch it exists to prevent. */
+.thread-viewport.is-restoring-scroll {
+  scroll-behavior: auto;
 }
 .thread-viewport > [data-radix-scroll-area-viewport] {
   min-height: 100%;
@@ -900,7 +958,9 @@ button:disabled {
 }
 .reasoning-card > summary {
   display: inline-flex;
-  min-height: 36px;
+  /* The design's floor applies to a disclosure as much as to a button: this was
+     the one control on the transcript that fell under it. */
+  min-height: var(--tap);
   align-items: center;
   gap: 8px;
   color: var(--muted);
@@ -1815,10 +1875,10 @@ fieldset.elicitation-field {
   .thread-viewport,
   .composer-shell,
   .request-dock {
-    padding-inline: 20px;
+    padding-inline: calc(20px + env(safe-area-inset-left)) calc(20px + env(safe-area-inset-right));
   }
   .workspace-header {
-    padding-inline: 20px;
+    padding-inline: calc(20px + env(safe-area-inset-left)) calc(20px + env(safe-area-inset-right));
   }
 }
 
@@ -1826,7 +1886,7 @@ fieldset.elicitation-field {
    ------------------------------------------------------------------ */
 @media (max-width: 600px) {
   .network-warning {
-    padding: 8px 12px;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
   }
   .session-sidebar {
     width: 100%;
@@ -1856,7 +1916,10 @@ fieldset.elicitation-field {
   .workspace-header {
     min-height: 60px;
     gap: 6px;
-    padding: 8px 8px 8px 4px;
+    /* This is the rule in force on a phone, so it carries the top inset itself:
+       inheriting it from the base rule is not possible through a shorthand. */
+    padding: calc(8px + env(safe-area-inset-top)) calc(8px + env(safe-area-inset-right)) 8px
+      calc(4px + env(safe-area-inset-left));
   }
   .session-workspace.has-session .sidebar-toggle {
     display: none;

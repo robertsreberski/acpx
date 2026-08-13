@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import { registerInstallWorker } from "./install";
+import { registerKeyboardInset } from "./keyboard-inset";
 import { SessionStoreProvider } from "./session-store";
 import "./styles.css";
 
@@ -12,6 +13,7 @@ if (!root) {
 }
 
 registerInstallWorker();
+registerKeyboardInset();
 
 createRoot(root).render(
   <StrictMode>
