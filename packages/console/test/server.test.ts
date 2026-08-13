@@ -738,6 +738,77 @@ test("invalid pending answers and inaccessible workspaces are typed client error
   }
 });
 
+test("pending answer timeouts expose whether delivery is unknown or did not happen", async () => {
+  const { running, service } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    for (const [answerOutcome, message] of [
+      ["unknown", "Request answer outcome is unknown; it may still be applied"],
+      ["not_delivered", "Request answer was not delivered before timeout"],
+    ] as const) {
+      service.respondToPendingRequest = async () => {
+        throw Object.assign(new Error("private queue failure"), {
+          detailCode: "PENDING_REQUEST_ANSWER_TIMEOUT",
+          answerOutcome,
+        });
+      };
+      const response = await fetch(
+        `${running.origin}/api/v1/sessions/record-1/pending/request-1/responses`,
+        {
+          method: "POST",
+          headers: mutationHeaders(auth, `timeout-${answerOutcome}`),
+          body: JSON.stringify({ response: { type: "cancel" } }),
+        },
+      );
+      assert.equal(response.status, 504);
+      assert.deepEqual(await response.json(), {
+        error: {
+          code: "PENDING_REQUEST_ANSWER_TIMEOUT",
+          message,
+          details: { answerOutcome },
+        },
+      });
+    }
+  } finally {
+    await running.close();
+  }
+});
+
+test("an unconfirmed pending response is a typed accepted-but-unknown result", async () => {
+  const { running, service } = await fixture();
+  try {
+    const auth = await bootstrap(running.origin);
+    service.respondToPendingRequest = async (input) => ({
+      requestId: input.requestId,
+      acpxRecordId: input.acpxRecordId,
+      kind: "permission",
+      state: "pending",
+      createdAt: "2026-08-12T00:00:00.000Z",
+    });
+    const response = await fetch(
+      `${running.origin}/api/v1/sessions/record-1/pending/request-1/responses`,
+      {
+        method: "POST",
+        headers: mutationHeaders(auth, "unknown-answer-key"),
+        body: JSON.stringify({ response: { type: "cancel" } }),
+      },
+    );
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), {
+      pending: {
+        requestId: "request-1",
+        acpxRecordId: "record-1",
+        kind: "permission",
+        state: "pending",
+        createdAt: "2026-08-12T00:00:00.000Z",
+      },
+      outcome: "unknown",
+    });
+  } finally {
+    await running.close();
+  }
+});
+
 test("a failed listen unsubscribes and disposes the service", async () => {
   const { root, running } = await fixture();
   const service = new MockSessionService();

@@ -2084,7 +2084,9 @@ test("pending responses inherit a bounded service timeout when the request omits
       sessionId: initial.acpxRecordId,
       ownerGeneration: 77,
     });
+    let responseWrites = 0;
     const server = createSingleRequestServer((socket, request) => {
+      responseWrites += 1;
       socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
       // Deliberately never send respond_request_result. The service-level default
       // must bound this browser mutation even though the owner accepted it.
@@ -2107,10 +2109,64 @@ test("pending responses inherit a bounded service timeout when the request omits
             (error as { detailCode?: string }).detailCode,
             "PENDING_REQUEST_ANSWER_TIMEOUT",
           );
+          assert.equal((error as { answerOutcome?: string }).answerOutcome, "unknown");
           return true;
         },
       );
       assert.ok(Date.now() - startedAt < 1_000);
+
+      for (const [idempotencyKey, answer] of [
+        ["bounded-pending-response", { type: "cancel" }],
+        ["bounded-pending-conflict", { type: "select", option_id: "allow" }],
+      ] as const) {
+        await assert.rejects(
+          async () =>
+            await service.respondToPendingRequest({
+              acpxRecordId: initial.acpxRecordId,
+              requestId: "live-only-request",
+              answer,
+              idempotencyKey,
+            }),
+          (error: unknown) => {
+            assert.equal((error as { answerOutcome?: string }).answerOutcome, "unknown");
+            return true;
+          },
+        );
+      }
+      assert.equal(responseWrites, 1, "an ambiguous answer was written to the owner twice");
+
+      const settledAt = new Date().toISOString();
+      await writePendingRequest({
+        schema: PENDING_REQUEST_SCHEMA,
+        kind: "permission",
+        requestId: "live-only-request",
+        sessionId: initial.acpxRecordId,
+        acpSessionId: initial.acpSessionId,
+        agentCommand: initial.agentCommand,
+        cwd,
+        state: "cancelled",
+        createdAt: settledAt,
+        updatedAt: settledAt,
+        ownerPid: keeper.pid!,
+        ownerGeneration: 77,
+        taskRequestId: "turn-bounded-response",
+        toolCall: {
+          toolCallId: "tool-bounded-response",
+          title: "Bounded response",
+          kind: "execute",
+        },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        resolution: { source: "cli", action: "cancel", answeredAt: settledAt },
+      });
+      const reconciled = await service.respondToPendingRequest({
+        acpxRecordId: initial.acpxRecordId,
+        requestId: "live-only-request",
+        answer: { type: "decline" },
+        idempotencyKey: "bounded-pending-reconcile",
+      });
+      assert.equal(reconciled.result.state, "cancelled");
+      assert.equal(reconciled.replayed, true);
+      assert.equal(responseWrites, 1, "durable reconciliation resubmitted the answer");
     } finally {
       service.dispose();
       await closeServer(server);

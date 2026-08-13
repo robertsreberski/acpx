@@ -12,6 +12,13 @@ export const interactionAvailability = (
   if (interaction.state !== "pending") {
     return { answerable: false, reason: `This request is ${interaction.state}.` };
   }
+  if (interaction.responseOutcome === "unknown") {
+    return {
+      answerable: false,
+      reason:
+        "The previous answer may still be applied. Wait for the durable request state to settle before answering again.",
+    };
+  }
   if (ownerState !== "online") {
     const label = ownerState === undefined ? "not available" : ownerState;
     return {

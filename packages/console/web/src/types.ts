@@ -138,6 +138,8 @@ export interface PendingInteraction {
   readonly sessionId: string;
   readonly kind: "permission" | "elicitation";
   readonly state: "pending" | "answered" | "cancelled" | "expired" | "orphaned";
+  /** A prior response crossed the write boundary but has not been confirmed. */
+  readonly responseOutcome?: "unknown";
   readonly createdAt: string;
   readonly title: string;
   readonly detail?: string;

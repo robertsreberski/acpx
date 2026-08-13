@@ -19,12 +19,23 @@ import type {
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly details?: unknown;
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, details?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.details = details;
+  }
+}
+
+export class PendingResponseOutcomeUnknownError extends Error {
+  constructor() {
+    super(
+      "The answer may still be applied. Wait for the request state to settle; a conflicting answer is blocked.",
+    );
+    this.name = "PendingResponseOutcomeUnknownError";
   }
 }
 
@@ -64,7 +75,11 @@ const json = async <T>(response: Response): Promise<T> => {
   }
   const typedBody = body as
     | {
-        readonly error?: { readonly message?: string; readonly code?: string };
+        readonly error?: {
+          readonly message?: string;
+          readonly code?: string;
+          readonly details?: unknown;
+        };
         readonly message?: string;
       }
     | T
@@ -72,7 +87,11 @@ const json = async <T>(response: Response): Promise<T> => {
   if (!response.ok) {
     const errorBody = typedBody as
       | {
-          readonly error?: { readonly message?: string; readonly code?: string };
+          readonly error?: {
+            readonly message?: string;
+            readonly code?: string;
+            readonly details?: unknown;
+          };
           readonly message?: string;
         }
       | undefined;
@@ -80,6 +99,7 @@ const json = async <T>(response: Response): Promise<T> => {
       errorBody?.error?.message ?? errorBody?.message ?? `Request failed (${response.status})`,
       response.status,
       errorBody?.error?.code,
+      errorBody?.error?.details,
     );
   }
   return typedBody as T;
@@ -102,6 +122,7 @@ interface PersistedMutationKey {
   readonly key: string;
   readonly created_at: number;
   readonly expires_at: number;
+  readonly exclusive_scope?: string;
 }
 
 interface ConsoleApiOptions {
@@ -143,7 +164,9 @@ const persistedMutationKey = (value: unknown): PersistedMutationKey => {
     entry.created_at < 0 ||
     typeof entry.expires_at !== "number" ||
     !Number.isSafeInteger(entry.expires_at) ||
-    entry.expires_at - entry.created_at !== AMBIGUOUS_MUTATION_TTL_MS
+    entry.expires_at - entry.created_at !== AMBIGUOUS_MUTATION_TTL_MS ||
+    (entry.exclusive_scope !== undefined &&
+      (typeof entry.exclusive_scope !== "string" || entry.exclusive_scope.length === 0))
   ) {
     throw new Error("Mutation retry entry is invalid.");
   }
@@ -152,6 +175,9 @@ const persistedMutationKey = (value: unknown): PersistedMutationKey => {
     key: entry.key,
     created_at: entry.created_at,
     expires_at: entry.expires_at,
+    ...(typeof entry.exclusive_scope === "string" && entry.exclusive_scope.length > 0
+      ? { exclusive_scope: entry.exclusive_scope }
+      : {}),
   };
 };
 
@@ -236,11 +262,19 @@ export class ConsoleApi {
     }
   }
 
-  #reserveMutationKey(fingerprint: string, requestedKey?: string): string {
+  #reserveMutationKey(fingerprint: string, requestedKey?: string, exclusiveScope?: string): string {
     this.#assertRetryStateAvailable();
     const existing = this.#ambiguousMutationKeys.get(fingerprint);
     if (existing) {
       return existing.key;
+    }
+    if (
+      exclusiveScope !== undefined &&
+      [...this.#ambiguousMutationKeys.values()].some(
+        (entry) => entry.exclusive_scope === exclusiveScope,
+      )
+    ) {
+      throw new PendingResponseOutcomeUnknownError();
     }
     if (this.#ambiguousMutationKeys.size >= MAX_AMBIGUOUS_MUTATIONS) {
       throw new MutationRetryStateError("CAPACITY_REACHED");
@@ -251,6 +285,7 @@ export class ConsoleApi {
       key: requestedKey ?? idempotencyKey(),
       created_at: now,
       expires_at: now + AMBIGUOUS_MUTATION_TTL_MS,
+      ...(exclusiveScope === undefined ? {} : { exclusive_scope: exclusiveScope }),
     };
     const nextEntries = new Map(this.#ambiguousMutationKeys).set(fingerprint, entry);
     this.#persistMutationKeys(nextEntries);
@@ -269,6 +304,40 @@ export class ConsoleApi {
     this.#ambiguousMutationKeys.delete(fingerprint);
   }
 
+  #reconcilePendingMutationKeys(
+    sessionId: string,
+    interactions: readonly WirePendingInteraction[],
+  ): void {
+    const prefix = `/api/v1/sessions/${encodeURIComponent(sessionId)}/pending/`;
+    const states = new Map(
+      interactions.map((interaction) => [interaction.requestId, interaction.state]),
+    );
+    const nextEntries = new Map(this.#ambiguousMutationKeys);
+    for (const [fingerprint, entry] of nextEntries) {
+      if (!entry.exclusive_scope?.startsWith(prefix)) {
+        continue;
+      }
+      const encodedRequestId = entry.exclusive_scope.slice(prefix.length, -"/responses".length);
+      const requestId = decodeURIComponent(encodedRequestId);
+      if (states.get(requestId) !== "pending") {
+        nextEntries.delete(fingerprint);
+      }
+    }
+    if (nextEntries.size !== this.#ambiguousMutationKeys.size) {
+      this.#persistMutationKeys(nextEntries);
+      this.#ambiguousMutationKeys.clear();
+      for (const [fingerprint, entry] of nextEntries) {
+        this.#ambiguousMutationKeys.set(fingerprint, entry);
+      }
+    }
+  }
+
+  #pendingOutcomeUnknown(path: string): boolean {
+    return [...this.#ambiguousMutationKeys.values()].some(
+      (entry) => entry.exclusive_scope === path,
+    );
+  }
+
   setCsrfToken(value: string | undefined): void {
     this.#csrfToken = value;
   }
@@ -284,6 +353,7 @@ export class ConsoleApi {
     key?: string,
     allowCsrfRefresh = true,
     decode?: (body: unknown) => T,
+    exclusiveScope?: string,
   ): Promise<T> {
     const serializedBody = JSON.stringify(body);
     const inFlightIdentity = `${method}\n${path}\n${serializedBody ?? ""}`;
@@ -301,6 +371,7 @@ export class ConsoleApi {
           key,
           allowCsrfRefresh,
           decode,
+          exclusiveScope,
         ),
     );
     this.#inFlightMutations.set(inFlightIdentity, mutation);
@@ -321,8 +392,9 @@ export class ConsoleApi {
     key: string | undefined,
     allowCsrfRefresh: boolean,
     decode: ((body: unknown) => T) | undefined,
+    exclusiveScope: string | undefined,
   ): Promise<T> {
-    const requestKey = this.#reserveMutationKey(fingerprint, key);
+    const requestKey = this.#reserveMutationKey(fingerprint, key, exclusiveScope);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Content-Type": "application/json",
@@ -367,6 +439,7 @@ export class ConsoleApi {
         requestKey,
         false,
         decode,
+        exclusiveScope,
       );
     }
     try {
@@ -375,6 +448,16 @@ export class ConsoleApi {
       this.#releaseMutationKey(fingerprint, requestKey);
       return result;
     } catch (error) {
+      if (
+        error instanceof PendingResponseOutcomeUnknownError ||
+        (error instanceof ApiError &&
+          error.code === "PENDING_REQUEST_ANSWER_TIMEOUT" &&
+          (error.details as { answerOutcome?: unknown } | undefined)?.answerOutcome === "unknown")
+      ) {
+        throw error instanceof PendingResponseOutcomeUnknownError
+          ? error
+          : new PendingResponseOutcomeUnknownError();
+      }
       if (response.ok) {
         throw new MutationTransportUnknownError(error);
       }
@@ -434,7 +517,13 @@ export class ConsoleApi {
   pending(id: string): Promise<readonly PendingInteraction[]> {
     return this.get<{ readonly pending: readonly WirePendingInteraction[] }>(
       `/api/v1/sessions/${encodeURIComponent(id)}/pending`,
-    ).then(({ pending }) => pending.map(pendingInteraction));
+    ).then(({ pending }) => {
+      this.#reconcilePendingMutationKeys(id, pending);
+      return pending.map((interaction) => {
+        const path = pendingResponsePath(id, interaction.requestId);
+        return pendingInteraction(interaction, this.#pendingOutcomeUnknown(path));
+      });
+    });
   }
 
   createSession(input: CreateSessionInput): Promise<SessionDetail> {
@@ -533,16 +622,21 @@ export class ConsoleApi {
   }
 
   answerInteraction(sessionId: string, requestId: string, answer: unknown): Promise<void> {
+    const path = pendingResponsePath(sessionId, requestId);
     return this.mutate(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/pending/${encodeURIComponent(requestId)}/responses`,
+      path,
       { response: answer },
       "POST",
       undefined,
       true,
       decodePendingMutation(sessionId, requestId),
+      path,
     );
   }
 }
+
+const pendingResponsePath = (sessionId: string, requestId: string): string =>
+  `/api/v1/sessions/${encodeURIComponent(sessionId)}/pending/${encodeURIComponent(requestId)}/responses`;
 
 export const api = new ConsoleApi();
 
@@ -878,6 +972,9 @@ const decodePendingMutation =
     }
     mutationTimestamp(pending, "createdAt", "Pending response mutation");
     mutationEnum(pending, "kind", PENDING_KINDS, "Pending response mutation");
+    if (pending.state === "pending" && response.outcome === "unknown") {
+      throw new PendingResponseOutcomeUnknownError();
+    }
     mutationEnum(pending, "state", TERMINAL_PENDING_STATES, "Pending response mutation");
   };
 
@@ -923,7 +1020,10 @@ const payloadRecord = (payload: unknown): Record<string, unknown> =>
     ? (payload as Record<string, unknown>)
     : {};
 
-const pendingInteraction = (interaction: WirePendingInteraction): PendingInteraction => {
+const pendingInteraction = (
+  interaction: WirePendingInteraction,
+  responseOutcomeUnknown = false,
+): PendingInteraction => {
   const schema = payloadRecord(interaction.schema);
   const properties = payloadRecord(schema.properties);
   const safeProperties = Object.fromEntries(
@@ -939,6 +1039,9 @@ const pendingInteraction = (interaction: WirePendingInteraction): PendingInterac
     sessionId: interaction.acpxRecordId,
     kind: interaction.kind,
     state: interaction.state,
+    ...(responseOutcomeUnknown && interaction.state === "pending"
+      ? { responseOutcome: "unknown" as const }
+      : {}),
     createdAt: interaction.createdAt,
     title:
       interaction.title ??

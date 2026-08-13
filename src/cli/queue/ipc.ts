@@ -1304,11 +1304,13 @@ function pendingRequestAnswerTimeout(
     return new PendingRequestAnswerTimeoutError(
       `Queue owner could not be reached within ${options.responseTimeoutMs}ms; the answer to ` +
         `request ${options.pendingRequestId} was not delivered`,
+      "not_delivered",
     );
   }
   return new PendingRequestAnswerTimeoutError(
     `Queue owner did not confirm the answer to request ${options.pendingRequestId} within ` +
       `${options.responseTimeoutMs}ms; it may still be applied`,
+    "unknown",
   );
 }
 

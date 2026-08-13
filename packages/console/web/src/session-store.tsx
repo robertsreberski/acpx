@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { api, ApiError } from "./api";
+import { api, ApiError, PendingResponseOutcomeUnknownError } from "./api";
 import { closeSessionFeedback } from "./close-session-feedback";
 import {
   clearComposerDraftIfSent,
@@ -470,12 +470,19 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       if (!selectedSessionId) {
         return;
       }
-      await runAction(
-        () => api.answerInteraction(selectedSessionId, requestId, answer),
-        "Answer delivered.",
-      );
+      try {
+        await runAction(
+          () => api.answerInteraction(selectedSessionId, requestId, answer),
+          "Answer delivered.",
+        );
+      } catch (error) {
+        if (error instanceof PendingResponseOutcomeUnknownError) {
+          await refresh();
+        }
+        throw error;
+      }
     },
-    [runAction, selectedSessionId],
+    [refresh, runAction, selectedSessionId],
   );
 
   const createSession = useCallback(

@@ -808,7 +808,8 @@ export async function runIdempotentMutation<T>(options: {
   operation: AcpxMutationOperation;
   idempotencyKey: string;
   input: unknown;
-  recoveryResult?: T;
+  /** Durable checkpoint used to reconcile an outcome without repeating its side effect. */
+  recoveryResult?: unknown;
   /** Groups incomplete side effects that may be reconciled by a retry using a fresh key. */
   recoveryScope?: unknown;
   recover?: (checkpoint: unknown) => Promise<T>;

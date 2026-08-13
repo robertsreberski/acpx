@@ -27,3 +27,9 @@ test("settled durable requests stay read-only even with a live owner", () => {
     reason: "This request is answered.",
   });
 });
+
+test("a pending request with an unconfirmed prior answer stays read-only", () => {
+  const state = interactionAvailability({ ...pending, responseOutcome: "unknown" }, "online");
+  assert.equal(state.answerable, false);
+  assert.match(state.reason ?? "", /previous answer may still be applied/u);
+});

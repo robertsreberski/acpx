@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ConsoleApi, MutationRetryStateError, MutationTransportUnknownError } from "../src/api";
+import {
+  ConsoleApi,
+  MutationRetryStateError,
+  MutationTransportUnknownError,
+  PendingResponseOutcomeUnknownError,
+} from "../src/api";
 
 class MemoryStorage {
   readonly #items = new Map<string, string>();
@@ -396,6 +401,98 @@ test("an explicit retry after two lost responses retains the original idempotenc
   assert.equal(attempts, 3);
   assert.ok(keys[0]);
   assert.deepEqual(keys, [keys[0], keys[0], keys[0]]);
+});
+
+test("an unknown pending response blocks conflicting answers until durable reconciliation", async () => {
+  const api = client();
+  const mutations: Array<{ key: string; body: string }> = [];
+  let pendingReads = 0;
+  await withFetch(
+    async (input, init) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/pending")) {
+        pendingReads += 1;
+        return response({
+          pending: [
+            {
+              ...ANSWERED_PENDING,
+              state: pendingReads === 1 ? "pending" : "answered",
+            },
+          ],
+        });
+      }
+      mutations.push({
+        key: new Headers(init?.headers).get("Idempotency-Key") ?? "",
+        body: String(init?.body),
+      });
+      return mutations.length === 1
+        ? response(
+            {
+              error: {
+                code: "PENDING_REQUEST_ANSWER_TIMEOUT",
+                message: "Request answer outcome is unknown; it may still be applied",
+                details: { answerOutcome: "unknown" },
+              },
+            },
+            504,
+          )
+        : response({ pending: ANSWERED_PENDING, outcome: "confirmed" });
+    },
+    async () => {
+      await assert.rejects(
+        async () => await api.answerInteraction("record-1", "request-1", { type: "cancel" }),
+        PendingResponseOutcomeUnknownError,
+      );
+      await assert.rejects(
+        async () => await api.answerInteraction("record-1", "request-1", { type: "decline" }),
+        PendingResponseOutcomeUnknownError,
+      );
+      assert.equal(mutations.length, 1, "a conflicting answer reached the server");
+
+      const pending = await api.pending("record-1");
+      assert.equal(pending[0]?.responseOutcome, "unknown");
+      await assert.rejects(
+        async () => await api.answerInteraction("record-1", "request-1", { type: "decline" }),
+        PendingResponseOutcomeUnknownError,
+      );
+      assert.equal(mutations.length, 1, "a conflict bypassed the persisted ambiguity lock");
+
+      const settled = await api.pending("record-1");
+      assert.equal(settled[0]?.responseOutcome, undefined);
+      await api.answerInteraction("record-1", "request-1", { type: "decline" });
+    },
+  );
+  assert.equal(mutations.length, 2);
+  assert.notEqual(mutations[1]?.key, mutations[0]?.key);
+});
+
+test("an accepted-but-unconfirmed response reuses its key until confirmation", async () => {
+  const api = client();
+  const keys: string[] = [];
+  await withFetch(
+    async (_input, init) => {
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      return keys.length === 1
+        ? response(
+            {
+              pending: { ...ANSWERED_PENDING, state: "pending" },
+              outcome: "unknown",
+            },
+            202,
+          )
+        : response({ pending: ANSWERED_PENDING, outcome: "confirmed" });
+    },
+    async () => {
+      await assert.rejects(
+        async () => await api.answerInteraction("record-1", "request-1", { type: "cancel" }),
+        PendingResponseOutcomeUnknownError,
+      );
+      await api.answerInteraction("record-1", "request-1", { type: "cancel" });
+    },
+  );
+  assert.equal(keys.length, 2);
+  assert.ok(keys[0]);
+  assert.equal(keys[1], keys[0]);
 });
 
 test("a malformed successful response retains the mutation idempotency key", async () => {

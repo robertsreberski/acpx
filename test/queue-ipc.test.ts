@@ -352,6 +352,7 @@ test("an asked-for respond bound covers connecting, not just the reply", async (
         // caller has to be able to tell "I stopped waiting" from "delivery
         // failed". A connect that outruns the budget must not degrade it.
         assert.equal(error instanceof PendingRequestAnswerTimeoutError, true, String(error));
+        assert.equal((error as PendingRequestAnswerTimeoutError).answerOutcome, "not_delivered");
         return true;
       },
     );

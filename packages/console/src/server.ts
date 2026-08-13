@@ -80,6 +80,7 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
       code?: string;
       detailCode?: string;
       earliestCursor?: string;
+      answerOutcome?: "not_delivered" | "unknown";
     };
     const code = shaped.detailCode ?? shaped.code;
     const safeCode = shaped.name === "SessionNotFoundError" ? "SESSION_NOT_FOUND" : code;
@@ -88,9 +89,18 @@ function serviceError(error: unknown): { response: HttpError; original?: unknown
       const details =
         safeCode === "CURSOR_EXPIRED" && shaped.earliestCursor
           ? { earliestCursor: shaped.earliestCursor }
-          : undefined;
+          : safeCode === "PENDING_REQUEST_ANSWER_TIMEOUT" && shaped.answerOutcome
+            ? { answerOutcome: shaped.answerOutcome }
+            : undefined;
+      const message =
+        safeCode === "PENDING_REQUEST_ANSWER_TIMEOUT" && shaped.answerOutcome === "unknown"
+          ? "Request answer outcome is unknown; it may still be applied"
+          : safeCode === "PENDING_REQUEST_ANSWER_TIMEOUT" &&
+              shaped.answerOutcome === "not_delivered"
+            ? "Request answer was not delivered before timeout"
+            : mapping.message;
       return {
-        response: new HttpError(mapping.statusCode, safeCode!, mapping.message, details),
+        response: new HttpError(mapping.statusCode, safeCode!, message, details),
       };
     }
     return {
@@ -547,7 +557,10 @@ async function handleApi(
       response: body.response,
       idempotencyKey: idempotencyKey!,
     });
-    sendJson(response, 200, { pending: pendingResult });
+    sendJson(response, pendingResult.state === "pending" ? 202 : 200, {
+      pending: pendingResult,
+      outcome: pendingResult.state === "pending" ? "unknown" : "confirmed",
+    });
     return true;
   }
   const turns = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/turns$/);

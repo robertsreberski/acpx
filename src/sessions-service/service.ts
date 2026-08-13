@@ -28,7 +28,11 @@ import {
   setSessionMode,
 } from "../cli/session/session-control.js";
 import { createSessionWithClient, listAgentSessions } from "../cli/session/session-management.js";
-import { PendingRequestOwnerGoneError, SessionNotFoundError } from "../errors.js";
+import {
+  PendingRequestAnswerTimeoutError,
+  PendingRequestOwnerGoneError,
+  SessionNotFoundError,
+} from "../errors.js";
 import { isProcessAlive } from "../process-liveness.js";
 import { promptToDisplayText, textPrompt } from "../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../runtime/engine/lifecycle.js";
@@ -913,10 +917,29 @@ class SessionService implements AcpxSessionService {
   async respondToPendingRequest(
     input: AcpxRespondPendingRequestInput,
   ): Promise<AcpxMutationReceipt<AcpxPendingRequest>> {
+    const recoveryScope = {
+      acpxRecordId: input.acpxRecordId,
+      requestId: input.requestId,
+    };
     const receipt = await runIdempotentMutation({
       operation: "respond_pending_request",
       idempotencyKey: input.idempotencyKey,
       input,
+      recoveryScope,
+      recoveryResult: recoveryScope,
+      outcomeUnknown: (error) =>
+        error instanceof PendingRequestAnswerTimeoutError && error.answerOutcome === "unknown",
+      recover: async () => {
+        const current = await readPendingRequest(input.acpxRecordId, input.requestId);
+        if (current && current.state !== "pending") {
+          return projectPendingRequest(current);
+        }
+        throw new PendingRequestAnswerTimeoutError(
+          `The prior answer to request ${input.requestId} may still be applied; ` +
+            "wait for the durable request state to settle before answering again",
+          "unknown",
+        );
+      },
       run: async () => {
         await this.requireExactRecord(input.acpxRecordId);
         await this.assertAnswerableByLiveOwner(input.acpxRecordId, input.requestId);
