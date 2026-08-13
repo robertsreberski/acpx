@@ -1,5 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { DialogSubmission } from "../dialog-submission";
 import { useDismissibleLayer } from "../dismissible-layer";
 import { reconcileDialogOptions } from "../session-dialog-options";
 import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
@@ -28,18 +29,31 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [workspaceAgents, setWorkspaceAgents] = useState<readonly AgentSummary[]>([]);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [loadingAgents, setLoadingAgents] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const dialogModeRef = useRef<DialogProps["mode"]>(null);
   const agentGeneration = useRef(0);
   const providerGeneration = useRef(0);
-  useDismissibleLayer(mode !== null, onClose, dialogRef);
+  const submission = useRef(new DialogSubmission());
+  const closeDialog = useCallback(() => {
+    if (!submission.current.dismiss()) {
+      return;
+    }
+    onClose();
+  }, [onClose]);
+  useDismissibleLayer(mode !== null, closeDialog, dialogRef);
 
   const agent = workspaceAgents.find((item) => item.id === agentId);
   const modeRequired = requiresExplicitMode(agent);
   const defaultMode = safeDefaultMode(agent);
   const normalizedMode = normalizeExactId(sessionMode);
   const normalizedModel = normalizeExactId(model);
+
+  useEffect(() => {
+    submission.current.replace();
+    setSubmitting(false);
+  }, [mode]);
 
   useEffect(() => {
     if (!mode) {
@@ -195,6 +209,8 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
       setError(`Enter a mode for ${agent?.label ?? agentId}.`);
       return;
     }
+    const generation = submission.current.begin();
+    setSubmitting(true);
     const action =
       mode === "create"
         ? store.createSession({
@@ -212,9 +228,22 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             name: name.trim() || undefined,
             mode: normalizedMode,
           });
-    void action.then(onClose, (reason: unknown) => {
-      setError(reason instanceof Error ? reason.message : "The session could not be saved.");
-    });
+    void action.then(
+      () => {
+        if (!submission.current.complete(generation)) {
+          return;
+        }
+        setSubmitting(false);
+        onClose();
+      },
+      (reason: unknown) => {
+        if (!submission.current.complete(generation)) {
+          return;
+        }
+        setSubmitting(false);
+        setError(reason instanceof Error ? reason.message : "The session could not be saved.");
+      },
+    );
   };
 
   return (
@@ -223,7 +252,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {
-          onClose();
+          closeDialog();
         }
       }}
     >
@@ -239,7 +268,13 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             <span>{mode === "create" ? "Start fresh" : "Continue existing work"}</span>
             <h2 id="session-dialog-title">{mode === "create" ? "New session" : "Adopt session"}</h2>
           </div>
-          <button type="button" className="icon-button" aria-label="Close" onClick={onClose}>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Close"
+            onClick={closeDialog}
+            disabled={submitting}
+          >
             <Icon name="close" />
           </button>
         </header>
@@ -417,13 +452,19 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             </p>
           )}
           <footer>
-            <button type="button" className="secondary-button" onClick={onClose}>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={closeDialog}
+              disabled={submitting}
+            >
               Cancel
             </button>
             <button
               type="submit"
               className="primary-button"
               disabled={
+                submitting ||
                 store.actionBusy ||
                 loadingAgents ||
                 !agentId ||

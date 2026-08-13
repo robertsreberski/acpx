@@ -10,4 +10,8 @@ export class RequestGeneration {
   isLatest(generation: number): boolean {
     return generation === this.#current;
   }
+
+  invalidate(): void {
+    this.#current += 1;
+  }
 }
