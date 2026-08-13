@@ -14,6 +14,7 @@ import type {
   SessionDetail,
   SessionSummary,
   TimelinePage,
+  WorkspaceSuggestion,
 } from "./types";
 
 export class ApiError extends Error {
@@ -575,6 +576,22 @@ export class ConsoleApi {
         acpxRecordId: session.acpxRecordId,
       })),
     }));
+  }
+
+  workspaceSuggestions(prefix: string): Promise<readonly WorkspaceSuggestion[]> {
+    const search = new URLSearchParams({ prefix });
+    return this.get<{ readonly suggestions: readonly WorkspaceSuggestion[] }>(
+      `/api/v1/workspaces/suggestions?${search}`,
+    ).then((body) => body.suggestions);
+  }
+
+  /** Widens what this console can reach, so it is a mutation rather than a read. */
+  authorizeWorkspace(path: string): Promise<string> {
+    return this.mutate<{ readonly path: string }>(
+      "/api/v1/workspaces/authorizations",
+      { path },
+      "POST",
+    ).then((body) => body.path);
   }
 
   adoptSession(input: AdoptSessionInput): Promise<SessionDetail> {

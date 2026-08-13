@@ -16,9 +16,11 @@ export function reconcileDialogOptions(
   const agentId = agents.some((agent) => agent.id === currentAgentId)
     ? currentAgentId
     : (agents[0]?.id ?? "");
-  const cwd = workspaceRoots.some((root) => root.path === currentCwd)
-    ? currentCwd
-    : (workspaceRoots[0]?.path ?? "");
+  // A session may start in any directory the operator authorizes, so the
+  // configured roots are only the opening suggestion. Snapping a typed path
+  // back to a root — as this did when the workspace was a fixed dropdown —
+  // would make every directory outside them unreachable.
+  const cwd = currentCwd === "" ? (workspaceRoots[0]?.path ?? "") : currentCwd;
   return {
     agentId,
     cwd,

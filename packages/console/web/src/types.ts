@@ -27,6 +27,13 @@ export interface WorkspaceRoot {
   readonly path: string;
 }
 
+export interface WorkspaceSuggestion {
+  readonly path: string;
+  readonly label: string;
+  /** False when picking it would need an explicit authorization first. */
+  readonly authorized: boolean;
+}
+
 export interface SessionSummary {
   readonly id: string;
   readonly name: string;

@@ -1,12 +1,13 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../api";
+import { api, ApiError } from "../api";
 import { DialogSubmission } from "../dialog-submission";
 import { useDismissibleLayer } from "../dismissible-layer";
 import { reconcileDialogOptions } from "../session-dialog-options";
 import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
-import type { AgentSummary, ProviderSession } from "../types";
+import type { AgentSummary, ProviderSession, WorkspaceSuggestion } from "../types";
 import { loadWorkspaceAgents } from "../workspace-agent-inventory";
+import { Combobox } from "./Combobox";
 import { Icon } from "./Icon";
 
 interface DialogProps {
@@ -29,6 +30,10 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [workspaceAgents, setWorkspaceAgents] = useState<readonly AgentSummary[]>([]);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [loadingAgents, setLoadingAgents] = useState(false);
+  const [workspaceOptions, setWorkspaceOptions] = useState<readonly WorkspaceSuggestion[]>([]);
+  const [needsAuthorization, setNeedsAuthorization] = useState<string | null>(null);
+  const [authorizing, setAuthorizing] = useState(false);
+  const [authorizedGeneration, setAuthorizedGeneration] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
@@ -109,6 +114,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
     }
     setLoadingAgents(true);
     setAgentError(null);
+    setNeedsAuthorization(null);
     void loadWorkspaceAgents(cwd).then(
       (agents) => {
         if (generation !== agentGeneration.current) {
@@ -127,9 +133,17 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
         }
         setWorkspaceAgents([]);
         setAgentId("");
-        setAgentError(
-          reason instanceof Error ? reason.message : "Workspace agents could not be loaded.",
-        );
+        // The agent inventory is the first call that touches the workspace, so
+        // it is where an unauthorized directory surfaces. Offer to authorize it
+        // rather than reporting it as a failure the operator cannot act on.
+        if (reason instanceof ApiError && reason.code === "WORKSPACE_NOT_AUTHORIZED") {
+          setNeedsAuthorization(cwd);
+          setAgentError(null);
+        } else {
+          setAgentError(
+            reason instanceof Error ? reason.message : "Workspace agents could not be loaded.",
+          );
+        }
         setLoadingAgents(false);
       },
     );
@@ -138,7 +152,58 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
         agentGeneration.current += 1;
       }
     };
+  }, [cwd, mode, authorizedGeneration]);
+
+  // Directory completions for whatever has been typed so far. Debounced so a
+  // keystroke does not become a readdir, and generation-guarded so a slow reply
+  // cannot overwrite the suggestions for a path the operator has moved past.
+  useEffect(() => {
+    if (!mode) {
+      setWorkspaceOptions([]);
+      return undefined;
+    }
+    let live = true;
+    const timer = window.setTimeout(() => {
+      void api.workspaceSuggestions(cwd).then(
+        (suggestions) => {
+          if (live) {
+            setWorkspaceOptions(suggestions);
+          }
+        },
+        () => {
+          if (live) {
+            setWorkspaceOptions([]);
+          }
+        },
+      );
+    }, 120);
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
   }, [cwd, mode]);
+
+  const authorizeWorkspace = () => {
+    if (!needsAuthorization) {
+      return;
+    }
+    setAuthorizing(true);
+    void api.authorizeWorkspace(needsAuthorization).then(
+      (authorized) => {
+        setAuthorizing(false);
+        setNeedsAuthorization(null);
+        setCwd(authorized);
+        // Re-run the inventory now that the directory is reachable.
+        setAuthorizedGeneration((value) => value + 1);
+      },
+      (reason: unknown) => {
+        setAuthorizing(false);
+        setAgentError(
+          reason instanceof Error ? reason.message : "The workspace could not be authorized.",
+        );
+      },
+    );
+  };
 
   const loadProviderSessions = useCallback(
     async (cursor?: string) => {
@@ -310,30 +375,49 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
               ))}
             </select>
           </label>
-          <label className="form-field">
-            <span>Workspace</span>
-            <select
+          <div className="form-field">
+            <span id="session-dialog-workspace">Workspace</span>
+            <Combobox
               value={cwd}
-              onChange={(event) => {
-                setCwd(event.target.value);
+              onChange={(next) => {
+                setCwd(next);
                 setAgentId("");
                 setWorkspaceAgents([]);
                 setAgentError(null);
-                setLoadingAgents(true);
                 setSessionMode("");
                 setModel("");
                 setProviderSessionId("");
               }}
+              options={workspaceOptions.map((suggestion) => ({
+                value: suggestion.path,
+                label: suggestion.label,
+                hint: suggestion.authorized ? undefined : "needs authorizing",
+              }))}
+              placeholder="Type or pick any directory"
               required
-            >
-              {store.bootstrap.workspaceRoots.map((root) => (
-                <option value={root.path} key={root.id}>
-                  {root.label} — {root.path}
-                </option>
-              ))}
-            </select>
-            <small>Only administrator-allowlisted workspace roots are available.</small>
-          </label>
+            />
+            {needsAuthorization ? (
+              <div className="workspace-authorization" role="note">
+                <p>
+                  This directory is outside the configured workspace roots. Authorize it once to
+                  start sessions here.
+                </p>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={authorizeWorkspace}
+                  disabled={authorizing}
+                >
+                  {authorizing ? "Authorizing…" : "Authorize this directory"}
+                </button>
+              </div>
+            ) : (
+              <small>
+                Anything under {store.bootstrap.workspaceRoots.length === 1 ? "the root" : "a root"}{" "}
+                is ready to use; anywhere else asks once.
+              </small>
+            )}
+          </div>
           <label className="form-field">
             <span>
               Name <em>optional</em>

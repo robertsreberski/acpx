@@ -28,17 +28,32 @@ test("a live bootstrap refresh preserves still-available dialog selections", () 
   );
 });
 
-test("removed selections fall back explicitly and empty inventories stay empty", () => {
-  assert.deepEqual(reconcileDialogOptions("gone", "/gone", agents, roots), {
+test("a removed agent falls back explicitly and an empty inventory stays empty", () => {
+  assert.deepEqual(reconcileDialogOptions("gone", "/work/one", agents, roots), {
     agentId: "codex",
     cwd: "/work/one",
     agentChanged: true,
-    workspaceChanged: true,
+    workspaceChanged: false,
   });
-  assert.deepEqual(reconcileDialogOptions("mock", "/work/two", [], []), {
+  assert.deepEqual(reconcileDialogOptions("mock", "/work/two", [], roots), {
     agentId: "",
-    cwd: "",
+    cwd: "/work/two",
     agentChanged: true,
-    workspaceChanged: true,
+    workspaceChanged: false,
   });
+});
+
+test("a workspace outside the configured roots is kept, not snapped back to one", () => {
+  // Any directory can be used once authorized, so the roots are only a default.
+  assert.deepEqual(reconcileDialogOptions("mock", "/elsewhere/project", agents, roots), {
+    agentId: "mock",
+    cwd: "/elsewhere/project",
+    agentChanged: false,
+    workspaceChanged: false,
+  });
+});
+
+test("an empty workspace opens on the first configured root", () => {
+  assert.equal(reconcileDialogOptions("mock", "", agents, roots).cwd, "/work/one");
+  assert.equal(reconcileDialogOptions("mock", "", agents, []).cwd, "");
 });

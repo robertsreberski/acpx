@@ -265,3 +265,49 @@ test("loading an older page cannot resurrect finished head continuation", () => 
   );
   assert.equal(prepended.legacyImportPending, undefined);
 });
+
+test("a ledger being created for the first time is not a discarded epoch", () => {
+  // A session with no durable ledger reports epoch null until its first event
+  // writes one, so every new session crosses null -> real on its first turn.
+  const created = mergeRefreshedTimelinePage(
+    { epoch: null, events: [], coverage: "complete" },
+    { epoch: "epoch-1", events: events("epoch-1", 1, 3), coverage: "complete" },
+  );
+
+  assert.equal(created.continuityIssue, undefined);
+  assert.equal(created.epoch, "epoch-1");
+  assert.deepEqual(
+    created.events.map((item) => item.id),
+    events("epoch-1", 1, 3).map((item) => item.id),
+  );
+});
+
+test("retained pre-ledger history survives the ledger appearing under it", () => {
+  const imported = mergeRefreshedTimelinePage(
+    { epoch: null, events: events("legacy", 1, 2), coverage: "legacy_retained" },
+    { epoch: "epoch-1", events: events("epoch-1", 3, 4), coverage: "legacy_retained" },
+  );
+
+  assert.equal(imported.continuityIssue, undefined);
+  assert.equal(imported.coverage, "legacy_retained");
+  assert.equal(imported.events.length, 4);
+});
+
+test("a ledger that disappears after existing is still reported", () => {
+  const lost = mergeRefreshedTimelinePage(
+    { epoch: "epoch-1", events: events("epoch-1", 1, 3), coverage: "complete" },
+    { epoch: null, events: [], coverage: "complete" },
+  );
+
+  assert.equal(lost.continuityIssue?.reason, "epoch_changed");
+});
+
+test("an earlier page without a proven generation does not fake a reset", () => {
+  const prepended = prependEarlierTimelinePage(
+    { epoch: "epoch-1", events: events("epoch-1", 3, 4), coverage: "complete" },
+    { epoch: null, events: events("epoch-1", 1, 2), coverage: "complete" },
+  );
+
+  assert.equal(prepended.continuityIssue, undefined);
+  assert.equal(prepended.events.length, 4);
+});

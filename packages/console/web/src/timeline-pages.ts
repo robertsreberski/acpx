@@ -48,6 +48,26 @@ const epochChangeIssue = (): NonNullable<TimelinePage["continuityIssue"]> => ({
     "The transcript epoch changed. The stale browser window was discarded because its cursor is no longer valid; visible history may be incomplete.",
 });
 
+/**
+ * Whether a durable generation was actually replaced.
+ *
+ * A session with no ledger reports `epoch: null` until its first event creates
+ * one, so every new session passes through `null -> real` on its first turn.
+ * That is the ledger being created, not a generation being discarded: the
+ * browser held nothing that could be invalidated. Reporting it as lost
+ * continuity told operators their history might be incomplete during the most
+ * ordinary thing a session does.
+ *
+ * A real generation replaced by a different one is a genuine discontinuity, and
+ * so is a ledger that disappears after having existed.
+ */
+const epochReplaced = (before: string | null, after: string | null): boolean =>
+  before !== null && before !== after;
+
+/** Two loaded pages proven to come from different generations. */
+const epochsDiverged = (left: string | null, right: string | null): boolean =>
+  left !== null && right !== null && left !== right;
+
 const inheritedEpochIssue = (
   left: TimelinePage,
   right: TimelinePage,
@@ -99,7 +119,7 @@ export const mergeRefreshedTimelinePage = (
   }
   const normalizedCurrent = normalizeTimelinePage(current);
   const normalizedLatest = normalizeTimelinePage(latest);
-  if (normalizedCurrent.epoch !== normalizedLatest.epoch) {
+  if (epochReplaced(normalizedCurrent.epoch, normalizedLatest.epoch)) {
     return {
       ...normalizedLatest,
       continuityIssue: epochChangeIssue(),
@@ -136,7 +156,7 @@ export const prependEarlierTimelinePage = (
 ): TimelinePage => {
   const normalizedCurrent = normalizeTimelinePage(current);
   const normalizedEarlier = normalizeTimelinePage(earlier);
-  if (normalizedCurrent.epoch !== normalizedEarlier.epoch) {
+  if (epochsDiverged(normalizedCurrent.epoch, normalizedEarlier.epoch)) {
     return {
       ...normalizedCurrent,
       coverage: mergedCoverage(normalizedCurrent.coverage, normalizedEarlier.coverage),

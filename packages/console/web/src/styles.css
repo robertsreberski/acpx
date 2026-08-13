@@ -1125,6 +1125,79 @@ fieldset.elicitation-field {
   font-size: 14px;
   font-weight: 400;
 }
+/* Combobox
+   ------------------------------------------------------------------ */
+.combobox {
+  position: relative;
+  display: grid;
+  gap: 6px;
+}
+.combobox-list {
+  position: absolute;
+  z-index: 5;
+  top: calc(var(--tap) + 4px);
+  right: 0;
+  left: 0;
+  max-height: 244px;
+  overflow-y: auto;
+  margin: 0;
+  border-radius: var(--radius-tool);
+  padding: 4px;
+  background: var(--surface);
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    0 14px 36px rgba(20, 34, 25, 0.16);
+  list-style: none;
+}
+.combobox-option {
+  display: flex;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--ink);
+  background: transparent;
+  font-size: var(--text-meta);
+  text-align: left;
+}
+.combobox-option.is-active {
+  background: var(--chip);
+}
+.combobox-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.combobox-option em {
+  flex: 0 0 auto;
+  color: var(--attention-text);
+  font-size: var(--text-id);
+  font-style: normal;
+  font-weight: 650;
+}
+
+.workspace-authorization {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+  margin-top: 4px;
+  border-left: 3px solid var(--attention);
+  border-radius: 0 8px 8px 0;
+  padding: 10px 12px;
+  background: var(--attention-band);
+}
+.workspace-authorization p {
+  margin: 0;
+  color: var(--attention-body);
+  font-size: var(--text-meta);
+  font-weight: 400;
+  line-height: 1.5;
+}
+
 .form-check {
   display: flex;
   min-height: var(--tap);
