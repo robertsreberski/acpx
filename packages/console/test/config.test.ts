@@ -93,16 +93,21 @@ test("non-loopback binding requires an explicit network trust decision", async (
 
 test("workspace validation resolves symlinks before enforcing roots", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-root-"));
+  const canonicalRoot = await realpath(root);
   const inside = join(root, "inside");
   const outside = await mkdtemp(join(tmpdir(), "acpx-console-outside-"));
   await mkdir(inside);
   await writeFile(join(inside, "file"), "ok");
-  assert.equal(await assertWorkspaceAllowed(inside, [root]), await realpath(inside));
-  await assert.rejects(assertWorkspaceAllowed(outside, [root]), /outside the configured roots/);
+  assert.equal(await assertWorkspaceAllowed(inside, [canonicalRoot]), await realpath(inside));
+  await assert.rejects(
+    assertWorkspaceAllowed(outside, [canonicalRoot]),
+    /outside the configured roots/,
+  );
 });
 
 test("retained workspace validation allows only missing suffixes under canonical roots", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-retained-root-"));
+  const canonicalRoot = await realpath(root);
   const state = join(root, "state");
   const project = join(root, "project");
   const replacedParent = join(root, "replaced-parent");
@@ -117,13 +122,16 @@ test("retained workspace validation allows only missing suffixes under canonical
     symlink(outside, unseenEscape, "dir"),
   ]);
 
-  assert.equal(await assertRetainedWorkspaceAllowed("project", project, [root], state), project);
   assert.equal(
-    await assertRetainedWorkspaceAllowed("replaced", replacedProject, [root], state),
+    await assertRetainedWorkspaceAllowed("project", project, [canonicalRoot], state),
+    project,
+  );
+  assert.equal(
+    await assertRetainedWorkspaceAllowed("replaced", replacedProject, [canonicalRoot], state),
     replacedProject,
   );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [root], state),
+    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [canonicalRoot], state),
     /outside the configured roots/,
   );
 
@@ -134,29 +142,35 @@ test("retained workspace validation allows only missing suffixes under canonical
     rm(unseenEscape),
   ]);
   await symlink(outside, replacedParent, "dir");
-  assert.equal(await assertRetainedWorkspaceAllowed("project", project, [root], state), project);
+  assert.equal(
+    await assertRetainedWorkspaceAllowed("project", project, [canonicalRoot], state),
+    project,
+  );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("different-record", project, [root], state),
+    assertRetainedWorkspaceAllowed("different-record", project, [canonicalRoot], state),
     /Workspace is not accessible/,
   );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("replaced", replacedProject, [root], state),
+    assertRetainedWorkspaceAllowed("replaced", replacedProject, [canonicalRoot], state),
     /outside the configured roots/,
   );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [root], state),
+    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [canonicalRoot], state),
     /outside the configured roots/,
   );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("unseen", unseenEscape, [root], state),
+    assertRetainedWorkspaceAllowed("unseen", unseenEscape, [canonicalRoot], state),
     /Workspace is not accessible/,
   );
 
   await assert.rejects(
-    assertRetainedWorkspaceAllowed("outside", join(outside, "missing"), [root], state),
+    assertRetainedWorkspaceAllowed("outside", join(outside, "missing"), [canonicalRoot], state),
     /outside the configured roots/,
   );
-  await assert.rejects(assertWorkspaceAllowed(project, [root]), /Workspace is not accessible/);
+  await assert.rejects(
+    assertWorkspaceAllowed(project, [canonicalRoot]),
+    /Workspace is not accessible/,
+  );
 });
 
 test("invalid persisted configuration fails with the config path instead of coercing values", async () => {

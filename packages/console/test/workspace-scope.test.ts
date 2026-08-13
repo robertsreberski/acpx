@@ -40,7 +40,7 @@ async function fixture() {
       port: 0,
       trustNetwork: false,
       allowedHosts: ["127.0.0.1"],
-      workspaceRoots: [workspaceRoot],
+      workspaceRoots: [await realpath(workspaceRoot)],
       stateDir: join(root, "state"),
       staticDir: web,
     },
@@ -222,6 +222,34 @@ test("a retained session stays visible and controllable after its workspace leaf
 
     const escaped = await fetch(`${running.origin}/api/v1/sessions/missing-symlink-record`);
     assert.equal(escaped.status, 404);
+  } finally {
+    await running.close();
+  }
+});
+
+test("replacing a configured root cannot redefine its startup authorization boundary", async () => {
+  const { outside, running, service, workspaceRoot } = await fixture();
+
+  try {
+    const credentials = await auth(running.origin);
+    service.calls.length = 0;
+    await rm(workspaceRoot, { recursive: true });
+    await mkdir(join(outside, "project"));
+    await symlink(outside, workspaceRoot, "dir");
+
+    const detail = await fetch(`${running.origin}/api/v1/sessions/record-1`);
+    assert.equal(detail.status, 404);
+    assert.deepEqual(await detail.json(), {
+      error: { code: "SESSION_NOT_FOUND", message: "Session not found" },
+    });
+
+    const close = await fetch(`${running.origin}/api/v1/sessions/record-1/close`, {
+      method: "POST",
+      headers: mutationHeaders(credentials, "replaced-root-close"),
+      body: "{}",
+    });
+    assert.equal(close.status, 404);
+    assert.deepEqual(service.calls, []);
   } finally {
     await running.close();
   }

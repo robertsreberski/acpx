@@ -24,6 +24,7 @@ export interface ResolvedConsoleConfig {
   host: string;
   port: number;
   trustNetwork: boolean;
+  /** Canonical boundaries captured once at startup; never re-resolve during authorization. */
   workspaceRoots: string[];
   allowedHosts: string[];
   stateDir: string;
@@ -184,6 +185,8 @@ export async function resolveConsoleConfig(
   if (requestedRoots.length === 0) {
     throw new Error("At least one workspace root is required");
   }
+  // Pin canonical boundary identities before the server starts. Re-resolving a
+  // configured root per request would let filesystem replacement redefine it.
   const workspaceRoots = await Promise.all(
     requestedRoots.map(async (root) => realpath(resolve(cwd, root))),
   );
@@ -226,10 +229,7 @@ async function assertCanonicalWorkspaceAllowed(
   reportedCandidate: string,
   roots: string[],
 ): Promise<void> {
-  const canonicalRoots = await Promise.all(
-    roots.map(async (root) => await realpath(resolve(root))),
-  );
-  const allowed = canonicalRoots.some((root) => {
+  const allowed = roots.some((root) => {
     const pathFromRoot = relative(root, canonicalCandidate);
     return (
       pathFromRoot === "" ||
@@ -286,11 +286,8 @@ async function retainedWorkspaceDecisionPath(
   roots: string[],
   stateDir: string,
 ): Promise<string> {
-  const canonicalRoots = await Promise.all(
-    roots.map(async (root) => await realpath(resolve(root))),
-  );
   const identity = createHash("sha256")
-    .update(JSON.stringify({ acpxRecordId, candidate, roots: canonicalRoots.toSorted() }))
+    .update(JSON.stringify({ acpxRecordId, candidate, roots: roots.toSorted() }))
     .digest("hex");
   return join(resolve(stateDir), "workspace-authorizations", identity);
 }
