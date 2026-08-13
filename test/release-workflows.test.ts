@@ -31,6 +31,28 @@ test("release configures the npm registry before token or trusted publishing", (
   assert.match(setupNode.groups.options, /registry-url: https:\/\/registry\.npmjs\.org/);
 });
 
+test("manual release tags are ancestry-verified before repository code executes", () => {
+  const provenance = releaseWorkflow.indexOf(
+    "Validate release tag provenance before executing repository code",
+  );
+  const packageSetup = releaseWorkflow.indexOf("uses: pnpm/action-setup");
+  const dependencyInstall = releaseWorkflow.indexOf("run: pnpm install --frozen-lockfile");
+  const releasePlan = releaseWorkflow.indexOf("pnpm exec tsx scripts/release-plan.ts");
+
+  assert.ok(provenance >= 0, "release provenance guard is missing");
+  assert.ok(provenance < packageSetup, "package setup runs before release provenance is trusted");
+  assert.ok(
+    provenance < dependencyInstall,
+    "dependency scripts run before release provenance is trusted",
+  );
+  assert.ok(provenance < releasePlan, "repository release code runs before provenance is trusted");
+  assert.match(releaseWorkflow, /git merge-base --is-ancestor/);
+  assert.match(
+    releaseWorkflow,
+    /TRUSTED_BASE_BRANCH: \$\{\{ steps\.release_source\.outputs\.base_branch \}\}/,
+  );
+});
+
 test("release uses the reusable installed-console smoke with the registry acpx dependency", () => {
   assert.match(
     releaseWorkflow,
