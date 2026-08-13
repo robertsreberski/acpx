@@ -25,10 +25,16 @@ const SESSION_TIMELINE_CURSOR_SCHEMA = "acpx.session_cursor.v1" as const;
 const DEFAULT_PAGE_LIMIT = 200;
 const MAX_PAGE_LIMIT = 1_000;
 const REVERSE_READ_CHUNK_BYTES = 16 * 1024;
+const OVERSIZED_EVENT_PREFIX_BYTES = 8 * 1024;
+const PAGE_ENVELOPE_RESERVE_BYTES = 16 * 1024;
 const LOCK_RETRY_MS = 15;
 const LEGACY_READ_CHUNK_BYTES = 64 * 1024;
 export const LEGACY_IMPORT_MAX_BYTES_PER_READ = 4 * 1024 * 1024;
 export const LEGACY_IMPORT_MAX_MESSAGES_PER_READ = 2_048;
+/** Maximum UTF-8 bytes in one durable timeline JSON envelope, excluding its newline. */
+export const SESSION_TIMELINE_MAX_EVENT_BYTES = 256 * 1024;
+/** Maximum UTF-8 bytes returned by one serialized transcript page. */
+export const SESSION_TIMELINE_MAX_PAGE_BYTES = 1024 * 1024;
 
 export type SessionTimelineDirection = AcpMessageDirection | "internal";
 
@@ -52,7 +58,20 @@ export type SessionTimelinePayload =
       source?: "legacy_stream";
       legacy_cursor?: SessionTimelineLegacyCursor;
     }
-  | { kind: "lifecycle"; event: SessionTimelineLifecycleEvent };
+  | { kind: "lifecycle"; event: SessionTimelineLifecycleEvent }
+  | SessionTimelineTruncatedPayload;
+
+export type SessionTimelineTruncatedPayload = {
+  kind: "truncated";
+  reason: "event_size_limit";
+  original_kind: "acp" | "lifecycle" | "unknown";
+  original_bytes: number;
+  limit_bytes: number;
+  /** Bounded diagnostic only; the omitted payload is never represented as complete. */
+  summary?: string;
+  /** True when oversized association fields also had to be omitted from the marker. */
+  association_omitted?: true;
+};
 
 export type SessionTimelineEvent = {
   schema: typeof SESSION_TIMELINE_EVENT_SCHEMA;
@@ -147,6 +166,60 @@ function timelineLockPath(sessionId: string): string {
 
 function isoNow(): string {
   return new Date().toISOString();
+}
+
+function boundedSummary(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const limit = 256;
+  return value.length <= limit ? value : `${value.slice(0, limit)}…`;
+}
+
+function truncationSummary(payload: SessionTimelinePayload): string | undefined {
+  if (payload.kind === "lifecycle") {
+    return `Lifecycle event: ${payload.event.type}`;
+  }
+  if (payload.kind === "acp") {
+    const method = (payload.message as { method?: unknown }).method;
+    return typeof method === "string"
+      ? `ACP method: ${boundedSummary(method)}`
+      : "ACP response or error";
+  }
+  return payload.summary;
+}
+
+function serializeBoundedTimelineEnvelope(envelope: SessionTimelineEvent): string {
+  const serialized = JSON.stringify(envelope);
+  const originalBytes = Buffer.byteLength(serialized, "utf8");
+  if (originalBytes <= SESSION_TIMELINE_MAX_EVENT_BYTES) {
+    return serialized;
+  }
+  const originalKind = envelope.payload.kind;
+  const markerPayload: SessionTimelineTruncatedPayload = {
+    kind: "truncated",
+    reason: "event_size_limit",
+    original_kind:
+      originalKind === "acp" || originalKind === "lifecycle" ? originalKind : "unknown",
+    original_bytes: originalBytes,
+    limit_bytes: SESSION_TIMELINE_MAX_EVENT_BYTES,
+    summary: truncationSummary(envelope.payload),
+  };
+  let marker: SessionTimelineEvent = { ...envelope, payload: markerPayload };
+  let bounded = JSON.stringify(marker);
+  if (Buffer.byteLength(bounded, "utf8") > SESSION_TIMELINE_MAX_EVENT_BYTES) {
+    marker = {
+      ...marker,
+      turn_id: undefined,
+      request_id: undefined,
+      payload: { ...markerPayload, summary: undefined, association_omitted: true },
+    };
+    bounded = JSON.stringify(marker);
+  }
+  if (Buffer.byteLength(bounded, "utf8") > SESSION_TIMELINE_MAX_EVENT_BYTES) {
+    throw new Error("Session timeline event identity exceeds the durable per-event byte limit");
+  }
+  return bounded;
 }
 
 async function fileSize(filePath: string): Promise<number> {
@@ -577,6 +650,14 @@ function hasValidTimelinePayload(payload: Record<string, unknown> | undefined): 
       isAcpJsonRpcMessage(payload.message) &&
       (payload.legacy_cursor === undefined || isLegacyCursor(payload.legacy_cursor)),
     lifecycle: () => isLifecycleEvent(payload.event),
+    truncated: () =>
+      payload.reason === "event_size_limit" &&
+      typeof payload.original_kind === "string" &&
+      new Set(["acp", "lifecycle", "unknown"]).has(payload.original_kind) &&
+      isPositiveInteger(payload.original_bytes) &&
+      isPositiveInteger(payload.limit_bytes) &&
+      isOptionalString(payload.summary) &&
+      (payload.association_omitted === undefined || payload.association_omitted === true),
   };
   return typeof payload.kind === "string" && (validators[payload.kind]?.() ?? false);
 }
@@ -894,6 +975,18 @@ export class SessionTimelineWriter {
     });
   }
 
+  async appendTruncatedEvent(
+    payload: SessionTimelineTruncatedPayload,
+    association: {
+      direction: SessionTimelineDirection;
+      capturedAt: string;
+      turnId?: string;
+      requestId?: string;
+    },
+  ): Promise<void> {
+    await this.append({ ...association, payload });
+  }
+
   recordWriteError(error: unknown): void {
     this.metadata.last_write_error = error instanceof Error ? error.message : String(error);
   }
@@ -1034,7 +1127,11 @@ export class SessionTimelineWriter {
     };
     try {
       await fs.mkdir(path.dirname(this.metadata.active_path), { recursive: true });
-      await fs.appendFile(this.metadata.active_path, `${JSON.stringify(envelope)}\n`, "utf8");
+      await fs.appendFile(
+        this.metadata.active_path,
+        `${serializeBoundedTimelineEnvelope(envelope)}\n`,
+        "utf8",
+      );
       this.metadata.last_seq = envelope.seq;
       this.metadata.last_write_at = isoNow();
       this.metadata.last_write_error = null;
@@ -1084,6 +1181,9 @@ type ReverseTimelineReadOptions = {
   beforeSeq?: number;
   limit: number;
   predicate?: (event: SessionTimelineEvent) => boolean;
+  /** Bound retained matching events, independent of bytes scanned past filtered entries. */
+  maxResultBytes?: number;
+  onResultLimit?: () => void;
   onBytesRead?: (bytes: number) => void;
   onCorrupt?: () => void;
 };
@@ -1128,82 +1228,179 @@ function timelineEventMatches(
   ].every(Boolean);
 }
 
-function newlineBoundaries(data: Buffer): number[] {
-  const boundaries: number[] = [];
-  for (let index = 0; index < data.length; index += 1) {
-    if (data[index] === 0x0a) {
-      boundaries.push(index);
-    }
+function jsonStringField(prefix: string, name: string): string | undefined {
+  const match = new RegExp(`"${name}":("(?:\\\\.|[^"\\\\])*")`, "u").exec(prefix);
+  if (!match?.[1]) {
+    return undefined;
   }
-  return boundaries;
+  try {
+    const parsed = JSON.parse(match[1]) as unknown;
+    return typeof parsed === "string" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function appendMatchingLine(
-  params: Parameters<typeof consumeCompleteLines>[0],
+function oversizedSequence(prefix: string): number | undefined {
+  const raw = /"seq":(\d+)/u.exec(prefix)?.[1];
+  const parsed = raw === undefined ? Number.NaN : Number(raw);
+  return isPositiveInteger(parsed) ? parsed : undefined;
+}
+
+function oversizedOriginalKind(prefix: string): "acp" | "lifecycle" | "unknown" {
+  const kind = /"payload":\{"kind":"(acp|lifecycle)"/u.exec(prefix)?.[1];
+  return kind === "acp" || kind === "lifecycle" ? kind : "unknown";
+}
+
+function oversizedHeaderMatches(
+  prefix: string,
+  sessionId: string,
+  metadata: SessionTimelineMetadata,
+): boolean {
+  return (
+    jsonStringField(prefix, "schema") === SESSION_TIMELINE_EVENT_SCHEMA &&
+    jsonStringField(prefix, "acpx_record_id") === sessionId &&
+    jsonStringField(prefix, "epoch") === metadata.epoch
+  );
+}
+
+function oversizedTimelineLine(
+  prefix: Buffer,
+  originalBytes: number,
+  sessionId: string,
+  metadata: SessionTimelineMetadata,
+): SessionTimelineEvent | undefined {
+  const text = prefix.toString("utf8");
+  const seq = oversizedSequence(text);
+  const capturedAt = jsonStringField(text, "captured_at");
+  const direction = jsonStringField(text, "direction");
+  const coreValid = seq !== undefined && capturedAt !== undefined && isDirection(direction);
+  if (!oversizedHeaderMatches(text, sessionId, metadata) || !coreValid) {
+    return undefined;
+  }
+  return {
+    schema: SESSION_TIMELINE_EVENT_SCHEMA,
+    acpx_record_id: sessionId,
+    epoch: metadata.epoch,
+    seq,
+    captured_at: capturedAt,
+    direction,
+    payload: {
+      kind: "truncated",
+      reason: "event_size_limit",
+      original_kind: oversizedOriginalKind(text),
+      original_bytes: originalBytes,
+      limit_bytes: SESSION_TIMELINE_MAX_EVENT_BYTES,
+      summary: "Oversized retained timeline event; original payload omitted",
+      association_omitted: true,
+    },
+  };
+}
+
+async function readTimelineLine(
+  handle: fs.FileHandle,
   start: number,
   end: number,
-): boolean {
-  const event = matchingTimelineLine(
-    params.data.subarray(start, end),
-    params.sessionId,
-    params.metadata,
-    params.options,
-  );
-  if (event) {
-    params.result.push(event);
+  sessionId: string,
+  metadata: SessionTimelineMetadata,
+  options: ReverseTimelineReadOptions,
+): Promise<SessionTimelineEvent | undefined> {
+  const length = end - start;
+  if (length <= 0) {
+    return undefined;
   }
-  return params.result.length >= params.options.limit;
-}
-
-function consumeReverseSegments(
-  params: Parameters<typeof consumeCompleteLines>[0],
-  boundaries: number[],
-  firstCompleteStart: number,
-): { end: number; full: boolean } {
-  let end = params.data.length;
-  for (const boundary of boundaries.toReversed()) {
-    const start = boundary + 1;
-    if (start < firstCompleteStart) {
-      break;
+  const bytesToRead = Math.min(length, SESSION_TIMELINE_MAX_EVENT_BYTES + 1);
+  const line = Buffer.allocUnsafe(bytesToRead);
+  const { bytesRead } = await handle.read(line, 0, bytesToRead, start);
+  options.onBytesRead?.(bytesRead);
+  if (length > SESSION_TIMELINE_MAX_EVENT_BYTES) {
+    const prefix = line.subarray(0, Math.min(bytesRead, OVERSIZED_EVENT_PREFIX_BYTES));
+    const event = oversizedTimelineLine(prefix, length, sessionId, metadata);
+    if (!event) {
+      options.onCorrupt?.();
+      return undefined;
     }
-    if (appendMatchingLine(params, start, end)) {
-      return { end, full: true };
-    }
-    end = boundary;
+    return timelineEventMatches(event, sessionId, metadata, options) ? event : undefined;
   }
-  return { end, full: false };
+  return matchingTimelineLine(line.subarray(0, bytesRead), sessionId, metadata, options);
 }
 
-function finishLineConsumption(
-  params: Parameters<typeof consumeCompleteLines>[0],
-  boundaries: number[],
-  consumed: { end: number; full: boolean },
-): Buffer {
-  if (consumed.full) {
-    return Buffer.alloc(0);
-  }
-  if (params.startsAtFileBeginning && consumed.end > 0) {
-    appendMatchingLine(params, 0, consumed.end);
-    return Buffer.alloc(0);
-  }
-  return params.data.subarray(0, boundaries[0] ?? params.data.length);
-}
+type ReverseTimelineReadState = {
+  result: SessionTimelineEvent[];
+  resultBytes: number;
+};
 
-function consumeCompleteLines(params: {
-  data: Buffer;
-  startsAtFileBeginning: boolean;
+async function scanReverseTimelineChunk(input: {
+  handle: fs.FileHandle;
+  position: number;
+  lineEnd: number;
   sessionId: string;
   metadata: SessionTimelineMetadata;
   options: ReverseTimelineReadOptions;
-  result: SessionTimelineEvent[];
-}): Buffer {
-  const boundaries = newlineBoundaries(params.data);
-  const firstCompleteStart = params.startsAtFileBeginning ? 0 : (boundaries[0] ?? -1) + 1;
-  if (firstCompleteStart === 0 && !params.startsAtFileBeginning) {
-    return params.data;
+  state: ReverseTimelineReadState;
+}): Promise<{ position: number; lineEnd: number; stopped: boolean }> {
+  const bytesToRead = Math.min(REVERSE_READ_CHUNK_BYTES, input.position);
+  const start = input.position - bytesToRead;
+  const chunk = Buffer.allocUnsafe(bytesToRead);
+  const { bytesRead } = await input.handle.read(chunk, 0, bytesToRead, start);
+  input.options.onBytesRead?.(bytesRead);
+  let lineEnd = input.lineEnd;
+  for (let index = bytesRead - 1; index >= 0; index -= 1) {
+    if (chunk[index] !== 0x0a) {
+      continue;
+    }
+    const boundary = start + index;
+    const stopped =
+      boundary < lineEnd &&
+      (await appendTimelineReadLine({
+        handle: input.handle,
+        start: boundary + 1,
+        end: lineEnd,
+        sessionId: input.sessionId,
+        metadata: input.metadata,
+        options: input.options,
+        state: input.state,
+      }));
+    lineEnd = boundary;
+    if (stopped) {
+      return { position: start, lineEnd, stopped: true };
+    }
   }
-  const consumed = consumeReverseSegments(params, boundaries, firstCompleteStart);
-  return finishLineConsumption(params, boundaries, consumed);
+  return { position: start, lineEnd, stopped: false };
+}
+
+async function appendTimelineReadLine(input: {
+  handle: fs.FileHandle;
+  start: number;
+  end: number;
+  sessionId: string;
+  metadata: SessionTimelineMetadata;
+  options: ReverseTimelineReadOptions;
+  state: ReverseTimelineReadState;
+}): Promise<boolean> {
+  const event = await readTimelineLine(
+    input.handle,
+    input.start,
+    input.end,
+    input.sessionId,
+    input.metadata,
+    input.options,
+  );
+  if (!event) {
+    return false;
+  }
+  const eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+  if (
+    input.options.maxResultBytes !== undefined &&
+    input.state.result.length > 0 &&
+    input.state.resultBytes + eventBytes > input.options.maxResultBytes
+  ) {
+    input.options.onResultLimit?.();
+    return true;
+  }
+  input.state.result.push(event);
+  input.state.resultBytes += eventBytes;
+  return input.state.result.length >= input.options.limit;
 }
 
 async function readTimelineEventsBackward(
@@ -1222,28 +1419,38 @@ async function readTimelineEventsBackward(
   }
   try {
     let position = (await handle.stat()).size;
-    let carry = Buffer.alloc(0);
-    const result: SessionTimelineEvent[] = [];
-    while (position > 0 && result.length < options.limit) {
-      const bytesToRead = Math.min(REVERSE_READ_CHUNK_BYTES, position);
-      const start = position - bytesToRead;
-      const chunk = Buffer.allocUnsafe(bytesToRead);
-      const { bytesRead } = await handle.read(chunk, 0, bytesToRead, start);
-      options.onBytesRead?.(bytesRead);
-      const data = Buffer.concat([chunk.subarray(0, bytesRead), carry]);
-      carry = Buffer.from(
-        consumeCompleteLines({
-          data,
-          startsAtFileBeginning: start === 0,
-          sessionId,
-          metadata,
-          options,
-          result,
-        }),
-      );
-      position = start;
+    let lineEnd = position;
+    const state: ReverseTimelineReadState = { result: [], resultBytes: 0 };
+    let stopped = false;
+    while (position > 0) {
+      const scanned = await scanReverseTimelineChunk({
+        handle,
+        position,
+        lineEnd,
+        sessionId,
+        metadata,
+        options,
+        state,
+      });
+      position = scanned.position;
+      lineEnd = scanned.lineEnd;
+      stopped = scanned.stopped;
+      if (stopped) {
+        break;
+      }
     }
-    return result;
+    if (!stopped && lineEnd > 0) {
+      await appendTimelineReadLine({
+        handle,
+        start: 0,
+        end: lineEnd,
+        sessionId,
+        metadata,
+        options,
+        state,
+      });
+    }
+    return state.result;
   } finally {
     await handle.close();
   }
@@ -1354,27 +1561,42 @@ function pageFromEvents(params: {
   newestFirstEvents: SessionTimelineEvent[];
   limit: number;
   observedCorrupt?: boolean;
+  moreBefore?: boolean;
 }): SessionTimelinePage {
-  const hasMore = params.newestFirstEvents.length > params.limit;
+  let hasMore = params.moreBefore === true || params.newestFirstEvents.length > params.limit;
   const selected = params.newestFirstEvents.slice(0, params.limit).toReversed();
-  const first = selected[0];
-  return {
-    epoch: params.metadata.epoch,
-    items: timelinePageItems(
-      params.record,
-      params.metadata,
+  const coverage = timelineCoverage(params.metadata, params.observedCorrupt);
+  const writeError = boundedSummary(params.metadata.last_write_error ?? undefined);
+  const build = (): SessionTimelinePage => {
+    const first = selected[0];
+    return {
+      epoch: params.metadata.epoch,
+      items: timelinePageItems(
+        params.record,
+        params.metadata,
+        hasMore,
+        selected,
+        params.observedCorrupt === true,
+      ),
+      previousCursor:
+        hasMore && first
+          ? encodeCursor(params.record.acpxRecordId, params.metadata.epoch, first.seq)
+          : undefined,
       hasMore,
-      selected,
-      params.observedCorrupt === true,
-    ),
-    previousCursor:
-      hasMore && first
-        ? encodeCursor(params.record.acpxRecordId, params.metadata.epoch, first.seq)
-        : undefined,
-    hasMore,
-    coverage: timelineCoverage(params.metadata, params.observedCorrupt),
-    writeError: params.metadata.last_write_error ?? undefined,
+      coverage,
+      writeError,
+    };
   };
+  let page = build();
+  while (
+    selected.length > 1 &&
+    Buffer.byteLength(JSON.stringify(page), "utf8") > SESSION_TIMELINE_MAX_PAGE_BYTES
+  ) {
+    selected.shift();
+    hasMore = true;
+    page = build();
+  }
+  return page;
 }
 
 export async function listSessionTimelinePage(
@@ -1391,9 +1613,14 @@ export async function listSessionTimelinePage(
   assertCursorEpoch(cursor, record, metadata);
   const limit = normalizePageLimit(options.limit);
   let observedCorrupt = false;
+  let byteLimitReached = false;
   const events = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
     beforeSeq: cursor?.seq,
     limit: limit + 1,
+    maxResultBytes: SESSION_TIMELINE_MAX_PAGE_BYTES - PAGE_ENVELOPE_RESERVE_BYTES,
+    onResultLimit: () => {
+      byteLimitReached = true;
+    },
     onCorrupt: () => {
       observedCorrupt = true;
     },
@@ -1404,6 +1631,7 @@ export async function listSessionTimelinePage(
     newestFirstEvents: events,
     limit,
     observedCorrupt,
+    moreBefore: byteLimitReached,
   });
 }
 

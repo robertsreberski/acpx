@@ -26,6 +26,8 @@ import {
   getLatestSessionTimelineLifecycleEvent,
   listQueuedSessionTimelineTurns,
   listSessionTimelinePage,
+  SESSION_TIMELINE_MAX_EVENT_BYTES,
+  SESSION_TIMELINE_MAX_PAGE_BYTES,
   SessionTimelineCursorError,
   SessionTimelineWriter,
   sessionTimelineTestInternals,
@@ -695,6 +697,181 @@ test("latest and previous timeline windows use bounded reverse reads", async () 
       previousPage.items.map((item) => ("payload" in item ? item.seq : 0)),
       [37, 38],
     );
+  });
+});
+
+test("oversized events become explicit bounded markers without breaking pagination", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-oversized-write", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    const capturedAt = "2026-08-12T10:00:01.000Z";
+    await writer.appendAcpEvents([
+      {
+        direction: "inbound",
+        message: updateMessage(record.acpSessionId, "before"),
+        capturedAt,
+      },
+      {
+        direction: "inbound",
+        message: updateMessage(
+          record.acpSessionId,
+          "oversized:".concat("x".repeat(SESSION_TIMELINE_MAX_EVENT_BYTES * 2)),
+        ),
+        capturedAt,
+        turnId: "turn-large",
+      },
+      {
+        direction: "inbound",
+        message: updateMessage(record.acpSessionId, "after"),
+        capturedAt,
+      },
+    ]);
+    await writer.close({ checkpoint: true });
+
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    assert.ok(stored.timeline);
+    const lines = (await fs.readFile(stored.timeline.active_path, "utf8")).trimEnd().split("\n");
+    assert.equal(lines.length, 3);
+    assert.equal(
+      lines.every((line) => Buffer.byteLength(line, "utf8") <= SESSION_TIMELINE_MAX_EVENT_BYTES),
+      true,
+    );
+
+    const latest = await listSessionTimelinePage(record.acpxRecordId, { limit: 1 });
+    assert.deepEqual(
+      latest.items.map((item) => ("payload" in item ? item.seq : 0)),
+      [3],
+    );
+    assert.equal(latest.hasMore, true);
+    const middle = await listSessionTimelinePage(record.acpxRecordId, {
+      before: latest.previousCursor,
+      limit: 1,
+    });
+    const marker = middle.items[0];
+    assert.ok(marker && "payload" in marker);
+    assert.equal(marker.seq, 2);
+    assert.equal(marker.payload.kind, "truncated");
+    if (marker.payload.kind === "truncated") {
+      assert.equal(marker.payload.reason, "event_size_limit");
+      assert.equal(marker.payload.original_kind, "acp");
+      assert.equal(marker.payload.original_bytes > SESSION_TIMELINE_MAX_EVENT_BYTES, true);
+      assert.equal(marker.payload.limit_bytes, SESSION_TIMELINE_MAX_EVENT_BYTES);
+      assert.equal(marker.payload.summary, "ACP method: session/update");
+    }
+    assert.equal(middle.hasMore, true);
+    const oldest = await listSessionTimelinePage(record.acpxRecordId, {
+      before: middle.previousCursor,
+      limit: 1,
+    });
+    assert.deepEqual(
+      oldest.items.map((item) => ("payload" in item ? item.seq : 0)),
+      [1],
+    );
+    assert.equal(oldest.hasMore, false);
+  });
+});
+
+test("reverse reads project a pre-existing oversized line instead of accumulating it", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-oversized-retained", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    await writer.appendAcpEvents([
+      {
+        direction: "inbound",
+        message: updateMessage(record.acpSessionId, "before"),
+        capturedAt: "2026-08-12T10:00:01.000Z",
+      },
+    ]);
+    await writer.close({ checkpoint: true });
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    assert.ok(stored.timeline);
+    const oversized = {
+      schema: "acpx.session_event.v1",
+      acpx_record_id: stored.acpxRecordId,
+      epoch: stored.timeline.epoch,
+      seq: 2,
+      captured_at: "2026-08-12T10:00:02.000Z",
+      direction: "inbound",
+      payload: {
+        kind: "acp",
+        message: updateMessage(
+          record.acpSessionId,
+          "retained:".concat("y".repeat(SESSION_TIMELINE_MAX_EVENT_BYTES * 3)),
+        ),
+      },
+    };
+    const oversizedLine = JSON.stringify(oversized);
+    await fs.appendFile(stored.timeline.active_path, `${oversizedLine}\n`, "utf8");
+    stored.timeline.last_seq = 2;
+    await writeSessionRecord(stored);
+
+    const page = await listSessionTimelinePage(record.acpxRecordId, { limit: 10 });
+    assert.equal(page.coverage, "complete");
+    assert.deepEqual(
+      page.items.map((item) => ("payload" in item ? item.seq : 0)),
+      [1, 2],
+    );
+    const retainedMarker = page.items[1];
+    assert.ok(retainedMarker && "payload" in retainedMarker);
+    assert.equal(retainedMarker.payload.kind, "truncated");
+    if (retainedMarker.payload.kind === "truncated") {
+      assert.equal(retainedMarker.payload.original_bytes, Buffer.byteLength(oversizedLine, "utf8"));
+      assert.equal(retainedMarker.payload.original_kind, "acp");
+      assert.equal(retainedMarker.payload.association_omitted, true);
+    }
+  });
+});
+
+test("timeline pages are byte bounded and cursors cover every retained event", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-byte-pages", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    for (let index = 1; index <= 24; index += 1) {
+      await writer.appendAcpEvents([
+        {
+          direction: "inbound",
+          message: updateMessage(record.acpSessionId, `${index}:`.concat("z".repeat(70_000))),
+          capturedAt: "2026-08-12T10:00:01.000Z",
+        },
+      ]);
+    }
+    await writer.close({ checkpoint: true });
+
+    const sequences: number[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = await listSessionTimelinePage(record.acpxRecordId, {
+        before: cursor,
+        limit: 1_000,
+      });
+      pages += 1;
+      assert.equal(
+        Buffer.byteLength(JSON.stringify(page), "utf8") <= SESSION_TIMELINE_MAX_PAGE_BYTES,
+        true,
+      );
+      sequences.unshift(...page.items.flatMap((item) => ("payload" in item ? [item.seq] : [])));
+      cursor = page.previousCursor;
+      if (!page.hasMore) {
+        break;
+      }
+      assert.ok(cursor);
+    } while (cursor);
+    assert.equal(pages > 1, true);
+    assert.deepEqual(
+      sequences,
+      Array.from({ length: 24 }, (_, index) => index + 1),
+    );
+    assert.equal(new Set(sequences).size, 24);
   });
 });
 

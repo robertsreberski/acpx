@@ -219,6 +219,26 @@ const projectLifecycle = (
   };
 };
 
+const projectTruncated = (
+  event: WireTimelineEvent,
+  payload: Record<string, unknown>,
+): TranscriptEvent => ({
+  ...baseEvent(event),
+  kind: "timeline_truncated",
+  role: "assistant",
+  title: "Timeline event truncated",
+  text:
+    asString(payload.summary) ??
+    "This event exceeded the timeline storage limit; its original payload was omitted.",
+  status: "complete",
+  input: {
+    reason: payload.reason,
+    originalKind: payload.original_kind,
+    originalBytes: payload.original_bytes,
+    limitBytes: payload.limit_bytes,
+  },
+});
+
 export const projectTimelineEvent = (event: WireTimelineEvent): TranscriptEvent => {
   const payload = asRecord(event.payload);
   if (payload.kind === "acp") {
@@ -226,6 +246,9 @@ export const projectTimelineEvent = (event: WireTimelineEvent): TranscriptEvent 
   }
   if (payload.kind === "lifecycle") {
     return projectLifecycle(event, asRecord(payload.event));
+  }
+  if (payload.kind === "truncated") {
+    return projectTruncated(event, payload);
   }
   return {
     ...baseEvent(event),

@@ -233,6 +233,28 @@ test("projects lifecycle events without presenting them as chat text", () => {
   assert.equal(projected.role, "assistant");
 });
 
+test("projects oversized-event markers as explicit chronological activity", () => {
+  const projected = projectTimelineEvent(
+    wire(7, {
+      kind: "truncated",
+      reason: "event_size_limit",
+      original_kind: "acp",
+      original_bytes: 700_000,
+      limit_bytes: 262_144,
+      summary: "ACP method: session/update",
+    }),
+  );
+  assert.equal(projected.kind, "timeline_truncated");
+  assert.equal(projected.title, "Timeline event truncated");
+  assert.equal(projected.text, "ACP method: session/update");
+  assert.deepEqual(projected.input, {
+    reason: "event_size_limit",
+    originalKind: "acp",
+    originalBytes: 700_000,
+    limitBytes: 262_144,
+  });
+});
+
 test("binds an interaction card only to the request's first chronological event", () => {
   const events = [
     {

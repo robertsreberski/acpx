@@ -27,6 +27,10 @@ Repo: https://github.com/openclaw/acpx
   including automatic bounded continuation for large histories, without
   requiring a prompt mutation.
 
+- Sessions/console: bound individual timeline events and transcript pages by
+  serialized bytes, preserving oversized events as explicit chronological
+  truncation markers instead of allowing unbounded storage or response reads.
+
 - Console/workspaces: keep retained sessions visible and controllable after an
   allowlisted workspace leaf is deleted or renamed, without weakening canonical
   workspace-root and symlink boundaries.

@@ -354,8 +354,15 @@ async function importTimeline(
             source: event.payload.source,
           },
         ]);
-      } else {
+      } else if (event.payload.kind === "lifecycle") {
         await writer.appendLifecycleEvent(event.payload.event, {
+          capturedAt: event.captured_at,
+          turnId: event.turn_id,
+          requestId: event.request_id,
+        });
+      } else {
+        await writer.appendTruncatedEvent(event.payload, {
+          direction: event.direction,
           capturedAt: event.captured_at,
           turnId: event.turn_id,
           requestId: event.request_id,

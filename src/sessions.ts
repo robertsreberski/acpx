@@ -47,6 +47,8 @@ export type {
   AcpxTurnState,
 } from "./sessions-service/contract.js";
 export {
+  SESSION_TIMELINE_MAX_EVENT_BYTES,
+  SESSION_TIMELINE_MAX_PAGE_BYTES,
   SessionTimelineCursorError,
   appendSessionTimelineLifecycleEvent,
   getActiveSessionTimelineTurn,
@@ -63,6 +65,7 @@ export type {
   SessionTimelinePage,
   SessionTimelineQueuedTurn,
   SessionTimelinePayload,
+  SessionTimelineTruncatedPayload,
 } from "./session/timeline.js";
 export type {
   PendingRequestAnswer,
