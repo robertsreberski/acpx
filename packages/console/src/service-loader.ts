@@ -167,7 +167,10 @@ function projectAgent(agent: CoreAgent): ConsoleAgent {
   return {
     agentId: agent.agentId,
     label: agent.label,
-    supportsSessionList: agent.capabilities.sessionList === "supported",
+    supportsSessionList:
+      agent.capabilities.sessionList === "unknown"
+        ? undefined
+        : agent.capabilities.sessionList === "supported",
   };
 }
 

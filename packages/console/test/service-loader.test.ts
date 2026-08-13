@@ -3,7 +3,7 @@ import test from "node:test";
 import type { ServiceInvalidation, TimelinePage } from "../src/contracts.js";
 import { adaptAcpxSessionService } from "../src/service-loader.js";
 
-function coreFixture() {
+function coreFixture(sessionList: "supported" | "unsupported" | "unknown" = "supported") {
   const calls: Array<{ method: string; input: unknown }> = [];
   const session = {
     acpxRecordId: "record-1",
@@ -33,7 +33,7 @@ function coreFixture() {
             agentId: "codex",
             label: "Codex",
             capabilities: {
-              sessionList: "supported" as const,
+              sessionList,
               sessionResume: "supported" as const,
               sessionLoad: "unknown" as const,
             },
@@ -150,6 +150,26 @@ test("adapter unwraps mutation receipts and projects provider and agent inventor
       providerClose: { status: "confirmed" },
     },
   );
+});
+
+test("agent inventory preserves supported, unsupported, and unknown session-list capability", async () => {
+  const cases = [
+    ["supported", true],
+    ["unsupported", false],
+    ["unknown", undefined],
+  ] as const;
+
+  for (const [sessionList, supportsSessionList] of cases) {
+    const fixture = coreFixture(sessionList);
+    const service = adaptAcpxSessionService(fixture.core);
+    assert.deepEqual(await service.listAgents({ cwd: "/workspace" }), [
+      {
+        agentId: "codex",
+        label: "Codex",
+        supportsSessionList,
+      },
+    ]);
+  }
 });
 
 test("adapter translates web prompt and pending answer shapes into the stable core contract", async () => {
