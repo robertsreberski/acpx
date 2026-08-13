@@ -2346,68 +2346,73 @@ for (const scenario of [
   });
 }
 
-test("an explicit owner rejection remains terminal after acknowledgement", async () => {
-  await withTempHome("acpx-sessions-service-", async (homeDir) => {
-    const cwd = path.join(homeDir, "workspace");
-    await fs.mkdir(cwd, { recursive: true });
-    const initial = makeSessionRecord({
-      acpxRecordId: "session-accepted-rejection",
-      acpSessionId: "provider-accepted-rejection",
-      agentCommand: AGENT_REGISTRY.codex,
-      cwd,
-    });
-    await writeSessionRecordFile(homeDir, initial);
-    const keeper = await startKeeperProcess();
-    const paths = queuePaths(homeDir, initial.acpxRecordId);
-    await writeQueueOwnerLock({
-      ...paths,
-      pid: keeper.pid,
-      sessionId: initial.acpxRecordId,
-      ownerGeneration: 90,
-    });
-    let responseWrites = 0;
-    const server = createSingleRequestServer((socket, request) => {
-      responseWrites += 1;
-      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
-      socket.write(
-        `${JSON.stringify({
-          type: "error",
-          requestId: request.requestId,
-          ownerGeneration: 90,
-          code: "USAGE",
-          detailCode: "PENDING_REQUEST_NOT_ANSWERABLE",
-          origin: "queue",
-          retryable: false,
-          message: "The pending request has already settled",
-        })}\n`,
-      );
-    });
-    await listenServer(server, paths.socketPath);
-    const service = createAcpxSessionService({ cwd });
-    const input = {
-      acpxRecordId: initial.acpxRecordId,
-      requestId: "request-accepted-rejection",
-      answer: { type: "cancel" } as const,
-    };
-    try {
-      for (const idempotencyKey of ["accepted-rejection-first", "accepted-rejection-second"]) {
-        await assert.rejects(
-          async () => await service.respondToPendingRequest({ ...input, idempotencyKey }),
-          (error: unknown) => {
-            assert.equal(
-              (error as { detailCode?: string }).detailCode,
-              "PENDING_REQUEST_NOT_ANSWERABLE",
-            );
-            return true;
-          },
+for (const detailCode of ["QUEUE_RESPONSE_TIMEOUT", "QUEUE_CONNECT_TIMEOUT"] as const) {
+  test(`an explicit owner rejection preserves the colliding ${detailCode} code`, async () => {
+    await withTempHome("acpx-sessions-service-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const suffix = detailCode.toLowerCase().replaceAll("_", "-");
+      const initial = makeSessionRecord({
+        acpxRecordId: `session-accepted-rejection-${suffix}`,
+        acpSessionId: `provider-accepted-rejection-${suffix}`,
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd,
+      });
+      await writeSessionRecordFile(homeDir, initial);
+      const keeper = await startKeeperProcess();
+      const paths = queuePaths(homeDir, initial.acpxRecordId);
+      await writeQueueOwnerLock({
+        ...paths,
+        pid: keeper.pid,
+        sessionId: initial.acpxRecordId,
+        ownerGeneration: 90,
+      });
+      let responseWrites = 0;
+      const server = createSingleRequestServer((socket, request) => {
+        responseWrites += 1;
+        socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+        socket.write(
+          `${JSON.stringify({
+            type: "error",
+            requestId: request.requestId,
+            ownerGeneration: 90,
+            code: "USAGE",
+            detailCode,
+            origin: "queue",
+            retryable: false,
+            message: "The pending request has already settled",
+          })}\n`,
         );
+      });
+      await listenServer(server, paths.socketPath);
+      const service = createAcpxSessionService({ cwd });
+      const input = {
+        acpxRecordId: initial.acpxRecordId,
+        requestId: `request-accepted-rejection-${suffix}`,
+        answer: { type: "cancel" } as const,
+      };
+      try {
+        for (const attempt of ["first", "second"]) {
+          await assert.rejects(
+            async () =>
+              await service.respondToPendingRequest({
+                ...input,
+                idempotencyKey: `accepted-rejection-${suffix}-${attempt}`,
+              }),
+            (error: unknown) => {
+              assert.equal((error as { detailCode?: string }).detailCode, detailCode);
+              assert.equal((error as { outputCode?: string }).outputCode, "USAGE");
+              return true;
+            },
+          );
+        }
+        assert.equal(responseWrites, 2, "an explicit rejection incorrectly reserved the scope");
+      } finally {
+        service.dispose();
+        await closeServer(server);
+        await cleanupOwnerArtifacts(paths);
+        stopProcess(keeper);
       }
-      assert.equal(responseWrites, 2, "an explicit rejection incorrectly reserved the scope");
-    } finally {
-      service.dispose();
-      await closeServer(server);
-      await cleanupOwnerArtifacts(paths);
-      stopProcess(keeper);
-    }
+    });
   });
-});
+}

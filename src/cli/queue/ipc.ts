@@ -1343,6 +1343,7 @@ function pendingRequestAnswerTimeout(
 function isQueueBudgetTimeout(error: unknown): error is QueueConnectionError {
   return (
     error instanceof QueueConnectionError &&
+    !(error instanceof QueueOwnerRequestRejectedError) &&
     (error.detailCode === "QUEUE_RESPONSE_TIMEOUT" || error.detailCode === "QUEUE_CONNECT_TIMEOUT")
   );
 }
