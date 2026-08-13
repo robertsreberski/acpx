@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import net from "node:net";
@@ -193,17 +194,31 @@ test("releaseQueueOwnerLease preserves a replacement owner", async () => {
   });
 });
 
-test("tryAcquireQueueOwnerLease expires a retirement marker whose PID was reused", async () => {
+test("tryAcquireQueueOwnerLease expires a retirement marker whose PID was reused", async (t) => {
   await withTempHome(async (homeDir) => {
     const sessionId = "lease-stale-retirement-marker";
     const lockPath = queueLockFilePath(sessionId, homeDir);
     const markerPath = `${lockPath}.retiring`;
     await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    const markerId = `stale-marker-${randomUUID()}`;
+    const livenessPath =
+      process.platform === "win32"
+        ? `\\\\.\\pipe\\acpx-retire-${markerId}`
+        : path.join("/tmp", `acpx-retire-${markerId}.sock`);
+    t.after(async () => {
+      await fs.rm(markerPath, { force: true });
+      if (process.platform !== "win32") {
+        await fs.rm(livenessPath, { force: true });
+      }
+    });
+    if (process.platform !== "win32") {
+      await fs.writeFile(livenessPath, "stale socket placeholder", "utf8");
+    }
     await fs.writeFile(
       markerPath,
       `${JSON.stringify({
-        markerId: "stale-marker-id",
-        livenessPath: path.join(homeDir, "missing-retirement-liveness.sock"),
+        markerId,
+        livenessPath,
         pid: process.pid,
         ownerGeneration: 1,
         createdAt: "2000-01-01T00:00:00.000Z",
@@ -213,8 +228,13 @@ test("tryAcquireQueueOwnerLease expires a retirement marker whose PID was reused
 
     const lease = await tryAcquireQueueOwnerLease(sessionId);
     assert(lease);
+    t.after(async () => {
+      await releaseQueueOwnerLease(lease).catch(() => undefined);
+    });
     await assert.rejects(fs.access(markerPath));
-    await releaseQueueOwnerLease(lease);
+    if (process.platform !== "win32") {
+      await assert.rejects(fs.access(livenessPath));
+    }
   });
 });
 

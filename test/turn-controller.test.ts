@@ -5,6 +5,7 @@ import {
   QueueOwnerTurnController,
   type QueueOwnerActiveSessionController,
 } from "../src/cli/queue/owner-turn-controller.js";
+import { queueOwnerRuntimeTestInternals } from "../src/cli/session/queue-owner-runtime.js";
 
 test("QueueOwnerTurnController tracks explicit lifecycle states", async () => {
   const controller = createQueueOwnerTurnController();
@@ -373,6 +374,64 @@ test("QueueOwnerTurnController releases the idle-control barrier during shutdown
 
   releaseFallback();
   await preference;
+});
+
+test("queue owner closes a handed-off task when shutdown aborts turn start", async () => {
+  let releaseFallback!: () => void;
+  const fallbackGate = new Promise<void>((resolve) => {
+    releaseFallback = resolve;
+  });
+  const controller = createQueueOwnerTurnController({
+    applySessionPreferencesFallback: async () => {
+      await fallbackGate;
+      return {
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      };
+    },
+  });
+  const preference = controller.applySessionPreferences("smart-model", "high");
+  await Promise.resolve();
+  let closed = false;
+  let ran = false;
+  const task = queueOwnerRuntimeTestInternals.runQueueOwnerTask({
+    turnController: controller,
+    task: {
+      close: () => {
+        closed = true;
+      },
+    },
+    run: async () => {
+      ran = true;
+    },
+  });
+  await Promise.resolve();
+
+  controller.prepareForShutdown();
+
+  await assert.rejects(task, /Queue owner is closing/);
+  assert.equal(closed, true);
+  assert.equal(ran, false);
+  releaseFallback();
+  await preference;
+});
+
+test("queue owner leaves task closure to the runner after turn start", async () => {
+  const controller = createQueueOwnerTurnController();
+  let closeCalls = 0;
+  const result = await queueOwnerRuntimeTestInternals.runQueueOwnerTask({
+    turnController: controller,
+    task: {
+      close: () => {
+        closeCalls += 1;
+      },
+    },
+    run: async () => "completed",
+  });
+
+  assert.equal(result, "completed");
+  assert.equal(closeCalls, 0);
+  assert.equal(controller.lifecycleState, "idle");
 });
 
 test("QueueOwnerTurnController rejects control requests while closing", async () => {

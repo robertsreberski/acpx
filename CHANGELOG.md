@@ -18,6 +18,8 @@ Repo: https://github.com/openclaw/acpx
 
 - Runtime/embedding: settle turn results only after lifecycle persistence and client cleanup attempts finish, including unexpected finalization failures.
 
+- Effort/queue recovery: preserve live turn updates during active controls, close accepted tasks promptly when shutdown interrupts turn startup, and clean up inactive retirement-marker sockets.
+
 ## 2026.7.27 (v0.13.0)
 
 ### Highlights

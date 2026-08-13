@@ -25,6 +25,7 @@ import {
   tryAcquireQueueOwnerLease,
   trySubmitToRunningOwner,
   type QueueOwnerLease,
+  type QueueTask,
   waitMs,
 } from "../queue/ipc.js";
 import { refreshQueueOwnerLease } from "../queue/lease-store.js";
@@ -60,6 +61,26 @@ import { runQueuedTask } from "./runtime.js";
 const QUEUE_OWNER_STARTUP_MAX_ATTEMPTS = 120;
 const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const QUEUE_OWNER_ACTIVE_TURN_CANCEL_GRACE_MS = 750;
+
+async function runQueueOwnerTask<T>(params: {
+  turnController: QueueOwnerTurnController;
+  task: Pick<QueueTask, "close">;
+  run: () => Promise<T>;
+}): Promise<T> {
+  try {
+    await params.turnController.beginTurn();
+  } catch (error) {
+    // runQueuedTask owns close after turn startup. This earlier failure path
+    // rejects before runQueuedTask can enter its cleanup boundary.
+    params.task.close();
+    throw error;
+  }
+  try {
+    return await params.run();
+  } finally {
+    params.turnController.endTurn();
+  }
+}
 
 async function submitToRunningOwner(
   options: SessionSendOptions,
@@ -614,15 +635,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     return true;
   };
 
-  const runPromptTurn = async <T>(run: () => Promise<T>): Promise<T> => {
-    await turnController.beginTurn();
-    try {
-      return await run();
-    } finally {
-      turnController.endTurn();
-    }
-  };
-
   const shutdown = createQueueOwnerShutdownController({
     lease,
     parking,
@@ -722,32 +734,36 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       }
       isFirstTask = false;
 
-      const turnPromise = runPromptTurn(async () => {
-        try {
-          parking?.beginTask(task.requestId);
-          await runQueuedTask(options.sessionId, task, {
-            sharedClient,
-            verbose: options.verbose,
-            mcpServers: options.mcpServers,
-            nonInteractivePermissions: options.nonInteractivePermissions,
-            authCredentials: options.authCredentials,
-            authPolicy: options.authPolicy,
-            suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-            promptRetries: task.promptRetries ?? 0,
-            sessionOptions: options.sessionOptions,
-            onClientAvailable: setActiveController,
-            onClientClosed: clearActiveController,
-            ...(parking ? { onPendingRequestSink: parking.setTaskSink } : {}),
-            onPromptActive: async () => {
-              turnController.markPromptActive();
-              await applyPendingCancel();
-            },
-            handleProcessInterrupts: false,
-          });
-        } finally {
-          parking?.endTask();
-          checkpointPerfMetricsCapture();
-        }
+      const turnPromise = runQueueOwnerTask({
+        turnController,
+        task,
+        run: async () => {
+          try {
+            parking?.beginTask(task.requestId);
+            await runQueuedTask(options.sessionId, task, {
+              sharedClient,
+              verbose: options.verbose,
+              mcpServers: options.mcpServers,
+              nonInteractivePermissions: options.nonInteractivePermissions,
+              authCredentials: options.authCredentials,
+              authPolicy: options.authPolicy,
+              suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+              promptRetries: task.promptRetries ?? 0,
+              sessionOptions: options.sessionOptions,
+              onClientAvailable: setActiveController,
+              onClientClosed: clearActiveController,
+              ...(parking ? { onPendingRequestSink: parking.setTaskSink } : {}),
+              onPromptActive: async () => {
+                turnController.markPromptActive();
+                await applyPendingCancel();
+              },
+              handleProcessInterrupts: false,
+            });
+          } finally {
+            parking?.endTask();
+            checkpointPerfMetricsCapture();
+          }
+        },
       });
       shutdown.setActiveTurn(turnPromise);
       try {
@@ -810,4 +826,4 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
 
 export type { QueueOwnerRuntimeOptions };
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
-export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal };
+export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal, runQueueOwnerTask };

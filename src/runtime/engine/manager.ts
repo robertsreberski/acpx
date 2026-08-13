@@ -25,7 +25,7 @@ import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
   clearDesiredConfigOption,
-  reconcileDesiredEffortForModelChange,
+  normalizeModeId,
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredEffort,
@@ -1092,8 +1092,14 @@ export class AcpRuntimeManager {
         await this.waitForRuntimeControlSession(task, turn);
         await turn.client.setSessionMode(turn.activeSessionId, modeId);
         const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
-        nextState.desired_mode_id = modeId;
+        const normalizedModeId = normalizeModeId(modeId);
+        if (normalizedModeId) {
+          nextState.desired_mode_id = normalizedModeId;
+        } else {
+          delete nextState.desired_mode_id;
+        }
         turn.acpxState = nextState;
+        await turn.liveCheckpoint.checkpoint();
       },
       setSessionModel: async (modelId: string) => {
         await this.waitForRuntimeControlSession(task, turn);
@@ -1115,6 +1121,7 @@ export class AcpRuntimeManager {
             previousEffortConfigId: effortStateFromConfigOptions(previousState?.config_options)
               ?.configId,
           });
+          await turn.liveCheckpoint.checkpoint();
           return response;
         }
         const effort = await reapplyDesiredEffortAfterModelChange({
@@ -1129,6 +1136,7 @@ export class AcpRuntimeManager {
           },
         });
         turn.acpxState = effort.state;
+        await turn.liveCheckpoint.checkpoint();
         return effort.response ?? response;
       },
       setSessionConfigOption: async (configId: string, value: string) => {
@@ -1193,6 +1201,7 @@ export class AcpRuntimeManager {
     );
     this.applyRuntimeConfigOptionState(turn, resolvedConfigId, value, response);
     if (resolvedConfigId !== modelConfigId) {
+      await turn.liveCheckpoint.checkpoint();
       return { configId: resolvedConfigId, response };
     }
     const effort = await reapplyDesiredEffortAfterModelChange({
@@ -1207,6 +1216,7 @@ export class AcpRuntimeManager {
       },
     });
     turn.acpxState = effort.state;
+    await turn.liveCheckpoint.checkpoint();
     return { configId: resolvedConfigId, response: effort.response ?? response };
   }
 
@@ -1494,21 +1504,19 @@ export class AcpRuntimeManager {
   ): Promise<void> {
     const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
     const controller = this.activeControllers.get(record.acpxRecordId);
-    let targetRecord = record;
     if (controller) {
       await controller.setSessionMode(mode);
-    } else {
-      const result = await this.withRuntimeControlSession(
-        record,
-        sessionMode,
-        async ({ client, sessionId }) => {
-          await client.setSessionMode(sessionId, mode);
-        },
-      );
-      targetRecord = result.record;
+      return;
     }
-    setDesiredModeId(targetRecord, mode);
-    await this.options.sessionStore.save(targetRecord);
+    const result = await this.withRuntimeControlSession(
+      record,
+      sessionMode,
+      async ({ client, sessionId }) => {
+        await client.setSessionMode(sessionId, mode);
+      },
+    );
+    setDesiredModeId(result.record, mode);
+    await this.options.sessionStore.save(result.record);
   }
 
   async setConfigOption(
@@ -1520,15 +1528,10 @@ export class AcpRuntimeManager {
     const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
     const controller = this.activeControllers.get(record.acpxRecordId);
     if (controller) {
-      const previousState = cloneSessionAcpxState(record.acpx);
-      const modelConfigId = advertisedModelState(previousState)?.configId;
-      const { configId, response } = await controller.setResolvedSessionConfigOption(key, value);
-      applyConfigOptionsToRecord(record, response);
-      applyDesiredConfigOptionToRecord(record, configId, value);
-      if (configId === modelConfigId) {
-        record.acpx = reconcileDesiredEffortForModelChange(previousState, record.acpx).state;
-      }
-      await this.options.sessionStore.save(record);
+      // The active controller mutates the live turn state and checkpoints it.
+      // Saving this separately loaded record would race that checkpoint and can
+      // roll back conversation updates or another control applied mid-turn.
+      await controller.setResolvedSessionConfigOption(key, value);
       return;
     }
 

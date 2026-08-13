@@ -1304,13 +1304,20 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
     },
     hasActivePrompt: () => true,
     setSessionMode: async (_sessionId, modeId) => {
-      assert.equal(modeId, "plan");
+      assert.equal(modeId, " plan ");
       setModeCalls += 1;
     },
     setSessionConfigOption: async (_sessionId, key, value) => {
       assert.equal(key, "approval");
       assert.equal(value, "manual");
       setConfigCalls += 1;
+      handlers.onSessionUpdate?.({
+        sessionId: "live-session-sid",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "control checkpoint" },
+        },
+      });
       return {
         configOptions: [
           {
@@ -1346,7 +1353,7 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   });
   const eventsPromise = collectEvents(turn.events);
   await promptStarted;
-  await manager.setMode(createHandle("live-session"), "plan");
+  await manager.setMode(createHandle("live-session"), " plan ");
   await manager.setConfigOption(createHandle("live-session"), "approval", "manual");
   const liveStatusDuringTurn = await manager.getStatus(createHandle("live-session"));
   await turn.cancel();
@@ -1368,9 +1375,19 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   assert.deepEqual(liveStatusDuringTurn.details?.configOptions, expectedConfigOptions);
   assert.deepEqual(liveStatusAfterTurn.details?.configOptions, expectedConfigOptions);
   assert.equal(cancelRequested, 1);
-  assert.deepEqual(events, []);
+  assert.deepEqual(events, [
+    {
+      type: "text_delta",
+      text: "control checkpoint",
+      stream: "output",
+      tag: "agent_message_chunk",
+    },
+  ]);
   assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
   assert.equal(handlers.onSessionUpdate, undefined);
+  const stored = await store.load("live-session");
+  assert.equal(stored?.acpx?.desired_mode_id, "plan");
+  assert.match(JSON.stringify(stored?.messages), /control checkpoint/);
 });
 
 test("AcpRuntimeManager times out effort replay after an active model config change", async () => {
