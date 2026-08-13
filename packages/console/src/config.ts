@@ -1,4 +1,5 @@
-import { realpath, readFile, stat } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -257,6 +258,19 @@ async function nearestExistingDirectory(candidate: string): Promise<string> {
       if (code !== "ENOENT" && code !== "ENOTDIR") {
         throw error;
       }
+      try {
+        if ((await lstat(current)).isSymbolicLink()) {
+          throw new ConsoleInputError(`Workspace is outside the configured roots: ${candidate}`);
+        }
+      } catch (entryError) {
+        if (entryError instanceof ConsoleInputError) {
+          throw entryError;
+        }
+        const entryCode = (entryError as NodeJS.ErrnoException).code;
+        if (entryCode !== "ENOENT" && entryCode !== "ENOTDIR") {
+          throw entryError;
+        }
+      }
       const parent = dirname(current);
       if (parent === current) {
         throw new ConsoleInputError(`Workspace is not accessible: ${candidate}`);
@@ -266,20 +280,84 @@ async function nearestExistingDirectory(candidate: string): Promise<string> {
   }
 }
 
+async function retainedWorkspaceDecisionPath(
+  acpxRecordId: string,
+  candidate: string,
+  roots: string[],
+  stateDir: string,
+): Promise<string> {
+  const canonicalRoots = await Promise.all(
+    roots.map(async (root) => await realpath(resolve(root))),
+  );
+  const identity = createHash("sha256")
+    .update(JSON.stringify({ acpxRecordId, candidate, roots: canonicalRoots.toSorted() }))
+    .digest("hex");
+  return join(resolve(stateDir), "workspace-authorizations", identity);
+}
+
+type RetainedWorkspaceDecision = "allow" | "deny";
+
+async function retainedWorkspaceDecision(
+  marker: string,
+): Promise<RetainedWorkspaceDecision | undefined> {
+  try {
+    const value = await readFile(marker, "utf8");
+    return value === "allow\n" ? "allow" : "deny";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function rememberRetainedWorkspaceDecision(
+  marker: string,
+  decision: RetainedWorkspaceDecision,
+): Promise<void> {
+  await mkdir(dirname(marker), { recursive: true, mode: 0o700 });
+  const temporary = `${marker}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, `${decision}\n`, { flag: "wx", mode: 0o600 });
+    await rename(temporary, marker);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function isOutsideWorkspaceError(error: unknown): error is ConsoleInputError {
+  return (
+    error instanceof ConsoleInputError &&
+    error.message.startsWith("Workspace is outside the configured roots:")
+  );
+}
+
 /**
  * Authorize the cwd stored on an existing session record.
  *
  * New sessions still use {@link assertWorkspaceAllowed} and therefore require
  * an existing directory. A retained session must remain controllable after its
- * workspace leaf is deleted or renamed, so a missing suffix is accepted only
- * when its nearest existing directory resolves inside a configured root. This
- * also resolves any surviving symlink prefix before the boundary check.
+ * workspace leaf is deleted or renamed, so its last proven authorization is
+ * retained in the private console state. A record without that admission
+ * evidence fails closed once its workspace disappears: a missing path cannot
+ * reveal whether its former leaf was a real directory or an outside symlink.
+ * Recreating the path supplies new canonical evidence and refreshes the saved
+ * decision.
  */
 export async function assertRetainedWorkspaceAllowed(
+  acpxRecordId: string,
   cwd: string,
   roots: string[],
+  stateDir: string,
 ): Promise<string> {
   const candidate = resolve(cwd);
+  const decisionPath = await retainedWorkspaceDecisionPath(
+    acpxRecordId,
+    candidate,
+    roots,
+    stateDir,
+  );
   let canonicalCandidate: string;
   try {
     canonicalCandidate = await realpath(candidate);
@@ -288,10 +366,51 @@ export async function assertRetainedWorkspaceAllowed(
     if (code !== "ENOENT" && code !== "ENOTDIR") {
       throw error;
     }
-    canonicalCandidate = await nearestExistingDirectory(candidate);
+    const decision = await retainedWorkspaceDecision(decisionPath);
+    if (decision === "allow") {
+      try {
+        const nearest = await nearestExistingDirectory(candidate);
+        await assertCanonicalWorkspaceAllowed(nearest, candidate, roots);
+        return candidate;
+      } catch (missingError) {
+        if (isOutsideWorkspaceError(missingError)) {
+          await rememberRetainedWorkspaceDecision(decisionPath, "deny");
+        }
+        throw missingError;
+      }
+    }
+    if (decision === "deny") {
+      throw new ConsoleInputError(`Workspace is outside the configured roots: ${candidate}`);
+    }
+    let nearest: string;
+    try {
+      nearest = await nearestExistingDirectory(candidate);
+    } catch (missingError) {
+      if (isOutsideWorkspaceError(missingError)) {
+        await rememberRetainedWorkspaceDecision(decisionPath, "deny");
+      }
+      throw missingError;
+    }
+    try {
+      await assertCanonicalWorkspaceAllowed(nearest, candidate, roots);
+    } catch (missingError) {
+      if (isOutsideWorkspaceError(missingError)) {
+        await rememberRetainedWorkspaceDecision(decisionPath, "deny");
+      }
+      throw missingError;
+    }
+    throw new ConsoleInputError(`Workspace is not accessible: ${candidate}`);
   }
 
-  await assertCanonicalWorkspaceAllowed(canonicalCandidate, candidate, roots);
+  try {
+    await assertCanonicalWorkspaceAllowed(canonicalCandidate, candidate, roots);
+  } catch (error) {
+    if (isOutsideWorkspaceError(error)) {
+      await rememberRetainedWorkspaceDecision(decisionPath, "deny");
+    }
+    throw error;
+  }
+  await rememberRetainedWorkspaceDecision(decisionPath, "allow");
   return candidate;
 }
 

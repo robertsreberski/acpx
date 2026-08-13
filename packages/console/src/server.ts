@@ -324,14 +324,20 @@ function parseLimit(url: URL): number {
 }
 
 async function canonicalAllowedWorkspace(
+  acpxRecordId: string,
   cwd: string | undefined,
-  roots: string[],
+  config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
 ): Promise<string | undefined> {
   if (!cwd) {
     return undefined;
   }
   try {
-    return await assertRetainedWorkspaceAllowed(cwd, roots);
+    return await assertRetainedWorkspaceAllowed(
+      acpxRecordId,
+      cwd,
+      config.workspaceRoots,
+      config.stateDir,
+    );
   } catch {
     return undefined;
   }
@@ -339,12 +345,13 @@ async function canonicalAllowedWorkspace(
 
 async function allowedSessions(
   service: AcpxConsoleSessionService,
-  roots: string[],
+  config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
 ): Promise<ConsoleSession[]> {
   const sessions = await service.listSessions();
   const decisions = await Promise.all(
     sessions.map(
-      async (session) => (await canonicalAllowedWorkspace(session.cwd, roots)) !== undefined,
+      async (session) =>
+        (await canonicalAllowedWorkspace(session.acpxRecordId, session.cwd, config)) !== undefined,
     ),
   );
   return sessions.filter((_, index) => decisions[index]);
@@ -352,11 +359,11 @@ async function allowedSessions(
 
 async function requireAllowedSession(
   service: AcpxConsoleSessionService,
-  roots: string[],
+  config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
   acpxRecordId: string,
 ): Promise<ConsoleSession> {
   const session = await service.getSession({ acpxRecordId });
-  if (!session || !(await canonicalAllowedWorkspace(session.cwd, roots))) {
+  if (!session || !(await canonicalAllowedWorkspace(session.acpxRecordId, session.cwd, config))) {
     throw new HttpError(404, "SESSION_NOT_FOUND", "Session not found");
   }
   return session;
@@ -365,10 +372,19 @@ async function requireAllowedSession(
 async function scopedProviderSessions(
   sessions: ProviderSession[],
   cwd: string,
-  roots: string[],
+  config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
 ): Promise<ProviderSession[]> {
   const canonical = await Promise.all(
-    sessions.map(async (session) => await canonicalAllowedWorkspace(session.cwd, roots)),
+    sessions.map(async (session) => {
+      if (!session.cwd) {
+        return undefined;
+      }
+      try {
+        return await assertWorkspaceAllowed(session.cwd, config.workspaceRoots);
+      } catch {
+        return undefined;
+      }
+    }),
   );
   return sessions.filter((_, index) => canonical[index] === cwd);
 }
@@ -408,7 +424,7 @@ async function handleApi(
     );
     const [agents, sessions] = await Promise.all([
       context.service.listAgents({ cwd: context.config.workspaceRoots[0] }),
-      allowedSessions(context.service, context.config.workspaceRoots),
+      allowedSessions(context.service, context.config),
     ]);
     const body: ConsoleBootstrap = {
       version: 1,
@@ -432,7 +448,7 @@ async function handleApi(
   }
   if (method === "GET" && path === "/api/v1/sessions") {
     sendJson(response, 200, {
-      sessions: await allowedSessions(context.service, context.config.workspaceRoots),
+      sessions: await allowedSessions(context.service, context.config),
     });
     return true;
   }
@@ -467,7 +483,9 @@ async function handleApi(
       policy: body.policy,
       idempotencyKey: idempotencyKey!,
     });
-    if ((await canonicalAllowedWorkspace(session.cwd, context.config.workspaceRoots)) !== cwd) {
+    if (
+      (await canonicalAllowedWorkspace(session.acpxRecordId, session.cwd, context.config)) !== cwd
+    ) {
       throw new HttpError(500, "INTERNAL_ERROR", "ACPX Console could not complete the request");
     }
     sendJson(response, 201, { session });
@@ -487,7 +505,9 @@ async function handleApi(
       mode: optionalString(body, "mode"),
       idempotencyKey: idempotencyKey!,
     });
-    if ((await canonicalAllowedWorkspace(session.cwd, context.config.workspaceRoots)) !== cwd) {
+    if (
+      (await canonicalAllowedWorkspace(session.acpxRecordId, session.cwd, context.config)) !== cwd
+    ) {
       throw new HttpError(500, "INTERNAL_ERROR", "ACPX Console could not complete the request");
     }
     sendJson(response, 201, { session });
@@ -513,14 +533,14 @@ async function handleApi(
     );
     sendJson(response, 200, {
       ...page,
-      sessions: await scopedProviderSessions(page.sessions, cwd, context.config.workspaceRoots),
+      sessions: await scopedProviderSessions(page.sessions, cwd, context.config),
     });
     return true;
   }
 
   const timeline = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/timeline$/);
   if (method === "GET" && timeline) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, timeline[0]);
+    await requireAllowedSession(context.service, context.config, timeline[0]);
     sendJson(
       response,
       200,
@@ -534,7 +554,7 @@ async function handleApi(
   }
   const pending = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/pending$/);
   if (method === "GET" && pending) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, pending[0]);
+    await requireAllowedSession(context.service, context.config, pending[0]);
     sendJson(response, 200, {
       pending: await context.service.listPendingRequests({ acpxRecordId: pending[0] }),
     });
@@ -545,7 +565,7 @@ async function handleApi(
     /^\/api\/v1\/sessions\/([^/]+)\/pending\/([^/]+)\/responses$/,
   );
   if (method === "POST" && responseRoute) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, responseRoute[0]);
+    await requireAllowedSession(context.service, context.config, responseRoute[0]);
     const body = await readJsonBody(request);
     if (!("response" in body)) {
       throw new HttpError(400, "INVALID_INPUT", "response is required");
@@ -565,7 +585,7 @@ async function handleApi(
   }
   const turns = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/turns$/);
   if (method === "POST" && turns) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, turns[0]);
+    await requireAllowedSession(context.service, context.config, turns[0]);
     const body = await readJsonBody(request);
     sendJson(
       response,
@@ -580,7 +600,7 @@ async function handleApi(
   }
   const cancel = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/turns\/([^/]+)\/cancel$/);
   if (method === "POST" && cancel) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, cancel[0]);
+    await requireAllowedSession(context.service, context.config, cancel[0]);
     sendJson(
       response,
       202,
@@ -594,7 +614,7 @@ async function handleApi(
   }
   const close = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/close$/);
   if (method === "POST" && close) {
-    await requireAllowedSession(context.service, context.config.workspaceRoots, close[0]);
+    await requireAllowedSession(context.service, context.config, close[0]);
     sendJson(response, 200, {
       close: await context.service.closeSession({
         acpxRecordId: close[0],
@@ -605,11 +625,7 @@ async function handleApi(
   }
   const session = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)$/);
   if (method === "GET" && session) {
-    const value = await requireAllowedSession(
-      context.service,
-      context.config.workspaceRoots,
-      session[0],
-    );
+    const value = await requireAllowedSession(context.service, context.config, session[0]);
     sendJson(response, 200, { session: value });
     return true;
   }
@@ -657,11 +673,7 @@ export async function startAcpxConsoleServer(
       .then(async () => {
         if (event.acpxRecordId) {
           try {
-            await requireAllowedSession(
-              options.service,
-              options.config.workspaceRoots,
-              event.acpxRecordId,
-            );
+            await requireAllowedSession(options.service, options.config, event.acpxRecordId);
           } catch (error) {
             if (error instanceof HttpError && error.code === "SESSION_NOT_FOUND") {
               return;

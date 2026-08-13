@@ -103,19 +103,57 @@ test("workspace validation resolves symlinks before enforcing roots", async () =
 
 test("retained workspace validation allows only missing suffixes under canonical roots", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-retained-root-"));
+  const state = join(root, "state");
   const project = join(root, "project");
+  const replacedParent = join(root, "replaced-parent");
+  const replacedProject = join(replacedParent, "project");
   const outside = await mkdtemp(join(tmpdir(), "acpx-console-retained-outside-"));
   const escape = join(root, "escape");
-  await Promise.all([mkdir(project), symlink(outside, escape, "dir")]);
-  await rm(project, { recursive: true });
+  const unseenEscape = join(root, "unseen-escape");
+  await Promise.all([
+    mkdir(project),
+    mkdir(replacedProject, { recursive: true }),
+    symlink(outside, escape, "dir"),
+    symlink(outside, unseenEscape, "dir"),
+  ]);
 
-  assert.equal(await assertRetainedWorkspaceAllowed(project, [root]), project);
+  assert.equal(await assertRetainedWorkspaceAllowed("project", project, [root], state), project);
+  assert.equal(
+    await assertRetainedWorkspaceAllowed("replaced", replacedProject, [root], state),
+    replacedProject,
+  );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed(join(escape, "missing"), [root]),
+    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [root], state),
+    /outside the configured roots/,
+  );
+
+  await Promise.all([
+    rm(project, { recursive: true }),
+    rm(replacedParent, { recursive: true }),
+    rm(escape),
+    rm(unseenEscape),
+  ]);
+  await symlink(outside, replacedParent, "dir");
+  assert.equal(await assertRetainedWorkspaceAllowed("project", project, [root], state), project);
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed("different-record", project, [root], state),
+    /Workspace is not accessible/,
+  );
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed("replaced", replacedProject, [root], state),
     /outside the configured roots/,
   );
   await assert.rejects(
-    assertRetainedWorkspaceAllowed(join(outside, "missing"), [root]),
+    assertRetainedWorkspaceAllowed("escape", join(escape, "missing"), [root], state),
+    /outside the configured roots/,
+  );
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed("unseen", unseenEscape, [root], state),
+    /Workspace is not accessible/,
+  );
+
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed("outside", join(outside, "missing"), [root], state),
     /outside the configured roots/,
   );
   await assert.rejects(assertWorkspaceAllowed(project, [root]), /Workspace is not accessible/);

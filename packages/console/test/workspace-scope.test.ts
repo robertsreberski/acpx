@@ -175,7 +175,7 @@ test("configured roots scope session inventories and every retained-session oper
 });
 
 test("a retained session stays visible and controllable after its workspace leaf disappears", async () => {
-  const { project, running, service, workspaceRoot } = await fixture();
+  const { escape, project, running, service, workspaceRoot } = await fixture();
   service.sessions.push({
     ...baseSession,
     acpxRecordId: "missing-symlink-record",
@@ -184,7 +184,7 @@ test("a retained session stays visible and controllable after its workspace leaf
 
   try {
     const credentials = await auth(running.origin);
-    await rm(project, { recursive: true });
+    await Promise.all([rm(project, { recursive: true }), rm(escape)]);
 
     const inventory = await fetch(`${running.origin}/api/v1/sessions`);
     assert.equal(inventory.status, 200);
