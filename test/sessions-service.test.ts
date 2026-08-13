@@ -130,6 +130,45 @@ test("the first transcript read imports retained chat idempotently before any mu
   });
 });
 
+test("first read recovers a compatibility append that crashed before its record checkpoint", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-uncheckpointed-compatibility",
+      acpSessionId: "provider-uncheckpointed-compatibility",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const retained = retainedMessage(record.acpSessionId, "Durable before checkpoint");
+    assert.equal(record.lastSeq, 0);
+    assert.equal(record.timeline, undefined);
+    await writeSessionRecordFile(homeDir, record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${JSON.stringify(retained)}\n`,
+      "utf8",
+    );
+
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const page = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.deepEqual(
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        ),
+        [retained],
+      );
+      assert.equal(page.coverage, "legacy_retained");
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
 test("later compatibility appends appear on the next transcript read exactly once", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

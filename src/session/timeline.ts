@@ -817,6 +817,21 @@ export class SessionTimelineWriter {
     return new SessionTimelineWriter(record, metadata);
   }
 
+  private static async needsLegacyCompatibilityRefresh(
+    record: SessionRecord,
+    legacyOwnerCanAppend: boolean,
+  ): Promise<boolean> {
+    if (legacyOwnerCanAppend || record.timeline?.legacy_import_complete !== true) {
+      if (record.timeline || record.lastSeq > 0) {
+        return true;
+      }
+      // Compatibility append precedes the record checkpoint. Files, not the
+      // record sequence, decide whether a crash left retained traffic behind.
+      return (await legacyCompatibilityFiles(record)).length > 0 || legacyOwnerCanAppend;
+    }
+    return false;
+  }
+
   static async refreshLegacyCompatibility(
     sessionId: string,
     options: { legacyOwnerCanAppend?: () => boolean | Promise<boolean> } = {},
@@ -829,9 +844,7 @@ export class SessionTimelineWriter {
       // compatibility twin, causing that twin to be imported a second time.
       const legacyOwnerCanAppend = (await options.legacyOwnerCanAppend?.()) === true;
       if (
-        !legacyOwnerCanAppend &&
-        (record.timeline?.legacy_import_complete === true ||
-          (!record.timeline && record.lastSeq === 0))
+        !(await SessionTimelineWriter.needsLegacyCompatibilityRefresh(record, legacyOwnerCanAppend))
       ) {
         return false;
       }
