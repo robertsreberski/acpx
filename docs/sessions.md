@@ -190,9 +190,11 @@ Saved sessions may include a cached adapter PID from the last connected helper p
 
 1. `acpx` respawns the agent.
 2. Attempts ACP `session/resume` with the saved provider session id when the agent advertises it, otherwise ACP `session/load`.
-3. Falls back to `session/new` if reconnecting fails, transparently updating the saved record.
+3. Fails closed if that exact provider session cannot be restored. The only no-history exception is the first prompt after `sessions new` when the recorded capabilities advertise neither reuse method; that prompt may initialize the still-empty conversation with `session/new` while preserving its local record identity. After any prompt attempt, the saved provider session is not replaced; use `sessions new` explicitly when discarding the conversation is intended.
 
-This makes long-running scripted sessions resilient to crashes, OS restarts, and adapter upgrades.
+This makes long-running scripted sessions resilient when the adapter can restore
+the provider session without hiding continuity loss when it cannot. Prompt and
+control commands (`set-mode`, `set`, and `set model`) follow the same rule.
 
 ## Status
 

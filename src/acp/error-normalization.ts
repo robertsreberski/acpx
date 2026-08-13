@@ -199,7 +199,14 @@ export function normalizeOutputError(
 ): NormalizedOutputError {
   const meta = readOutputErrorMeta(error);
   const code = resolveOutputErrorCode(error, options, meta);
-  const acp = options.acp ?? meta.acp ?? extractAcpError(error);
+  const explicitDetailCode = meta.detailCode ?? options.detailCode;
+  // A continuity error intentionally wraps the adapter failure with the
+  // actionable contract. Exposing the nested ACP error as the primary JSON
+  // error would replace that guidance with a generic "Internal error".
+  const acp =
+    explicitDetailCode === "SESSION_RESUME_REQUIRED"
+      ? undefined
+      : (options.acp ?? meta.acp ?? extractAcpError(error));
   return {
     code,
     message: formatErrorMessage(error),

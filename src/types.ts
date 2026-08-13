@@ -103,6 +103,7 @@ export const EXIT_CODES = {
   TIMEOUT: 3,
   NO_SESSION: 4,
   PERMISSION_DENIED: 5,
+  INCOMPLETE: 6,
   INTERRUPTED: 130,
 } as const;
 
@@ -539,8 +540,25 @@ export type SessionRecord = {
   importedFrom?: SessionImportedFrom;
 };
 
-export type RunPromptResult = {
-  stopReason: StopReason;
+export const TURN_INCOMPLETE_REASONS = ["context_compaction"] as const;
+export type TurnIncompleteReason = (typeof TURN_INCOMPLETE_REASONS)[number];
+
+export type TurnCompletionResult =
+  | {
+      status: "completed";
+      stopReason: Exclude<StopReason, "cancelled">;
+    }
+  | {
+      status: "cancelled";
+      stopReason: "cancelled";
+    }
+  | {
+      status: "incomplete";
+      stopReason: Exclude<StopReason, "cancelled">;
+      reason: TurnIncompleteReason;
+    };
+
+export type RunPromptResult = TurnCompletionResult & {
   permissionStats: PermissionStats;
   sessionId: string;
 };

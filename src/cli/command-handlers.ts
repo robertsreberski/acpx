@@ -4,6 +4,7 @@ import { Command, InvalidArgumentError } from "commander";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { AgentSpawnError } from "../errors.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
+import { permissionDenialTakesPrecedence } from "../permissions.js";
 import {
   mergePromptSourceWithText,
   parsePromptSource,
@@ -150,9 +151,7 @@ function applyPermissionExitCode(
   quietOutput?: OutputFormatter,
 ): void {
   const stats = result.permissionStats;
-  const deniedOrCancelled = stats.denied + stats.cancelled;
-
-  if (stats.requested > 0 && stats.approved === 0 && deniedOrCancelled > 0) {
+  if (permissionDenialTakesPrecedence(stats)) {
     process.exitCode = EXIT_CODES.PERMISSION_DENIED;
     quietOutput?.onError({
       code: "PERMISSION_DENIED",
@@ -160,6 +159,16 @@ function applyPermissionExitCode(
       message: "Permission request denied or cancelled",
     });
     quietOutput?.flush();
+  }
+}
+
+function applyPromptExitCode(
+  result: Parameters<typeof applyPermissionExitCode>[0] & { status: string },
+  quietOutput?: OutputFormatter,
+): void {
+  applyPermissionExitCode(result, quietOutput);
+  if (process.exitCode == null && result.status === "incomplete") {
+    process.exitCode = EXIT_CODES.INCOMPLETE;
   }
 }
 
@@ -348,6 +357,7 @@ export async function handlePrompt(
   const result = await sendSession({
     sessionId: record.acpxRecordId,
     prompt,
+    resumePolicy: "same-session-only",
     mcpServers: config.mcpServers,
     mcpConfigPath: config.mcpConfigPath,
     mcpConfigFingerprint: config.mcpConfigFingerprint,
@@ -387,7 +397,7 @@ export async function handlePrompt(
     return;
   }
 
-  applyPermissionExitCode(result, outputPolicy.format === "quiet" ? outputFormatter : undefined);
+  applyPromptExitCode(result, outputPolicy.format === "quiet" ? outputFormatter : undefined);
 
   if (globalFlags.verbose && result.loadError) {
     process.stderr.write(
@@ -470,7 +480,7 @@ export async function handleExec(
     },
   });
 
-  applyPermissionExitCode(result, outputPolicy.format === "quiet" ? outputFormatter : undefined);
+  applyPromptExitCode(result, outputPolicy.format === "quiet" ? outputFormatter : undefined);
 }
 
 function printCancelResultByFormat(

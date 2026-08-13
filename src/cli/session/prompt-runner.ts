@@ -127,6 +127,7 @@ function buildDirectConnectedSessionOptions<T>(
     authPolicy: options.authPolicy,
     fs: options.fs,
     terminal: options.terminal,
+    resumePolicy: "same-session-only",
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
     onClientAvailable: (controller: FullConnectedSessionController) => {

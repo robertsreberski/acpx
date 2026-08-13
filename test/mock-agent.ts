@@ -67,8 +67,10 @@ type MockAgentOptions = {
   omitReconnectModelId?: string;
   reportModelAs?: string;
   replayLoadSessionUpdates: boolean;
+  replayLoadSessionCompaction: boolean;
   loadReplayText: string;
   ignoreSigterm: boolean;
+  closeDelayMs: number;
   cancelDelayMs: number;
   /** If set, the agent writes its PID to this path at startup (before ACP handshake). */
   pidFile?: string;
@@ -426,8 +428,10 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let omitReconnectModelId: string | undefined;
   let reportModelAs: string | undefined;
   let replayLoadSessionUpdates = false;
+  let replayLoadSessionCompaction = false;
   let loadReplayText = "replayed load session update";
   let ignoreSigterm = false;
+  let closeDelayMs = 0;
   let cancelDelayMs = 0;
   let hangOnNewSession = false;
   let pidFile: string | undefined;
@@ -547,6 +551,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--replay-load-session-compaction") {
+      supportsLoadSession = true;
+      replayLoadSessionCompaction = true;
+      continue;
+    }
+
     if (token === "--supports-close-session") {
       supportsCloseSession = true;
       continue;
@@ -573,6 +583,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--ignore-sigterm") {
       ignoreSigterm = true;
+      continue;
+    }
+
+    if (token === "--close-delay-ms") {
+      closeDelayMs = parsePositiveIntegerOption(argv, index + 1, token);
+      index += 1;
       continue;
     }
 
@@ -664,8 +680,10 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     omitReconnectModelId,
     reportModelAs,
     replayLoadSessionUpdates,
+    replayLoadSessionCompaction,
     loadReplayText,
     ignoreSigterm,
+    closeDelayMs,
     cancelDelayMs,
     pidFile,
     callLog,
@@ -935,6 +953,9 @@ class MockAgent implements Agent {
     if (this.options.replayLoadSessionUpdates) {
       await this.sendAssistantMessage(params.sessionId, this.options.loadReplayText);
     }
+    if (this.options.replayLoadSessionCompaction) {
+      await this.sendContextCompaction(params.sessionId);
+    }
 
     return this.buildSessionReconnectResponse(params.sessionId, this.options.loadSessionMeta);
   }
@@ -1084,6 +1105,53 @@ class MockAgent implements Agent {
     }
 
     try {
+      if (text === "permission-denied-compact") {
+        await this.connection.requestPermission({
+          sessionId: params.sessionId,
+          toolCall: {
+            toolCallId: randomUUID(),
+            title: "Bash",
+            kind: "execute",
+          },
+          options: [
+            { optionId: "allow", name: "Allow", kind: "allow_once" },
+            { optionId: "reject", name: "Reject", kind: "reject_once" },
+          ],
+        });
+        await this.sendContextCompaction(params.sessionId);
+        session.hasCompletedPrompt = true;
+        return { stopReason: "end_turn" };
+      }
+
+      if (
+        text === "compact-no-final" ||
+        text === "compact-final" ||
+        text === "compact-late-final"
+      ) {
+        await this.sendContextCompaction(params.sessionId);
+        if (text === "compact-final") {
+          await this.sendAssistantMessage(params.sessionId, "answer after compaction", {
+            codex: { phase: "final_answer" },
+          });
+        } else if (text === "compact-late-final") {
+          setTimeout(() => {
+            void this.sendAssistantMessage(params.sessionId, "late answer after compaction", {
+              codex: { phase: "final_answer" },
+            }).catch((error: unknown) => {
+              process.stderr.write(`late-final failed: ${toErrorMessage(error)}\n`);
+            });
+          }, 50);
+        }
+        session.hasCompletedPrompt = true;
+        return { stopReason: "end_turn" };
+      }
+
+      if (text === "compact-no-final-max-tokens") {
+        await this.sendContextCompaction(params.sessionId);
+        session.hasCompletedPrompt = true;
+        return { stopReason: "max_tokens" };
+      }
+
       const response =
         text === "inspect-prompt"
           ? describePromptBlocks(params.prompt)
@@ -1228,7 +1296,11 @@ class MockAgent implements Agent {
     return this.extMethod("session/set_model", params);
   }
 
-  private async sendAssistantMessage(sessionId: SessionId, text: string): Promise<void> {
+  private async sendAssistantMessage(
+    sessionId: SessionId,
+    text: string,
+    meta?: Record<string, unknown>,
+  ): Promise<void> {
     await this.connection.sessionUpdate({
       sessionId,
       update: {
@@ -1237,6 +1309,32 @@ class MockAgent implements Agent {
           type: "text",
           text,
         },
+        ...(meta ? { _meta: meta } : {}),
+      },
+    });
+  }
+
+  private async sendContextCompaction(sessionId: SessionId): Promise<void> {
+    const toolCallId = randomUUID();
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Context compaction",
+        kind: "other",
+        status: "in_progress",
+      },
+    });
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        title: "Context compaction",
+        kind: "other",
+        status: "completed",
+        _meta: { contextCompaction: true },
       },
     });
   }
@@ -1330,6 +1428,9 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+    if (text === "cancel-turn") {
+      throw new CancelledError();
     }
 
     if (text.startsWith("extension-notification ")) {
@@ -1597,6 +1698,11 @@ class MockAgent implements Agent {
       }
 
       await this.sendAssistantMessage(sessionId, liveText);
+      this.logCall({
+        method: "session/update-sent",
+        sessionId,
+        text: liveText,
+      });
       await sleepWithCancel(Math.round(ms), signal);
       return `stream-sleep done: ${liveText}`;
     }
@@ -1711,6 +1817,12 @@ if (mockAgentOptions.pidFile) {
 if (mockAgentOptions.ignoreSigterm) {
   process.on("SIGTERM", () => {
     // Intentionally ignore to exercise ACP client SIGKILL fallback behavior.
+  });
+}
+
+if (mockAgentOptions.closeDelayMs > 0) {
+  process.stdin.once("end", () => {
+    setTimeout(() => undefined, mockAgentOptions.closeDelayMs);
   });
 }
 

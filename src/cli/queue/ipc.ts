@@ -27,6 +27,8 @@ import {
 import { connectToQueueOwner, type QueueRequestBudget } from "./ipc-transport.js";
 import {
   ensureOwnerIsUsable,
+  isProcessAlive,
+  QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION,
   QUEUE_PROTOCOL_DEFER_VERSION,
   QUEUE_PROTOCOL_EFFORT_VERSION,
   readLiveQueueOwner,
@@ -867,11 +869,7 @@ function permissionPolicyNeedsDeferSupport(policy: PermissionPolicy | undefined)
   return (policy?.defer?.length ?? 0) > 0 || policy?.defaultAction === "defer";
 }
 
-/**
- * Gate only requests that actually depend on v2 semantics. A warm owner from a
- * previous build handles a policy without `defer` identically, and refusing
- * those would break every reusable session on upgrade for no safety gain.
- */
+/** Gate requests whose permission policy depends on v2 defer semantics. */
 function assertQueueOwnerUnderstandsPolicy(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
@@ -892,6 +890,25 @@ function assertQueueOwnerUnderstandsPolicy(
       detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
       origin: "queue",
       retryable: false,
+    },
+  );
+}
+
+/** Every prompt depends on the v4 result discriminant and compaction semantics. */
+function assertQueueOwnerSupportsCompletionStatus(owner: QueueOwnerRecord): void {
+  const ownerProtocol = queueOwnerProtocolVersion(owner);
+  if (ownerProtocol >= QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION) {
+    return;
+  }
+
+  const ownerBuild = owner.acpxVersion ? ` (owner acpx ${owner.acpxVersion})` : "";
+  throw new QueueConnectionError(
+    `Session queue owner speaks queue protocol v${ownerProtocol}${ownerBuild} and cannot report ` +
+      "current prompt completion semantics; wait for the existing owner to exit, then retry",
+    {
+      detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
+      origin: "queue",
+      retryable: true,
     },
   );
 }
@@ -999,14 +1016,33 @@ function assertQueueOwnerMcpConfigMatches(
   );
 }
 
-export async function trySubmitToRunningOwner(
-  options: SubmitToQueueOwnerOptions,
-): Promise<SessionSendOutcome | undefined> {
-  const owner = await readQueueOwnerRecord(options.sessionId);
+async function resolveCompletionAwareQueueOwner(
+  sessionId: string,
+): Promise<QueueOwnerRecord | undefined> {
+  const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
     return undefined;
   }
-  if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
+  // A crashed owner cannot be disturbed, and its lease must not strand the
+  // session after an upgrade. Let normal stale-owner recovery remove it so the
+  // caller can start a current owner.
+  if (!isProcessAlive(owner.pid)) {
+    await ensureOwnerIsUsable(sessionId, owner);
+    return undefined;
+  }
+  // Reject incompatible owners from their persisted lease alone. In
+  // particular, do this before liveness recovery: probing or retiring an old
+  // live owner would mutate the very process this compatibility gate promises
+  // to leave undisturbed.
+  assertQueueOwnerSupportsCompletionStatus(owner);
+  return (await ensureOwnerIsUsable(sessionId, owner)) ? owner : undefined;
+}
+
+export async function trySubmitToRunningOwner(
+  options: SubmitToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  const owner = await resolveCompletionAwareQueueOwner(options.sessionId);
+  if (!owner) {
     return undefined;
   }
   assertQueueOwnerUnderstandsSubmit(owner, options);

@@ -53,6 +53,7 @@ function readPackageVersionForTest(): string {
 
 const PACKAGE_VERSION = readPackageVersionForTest();
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
+const LOAD_CAPABLE_MOCK_AGENT_COMMAND = `${MOCK_AGENT_COMMAND} --supports-load-session`;
 const MOCK_AGENT_IGNORING_SIGTERM = `${MOCK_AGENT_COMMAND} --ignore-sigterm`;
 const MOCK_CODEX_AGENT_WITH_RUNTIME_SESSION_ID = `${MOCK_AGENT_COMMAND} --codex-session-id codex-runtime-session`;
 const MOCK_CLAUDE_AGENT_WITH_RUNTIME_SESSION_ID = `${MOCK_AGENT_COMMAND} --claude-session-id claude-runtime-session`;
@@ -62,9 +63,8 @@ const MOCK_AGENT_WITH_DISTINCT_CREATE_AND_LOAD_RUNTIME_SESSION_IDS =
   "--supports-load-session --load-runtime-session-id resumed-runtime-session";
 const MOCK_AGENT_WITH_LOAD_FALLBACK = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-fails-on-empty`;
 const MOCK_AGENT_WITH_LOAD_SESSION_NOT_FOUND = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-not-found`;
-const MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-fails-on-empty --set-session-mode-fails`;
-const MOCK_AGENT_WITH_SET_MODE_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-mode-invalid-params`;
-const MOCK_AGENT_WITH_SET_CONFIG_INVALID_PARAMS = `${MOCK_AGENT_COMMAND} --set-session-config-invalid-params`;
+const MOCK_AGENT_WITH_SET_MODE_INVALID_PARAMS = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --set-session-mode-invalid-params`;
+const MOCK_AGENT_WITH_SET_CONFIG_INVALID_PARAMS = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --set-session-config-invalid-params`;
 
 type CliRunResult = {
   code: number | null;
@@ -569,7 +569,7 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
         {
           agents: {
             codex: {
-              command: `${MOCK_AGENT_COMMAND} --advertise-config-options --model-dependent-efforts`,
+              command: `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options --model-dependent-efforts`,
             },
           },
         },
@@ -618,7 +618,7 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
       ],
       homeDir,
     );
-    assert.equal(second.code, 0, second.stderr);
+    assert.equal(second.code, 0, second.stderr || second.stdout);
     const secondPayload = JSON.parse(second.stdout.trim()) as Record<string, unknown>;
     assert.equal(secondPayload.action, "session_ensured");
     assert.equal(secondPayload.created, false);
@@ -926,7 +926,7 @@ test("prompt reconciles agentSessionId from loadSession metadata", async () => {
   });
 });
 
-test("set-mode persists across load fallback and replays on fresh ACP sessions", async () => {
+test("set-mode fails closed when loading the exact provider session fails", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -958,51 +958,14 @@ test("set-mode persists across load fallback and replays on fresh ACP sessions",
       closed: false,
     });
 
-    const setPlan = await runCli(
+    const result = await runCli(
       ["--cwd", cwd, "--format", "json", "codex", "set-mode", "plan"],
       homeDir,
     );
-    assert.equal(setPlan.code, 0, setPlan.stderr);
-    const setPlanPayload = JSON.parse(setPlan.stdout.trim()) as {
-      acpxSessionId?: unknown;
-    };
-
-    const checkPlan = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "set", "reasoning_effort", "high"],
-      homeDir,
-    );
-    assert.equal(checkPlan.code, 0, checkPlan.stderr);
-    const checkPlanPayload = JSON.parse(checkPlan.stdout.trim()) as {
-      acpxSessionId?: unknown;
-      configOptions?: Array<{ id?: string; currentValue?: string }>;
-    };
-    const modeAfterPlan =
-      checkPlanPayload.configOptions?.find((option) => option.id === "mode")?.currentValue ?? "";
-    assert.equal(modeAfterPlan, "plan");
-    assert.notEqual(checkPlanPayload.acpxSessionId, setPlanPayload.acpxSessionId);
-
-    const setAuto = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "set-mode", "auto"],
-      homeDir,
-    );
-    assert.equal(setAuto.code, 0, setAuto.stderr);
-    const setAutoPayload = JSON.parse(setAuto.stdout.trim()) as {
-      acpxSessionId?: unknown;
-    };
-
-    const checkAuto = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "set", "reasoning_effort", "medium"],
-      homeDir,
-    );
-    assert.equal(checkAuto.code, 0, checkAuto.stderr);
-    const checkAutoPayload = JSON.parse(checkAuto.stdout.trim()) as {
-      acpxSessionId?: unknown;
-      configOptions?: Array<{ id?: string; currentValue?: string }>;
-    };
-    const modeAfterAuto =
-      checkAutoPayload.configOptions?.find((option) => option.id === "mode")?.currentValue ?? "";
-    assert.equal(modeAfterAuto, "auto");
-    assert.notEqual(checkAutoPayload.acpxSessionId, setAutoPayload.acpxSessionId);
+    assert.equal(result.code, 1, result.stderr);
+    const error = parseSingleAcpErrorLine(result.stdout);
+    assert.equal(error.data?.detailCode, "SESSION_RESUME_REQUIRED");
+    assert.match(error.message ?? "", /run `sessions new` explicitly/);
 
     const storedRecordPath = path.join(
       homeDir,
@@ -1011,11 +974,11 @@ test("set-mode persists across load fallback and replays on fresh ACP sessions",
       `${encodeURIComponent(sessionId)}.json`,
     );
     const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
-      acpx?: {
-        desired_mode_id?: string;
-      };
+      acp_session_id?: string;
+      acpx?: { desired_mode_id?: string };
     };
-    assert.equal(storedRecord.acpx?.desired_mode_id, "auto");
+    assert.equal(storedRecord.acp_session_id, sessionId);
+    assert.equal(storedRecord.acpx?.desired_mode_id, undefined);
   });
 });
 
@@ -1030,7 +993,7 @@ test("codex thought_level passes through for current built-in adapter", async ()
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -1044,7 +1007,7 @@ test("codex thought_level passes through for current built-in adapter", async ()
     await writeSessionRecord(homeDir, {
       acpxRecordId: sessionId,
       acpSessionId: sessionId,
-      agentCommand: MOCK_AGENT_COMMAND,
+      agentCommand: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
       cwd,
       createdAt: "2026-01-01T00:00:00.000Z",
       lastUsedAt: "2026-01-01T00:00:00.000Z",
@@ -1071,7 +1034,7 @@ test("codex thought_level passes through for current built-in adapter", async ()
 test("codex set model passes the requested model through unchanged", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
-    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`;
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
     await fs.writeFile(
@@ -1116,7 +1079,7 @@ test("codex set model passes the requested model through unchanged", async () =>
   });
 });
 
-test("set-mode load fallback failure does not persist the fresh session id to disk", async () => {
+test("set-mode fails without session reuse support and preserves the saved conversation", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -1127,7 +1090,7 @@ test("set-mode load fallback failure does not persist the fresh session id to di
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE,
+              command: MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -1141,7 +1104,7 @@ test("set-mode load fallback failure does not persist the fresh session id to di
     await writeSessionRecord(homeDir, {
       acpxRecordId: sessionId,
       acpSessionId: sessionId,
-      agentCommand: MOCK_AGENT_WITH_LOAD_FALLBACK_AND_MODE_FAILURE,
+      agentCommand: MOCK_AGENT_COMMAND,
       cwd,
       createdAt: "2026-01-01T00:00:00.000Z",
       lastUsedAt: "2026-01-01T00:00:00.000Z",
@@ -1158,7 +1121,9 @@ test("set-mode load fallback failure does not persist the fresh session id to di
     assert.equal(result.code, 1, result.stderr);
     const error = parseSingleAcpErrorLine(result.stdout);
     assert.equal(error.data?.acpxCode, "RUNTIME");
-    assert.equal(error.data?.detailCode, "SESSION_MODE_REPLAY_FAILED");
+    assert.equal(error.data?.detailCode, "SESSION_RESUME_REQUIRED");
+    assert.equal(error.data?.retryable, false);
+    assert.match(error.message ?? "", /run `sessions new` explicitly/);
 
     const storedRecordPath = path.join(
       homeDir,
@@ -1351,7 +1316,7 @@ test("queued prompt failures emit exactly one JSON error event", async () => {
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -1435,7 +1400,7 @@ test("json-strict queued prompt failure emits JSON-RPC lines only", async () => 
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -1516,7 +1481,7 @@ test("queued prompt failures remain visible in quiet mode", async () => {
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -1579,7 +1544,7 @@ test("queued setup failures emit exactly one structured quiet diagnostic", async
         {
           agents: {
             codex: {
-              command: `${MOCK_AGENT_COMMAND} --set-session-model-fails`,
+              command: `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --set-session-model-fails`,
             },
           },
         },
@@ -1729,7 +1694,7 @@ test("non-queued write permission denial exits with code 5", async () => {
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
             },
           },
         },
@@ -2201,13 +2166,13 @@ test("prompt preserves structured ACP prompt blocks through the queue owner", as
     await fs.mkdir(cwd, { recursive: true });
 
     const created = await runCli(
-      ["--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "sessions", "new"],
+      ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--cwd", cwd, "sessions", "new"],
       homeDir,
     );
     assert.equal(created.code, 0, created.stderr);
 
     const result = await runCli(
-      ["--agent", MOCK_AGENT_COMMAND, "--cwd", cwd, "--format", "quiet", "prompt"],
+      ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--cwd", cwd, "--format", "quiet", "prompt"],
       homeDir,
       {
         stdin: JSON.stringify([

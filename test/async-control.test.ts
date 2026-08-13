@@ -104,3 +104,45 @@ test("withInterrupt rejects with InterruptedError on SIGHUP", async () => {
   await assert.rejects(async () => await pending, InterruptedError);
   assert.equal(interruptCalls, 1);
 });
+
+test("withInterrupt latches the interrupt while slow cleanup is still running", async () => {
+  let releaseRun: (() => void) | undefined;
+  let releaseCleanup: (() => void) | undefined;
+  let pendingSettled = false;
+
+  const pending = withInterrupt(
+    async () =>
+      await new Promise<string>((resolve) => {
+        releaseRun = () => resolve("late success");
+      }),
+    async () =>
+      await new Promise<void>((resolve) => {
+        releaseCleanup = resolve;
+      }),
+  );
+  void pending
+    .finally(() => {
+      pendingSettled = true;
+    })
+    .catch(() => undefined);
+
+  process.emit("SIGINT");
+  releaseRun?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(pendingSettled, false, "cleanup must finish before the interrupt settles");
+
+  releaseCleanup?.();
+  await assert.rejects(async () => await pending, InterruptedError);
+});
+
+test("withInterrupt preserves the interrupt when cleanup rejects", async () => {
+  const pending = withInterrupt(
+    async () => await new Promise<string>(() => {}),
+    async () => {
+      throw new Error("cleanup failed");
+    },
+  );
+
+  process.emit("SIGINT");
+  await assert.rejects(async () => await pending, InterruptedError);
+});

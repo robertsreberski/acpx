@@ -47,6 +47,7 @@ type OutputFormatterOptions = {
   stderr?: WritableLike;
   jsonContext?: OutputFormatterContext;
   suppressReads?: boolean;
+  suppressIncompleteDiagnostic?: boolean;
 };
 
 type NormalizedToolStatus = ToolCallStatus | "unknown";
@@ -767,6 +768,7 @@ class TextOutputFormatter implements OutputFormatter {
   private readonly suppressReads: boolean;
   private readonly toolStates = new Map<string, ToolRenderState>();
   private thoughtBuffer = "";
+  private pendingStopReason: string | undefined;
   private wroteAny = false;
   private atLineStart = true;
   private section: FormatterSection | null = null;
@@ -782,6 +784,19 @@ class TextOutputFormatter implements OutputFormatter {
   }
 
   onAcpMessage(message: AcpJsonRpcMessage): void {
+    if (isTurnIncompleteNotification(message)) {
+      this.pendingStopReason = undefined;
+      this.flushThoughtBuffer();
+      this.beginSection("done");
+      this.writeLine(
+        this.formatAnsi(
+          "[incomplete] context_compaction — no final answer; explicit follow-up required",
+          "33",
+        ),
+      );
+      return;
+    }
+
     const notification = extractSessionUpdateNotification(message);
     if (notification) {
       this.renderSessionUpdate(notification);
@@ -801,7 +816,7 @@ class TextOutputFormatter implements OutputFormatter {
 
     const stopReason = parsePromptStopReason(message);
     if (stopReason) {
-      this.renderDone(stopReason);
+      this.pendingStopReason = stopReason;
       return;
     }
 
@@ -871,6 +886,7 @@ class TextOutputFormatter implements OutputFormatter {
   }
 
   onError(params: RenderableOutputError): void {
+    this.pendingStopReason = undefined;
     this.flushThoughtBuffer();
     this.beginSection("done");
     this.writeLine(this.formatAnsi(`[error] ${params.code}: ${params.message}`, "31"));
@@ -916,6 +932,11 @@ class TextOutputFormatter implements OutputFormatter {
   }
 
   flush(): void {
+    const stopReason = this.pendingStopReason;
+    this.pendingStopReason = undefined;
+    if (stopReason) {
+      this.renderDone(stopReason);
+    }
     this.flushThoughtBuffer();
     if (!this.atLineStart) {
       this.write("\n");
@@ -1136,13 +1157,16 @@ class TextOutputFormatter implements OutputFormatter {
 class QuietOutputFormatter implements OutputFormatter {
   private readonly stdout: WritableLike;
   private readonly stderr: WritableLike;
+  private readonly suppressIncompleteDiagnostic: boolean;
   private chunks: string[] = [];
   private flushed = false;
   private metadataFlushed = false;
+  private terminalMessage: AcpJsonRpcMessage | undefined;
 
-  constructor(stdout: WritableLike, stderr: WritableLike) {
+  constructor(stdout: WritableLike, stderr: WritableLike, suppressIncompleteDiagnostic: boolean) {
     this.stdout = stdout;
     this.stderr = stderr;
+    this.suppressIncompleteDiagnostic = suppressIncompleteDiagnostic;
   }
 
   setContext(_context: OutputFormatterContext): void {
@@ -1150,6 +1174,15 @@ class QuietOutputFormatter implements OutputFormatter {
   }
 
   onAcpMessage(message: AcpJsonRpcMessage): void {
+    if (isTurnIncompleteNotification(message)) {
+      if (!this.suppressIncompleteDiagnostic) {
+        this.stderr.write(
+          "[acpx] incomplete: context_compaction; no final answer was emitted; explicit follow-up required\n",
+        );
+      }
+      return;
+    }
+
     const update = extractSessionUpdateNotification(message);
     if (
       update?.update.sessionUpdate === "agent_message_chunk" &&
@@ -1160,8 +1193,9 @@ class QuietOutputFormatter implements OutputFormatter {
     }
 
     if (parsePromptStopReason(message)) {
-      this.flushBufferedOutput();
-      this.flushMetadata(message);
+      // The response may precede post-compaction final-answer chunks. Hold the
+      // terminal message until the runtime's update drain calls flush().
+      this.terminalMessage = message;
     }
   }
 
@@ -1184,7 +1218,10 @@ class QuietOutputFormatter implements OutputFormatter {
   }
 
   flush(): void {
-    // no-op for streaming output
+    this.flushBufferedOutput();
+    if (this.terminalMessage) {
+      this.flushMetadata(this.terminalMessage);
+    }
   }
 
   private flushBufferedOutput(): void {
@@ -1194,6 +1231,9 @@ class QuietOutputFormatter implements OutputFormatter {
 
     this.flushed = true;
     const text = this.chunks.join("");
+    if (!text) {
+      return;
+    }
     this.stdout.write(text.endsWith("\n") ? text : `${text}\n`);
   }
 
@@ -1281,6 +1321,13 @@ class QuietOutputFormatter implements OutputFormatter {
   }
 }
 
+function isTurnIncompleteNotification(message: AcpJsonRpcMessage): boolean {
+  return (
+    extractJsonRpcMethod(message) === "_acpx/turn_incomplete" &&
+    asRecord((message as { params?: unknown }).params)?.reason === "context_compaction"
+  );
+}
+
 function preferredAcpErrorDetails(acp: OutputErrorAcpPayload | undefined): string | undefined {
   const details = asRecord(acp?.data)?.details;
   return typeof details === "string" && details.trim().length > 0 ? details.trim() : undefined;
@@ -1300,7 +1347,11 @@ export function createOutputFormatter(
     case "json":
       return createJsonOutputFormatter(stdout, suppressReads, options.jsonContext);
     case "quiet":
-      return new QuietOutputFormatter(stdout, stderr);
+      return new QuietOutputFormatter(
+        stdout,
+        stderr,
+        options.suppressIncompleteDiagnostic === true,
+      );
     default: {
       const exhaustive: never = format;
       void exhaustive;

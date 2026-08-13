@@ -114,6 +114,8 @@ function labelForStatus(status: ViewerNodeData["status"]): string {
       return "timed out";
     case "cancelled":
       return "cancelled";
+    case "incomplete":
+      return "incomplete";
     default:
       return status;
   }

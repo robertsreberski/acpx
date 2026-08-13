@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { AcpClient } from "../acp/client.js";
 import { InterruptedError, TimeoutError, withInterrupt, withTimeout } from "../async-control.js";
+import { PermissionDeniedError } from "../errors.js";
+import { permissionDenialTakesPrecedence } from "../permissions.js";
 import { promptToDisplayText } from "../prompt-content.js";
 import {
   cloneSessionAcpxState,
@@ -16,12 +18,19 @@ import {
   runOnce,
   sendSessionDirect,
 } from "../session/session.js";
-import type { PermissionPolicy, PromptInput, SessionRecord } from "../types.js";
+import type {
+  PermissionPolicy,
+  PermissionStats,
+  PromptInput,
+  SessionRecord,
+  TurnCompletionResult,
+} from "../types.js";
 import { acp, action, checkpoint, compute, defineFlow, shell } from "./definition.js";
 import { formatShellActionSummary, runShellAction } from "./executors/shell.js";
 import { resolveNext, resolveNextForOutcome, validateFlowDefinition } from "./graph.js";
 import {
   attachStepTrace,
+  CancelledTurnError,
   clearActiveNode,
   createIsolatedSessionBinding,
   createNodeOutcomePayload,
@@ -35,6 +44,7 @@ import {
   extractAttachedStepTrace,
   finalizeStepTrace,
   findConversationDeltaStart,
+  IncompleteTurnError,
   isoNow,
   makeFlowNodeContext,
   markNodeStarted,
@@ -124,6 +134,8 @@ type FlowStepExecutionResult = FlowNodeExecutionResult & {
 
 type TracedPromptResult = {
   rawText: string;
+  completion: TurnCompletionResult;
+  permissionStats: PermissionStats;
   sessionInfo: FlowSessionBinding;
   conversation: {
     sessionId: string;
@@ -912,6 +924,35 @@ export class FlowRunner {
       prompt,
       sessionInfo,
     );
+    const trace: FlowStepTrace = {
+      sessionId: sessionInfo.bundleId,
+      turn:
+        prompt.completion.status === "incomplete"
+          ? {
+              status: prompt.completion.status,
+              stopReason: prompt.completion.stopReason,
+              reason: prompt.completion.reason,
+            }
+          : {
+              status: prompt.completion.status,
+              stopReason: prompt.completion.stopReason,
+            },
+      promptArtifact: prepared.promptArtifact,
+      rawResponseArtifact,
+      conversation: prompt.conversation,
+    };
+    if (prompt.completion.status === "incomplete") {
+      if (permissionDenialTakesPrecedence(prompt.permissionStats)) {
+        throw attachStepTrace(
+          new PermissionDeniedError("Permission request denied or cancelled"),
+          trace,
+        );
+      }
+      throw attachStepTrace(new IncompleteTurnError(prompt.completion.stopReason), trace);
+    }
+    if (prompt.completion.status === "cancelled") {
+      throw attachStepTrace(new CancelledTurnError(), trace);
+    }
     await this.appendAcpResponseParsedTrace(
       runDir,
       state,
@@ -919,12 +960,6 @@ export class FlowRunner {
       sessionInfo,
       rawResponseArtifact,
     );
-    const trace: FlowStepTrace = {
-      sessionId: sessionInfo.bundleId,
-      promptArtifact: prepared.promptArtifact,
-      rawResponseArtifact,
-      conversation: prompt.conversation,
-    };
     const output = await this.parseAcpOutput(node, context, prompt.rawText, trace);
     return {
       output,
@@ -1122,7 +1157,7 @@ export class FlowRunner {
     }
 
     try {
-      await sendSessionDirect({
+      const result = await sendSessionDirect({
         sessionId: binding.acpxRecordId,
         prompt,
         resumePolicy: "same-session-only",
@@ -1161,6 +1196,8 @@ export class FlowRunner {
 
       return {
         rawText: capture.read(),
+        completion: result,
+        permissionStats: result.permissionStats,
         sessionInfo,
         conversation: {
           sessionId: sessionInfo.bundleId,
@@ -1265,6 +1302,8 @@ export class FlowRunner {
     await this.store.writeSessionRecord(runDir, state, sessionInfo, syntheticRecord);
     return {
       rawText: capture.read(),
+      completion: result,
+      permissionStats: result.permissionStats,
       sessionInfo,
       conversation: {
         sessionId: sessionInfo.bundleId,

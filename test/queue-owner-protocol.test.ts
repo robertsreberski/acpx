@@ -5,6 +5,7 @@ import {
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
 import {
+  QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION,
   QUEUE_PROTOCOL_EFFORT_VERSION,
   QUEUE_PROTOCOL_RULE_KEY_COUNT,
   QUEUE_PROTOCOL_VERSION,
@@ -40,6 +41,7 @@ async function submitWithPolicy(params: {
   defer?: boolean;
   deferMaxAgeMs?: number;
   effort?: string;
+  waitForCompletion?: boolean;
 }): Promise<unknown> {
   return await trySubmitToRunningOwner({
     sessionId: params.sessionId,
@@ -50,7 +52,7 @@ async function submitWithPolicy(params: {
     ...(params.deferMaxAgeMs === undefined ? {} : { deferMaxAgeMs: params.deferMaxAgeMs }),
     ...(params.effort ? { sessionOptions: { effort: params.effort } } : {}),
     outputFormatter: noopFormatter(),
-    waitForCompletion: true,
+    waitForCompletion: params.waitForCompletion ?? true,
   });
 }
 
@@ -83,6 +85,7 @@ async function withFakeOwner(
     acpxVersion?: string;
     parking?: boolean;
     parkingMaxAgeMs?: number;
+    heartbeatAt?: string;
   },
   run: () => Promise<void>,
 ): Promise<void> {
@@ -94,6 +97,7 @@ async function withFakeOwner(
       pid: keeper.pid,
       sessionId,
       socketPath,
+      queueProtocol: fields.queueProtocol ?? null,
       ...fields,
     });
     await run();
@@ -104,49 +108,103 @@ async function withFakeOwner(
 
 const DEFER_POLICY: PermissionPolicy = { defer: ["execute"] };
 
-test("a pre-defer queue owner refuses a policy carrying defer rules", async () => {
-  await withTempHome(async (homeDir) => {
-    // No queueProtocol field at all: exactly what an owner from a build that
-    // predates defer leaves on disk.
-    await withFakeOwner(homeDir, "owner-legacy-defer", { acpxVersion: "0.13.0" }, async () => {
-      const owner = await readQueueOwnerRecord("owner-legacy-defer");
-      assert(owner);
-      assert.equal(owner.queueProtocol, undefined);
-      assert.equal(queueOwnerProtocolVersion(owner), 1);
-
+async function assertOlderOwnerRefusesPrompt(params: {
+  homeDir: string;
+  sessionId: string;
+  queueProtocol?: number;
+  heartbeatAt?: string;
+  waitForCompletion: boolean;
+}): Promise<void> {
+  await withFakeOwner(
+    params.homeDir,
+    params.sessionId,
+    {
+      ...(params.queueProtocol === undefined ? {} : { queueProtocol: params.queueProtocol }),
+      ...(params.heartbeatAt === undefined ? {} : { heartbeatAt: params.heartbeatAt }),
+      acpxVersion: "0.13.0",
+    },
+    async () => {
+      const before = await readQueueOwnerRecord(params.sessionId);
+      assert(before);
       await assert.rejects(
         async () =>
           await submitWithPolicy({
-            sessionId: "owner-legacy-defer",
-            permissionPolicy: DEFER_POLICY,
+            sessionId: params.sessionId,
+            waitForCompletion: params.waitForCompletion,
           }),
         (error: unknown) => {
-          assert.equal(error instanceof QueueConnectionError, true);
           const queueError = error as QueueConnectionError;
           assert.equal(queueError.detailCode, "QUEUE_OWNER_PROTOCOL_MISMATCH");
-          assert.equal(queueError.retryable, false);
-          assert.match(queueError.message, /queue protocol v1/);
-          assert.match(queueError.message, /owner acpx 0\.13\.0/);
+          assert.equal(queueError.retryable, true);
+          assert.match(queueError.message, /cannot report current prompt completion semantics/);
           return true;
         },
       );
+      const after = await readQueueOwnerRecord(params.sessionId);
+      assert.equal(after?.ownerGeneration, before.ownerGeneration);
+    },
+  );
+}
+
+test("a legacy queue owner refuses a waited prompt without disturbing existing work", async () => {
+  await withTempHome(async (homeDir) => {
+    await assertOlderOwnerRefusesPrompt({
+      homeDir,
+      sessionId: "owner-legacy-waited",
+      waitForCompletion: true,
     });
   });
 });
 
-test("a pre-defer queue owner refuses defaultAction defer", async () => {
+test("a v2 queue owner refuses a no-wait prompt without disturbing existing work", async () => {
   await withTempHome(async (homeDir) => {
-    await withFakeOwner(homeDir, "owner-legacy-default", {}, async () => {
-      await assert.rejects(
-        async () =>
-          await submitWithPolicy({
-            sessionId: "owner-legacy-default",
-            permissionPolicy: { defaultAction: "defer" },
-          }),
-        (error: unknown) =>
-          (error as QueueConnectionError).detailCode === "QUEUE_OWNER_PROTOCOL_MISMATCH",
-      );
+    await assertOlderOwnerRefusesPrompt({
+      homeDir,
+      sessionId: "owner-v2-no-wait",
+      queueProtocol: 2,
+      waitForCompletion: false,
     });
+  });
+});
+
+test("a v3 queue owner refuses prompts that require completion status", async () => {
+  await withTempHome(async (homeDir) => {
+    await assertOlderOwnerRefusesPrompt({
+      homeDir,
+      sessionId: "owner-v3-waited",
+      queueProtocol: QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION - 1,
+      waitForCompletion: true,
+    });
+  });
+});
+
+test("a stale-heartbeat v3 owner is rejected without liveness recovery", async () => {
+  await withTempHome(async (homeDir) => {
+    await assertOlderOwnerRefusesPrompt({
+      homeDir,
+      sessionId: "owner-v3-stale-heartbeat",
+      queueProtocol: QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION - 1,
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+      waitForCompletion: true,
+    });
+  });
+});
+
+test("a dead v3 owner is retired so a current owner can replace it", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "owner-v3-dead";
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: 2_147_483_647,
+      sessionId,
+      socketPath,
+      queueProtocol: QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION - 1,
+    });
+
+    assert(await readQueueOwnerRecord(sessionId));
+    assert.equal(await submitWithPolicy({ sessionId }), undefined);
+    assert.equal(await readQueueOwnerRecord(sessionId), undefined);
   });
 });
 
@@ -173,25 +231,6 @@ async function assertReachesTransport(
   );
 }
 
-test("a pre-defer queue owner still serves policies that do not use defer", async () => {
-  await withTempHome(async (homeDir) => {
-    await withFakeOwner(homeDir, "owner-legacy-compatible", {}, async () => {
-      // Gating every warm owner on upgrade would be a regression, so a policy a
-      // v1 owner handles identically must pass.
-      for (const permissionPolicy of [
-        undefined,
-        { escalate: ["execute"] } as PermissionPolicy,
-        { defer: [], defaultAction: "deny" } as PermissionPolicy,
-      ]) {
-        await assertReachesTransport({
-          sessionId: "owner-legacy-compatible",
-          ...(permissionPolicy ? { permissionPolicy } : {}),
-        });
-      }
-    });
-  });
-});
-
 test("a current queue owner accepts defer policies", async () => {
   await withTempHome(async (homeDir) => {
     await withFakeOwner(
@@ -208,29 +247,17 @@ test("a current queue owner accepts defer policies", async () => {
   });
 });
 
-test("a pre-effort queue owner refuses effort-bearing prompts", async () => {
+test("a current queue owner accepts effort-bearing prompts", async () => {
   await withTempHome(async (homeDir) => {
     await withFakeOwner(
       homeDir,
-      "owner-pre-effort-prompt",
-      { queueProtocol: QUEUE_PROTOCOL_EFFORT_VERSION - 1, acpxVersion: "0.13.0" },
+      "owner-current-effort",
+      { queueProtocol: QUEUE_PROTOCOL_VERSION },
       async () => {
-        await assert.rejects(
-          async () =>
-            await submitWithPolicy({
-              sessionId: "owner-pre-effort-prompt",
-              effort: "high",
-            }),
-          (error: unknown) => {
-            const queueError = error as QueueConnectionError;
-            assert.equal(queueError.detailCode, "QUEUE_OWNER_PROTOCOL_MISMATCH");
-            assert.equal(queueError.retryable, false);
-            assert.match(queueError.message, /would ignore the requested effort/);
-            return true;
-          },
-        );
-
-        await assertReachesTransport({ sessionId: "owner-pre-effort-prompt" });
+        await assertReachesTransport({
+          sessionId: "owner-current-effort",
+          effort: "high",
+        });
       },
     );
   });
@@ -278,8 +305,8 @@ test("adding a permission policy rule key forces a queue protocol decision", () 
   assert.equal(
     PERMISSION_POLICY_RULE_KEYS.length,
     QUEUE_PROTOCOL_RULE_KEY_COUNT,
-    "PERMISSION_POLICY_RULE_KEYS changed: teach permissionPolicyNeedsDeferSupport about the " +
-      "new key, bump QUEUE_PROTOCOL_VERSION, then update QUEUE_PROTOCOL_RULE_KEY_COUNT",
+    "PERMISSION_POLICY_RULE_KEYS changed: decide queue compatibility, bump " +
+      "QUEUE_PROTOCOL_VERSION, then update QUEUE_PROTOCOL_RULE_KEY_COUNT",
   );
 });
 

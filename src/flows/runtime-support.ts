@@ -5,7 +5,7 @@ import { createOutputFormatter } from "../cli/output/output.js";
 import { textPrompt } from "../prompt-content.js";
 import { defaultSessionEventLog } from "../session/event-log.js";
 import { SESSION_RECORD_SCHEMA } from "../types.js";
-import type { PromptInput, SessionRecord } from "../types.js";
+import type { PromptInput, SessionRecord, TurnCompletionResult } from "../types.js";
 import type { FlowRunStore } from "./store.js";
 import type {
   AcpNodeDefinition,
@@ -170,7 +170,7 @@ export function summarizePrompt(promptText: string, explicitDetail?: string): st
   return `ACP: ${truncated}`;
 }
 
-export function createQuietCaptureOutput(): {
+export function createQuietCaptureOutput(stderr: MemoryWritable = process.stderr): {
   formatter: ReturnType<typeof createOutputFormatter>;
   read: () => string;
 } {
@@ -180,10 +180,14 @@ export function createQuietCaptureOutput(): {
       chunks.push(chunk);
     },
   };
-
   return {
     formatter: createOutputFormatter("quiet", {
       stdout,
+      stderr,
+      // FlowRunner classifies this terminal condition and either routes it or
+      // lets the outer CLI render it in the requested format. Suppress only
+      // that duplicate line; preserve all other adapter/runtime diagnostics.
+      suppressIncompleteDiagnostic: true,
     }),
     read: () => chunks.join("").trim(),
   };
@@ -362,6 +366,12 @@ export function createNodeResult(options: {
 }
 
 export function outcomeForError(error: unknown): FlowNodeOutcome {
+  if (error instanceof IncompleteTurnError) {
+    return "incomplete";
+  }
+  if (error instanceof CancelledTurnError) {
+    return "cancelled";
+  }
   if (error instanceof TimeoutError) {
     return "timed_out";
   }
@@ -369,6 +379,26 @@ export function outcomeForError(error: unknown): FlowNodeOutcome {
     return "cancelled";
   }
   return "failed";
+}
+
+export class IncompleteTurnError extends Error {
+  readonly reason = "context_compaction" as const;
+
+  constructor(
+    readonly stopReason: Extract<TurnCompletionResult, { status: "incomplete" }>["stopReason"],
+  ) {
+    super("ACP turn incomplete: Codex compacted context before emitting a final answer");
+    this.name = "IncompleteTurnError";
+  }
+}
+
+export class CancelledTurnError extends Error {
+  readonly stopReason = "cancelled" as const;
+
+  constructor() {
+    super("ACP turn cancelled before completion");
+    this.name = "CancelledTurnError";
+  }
 }
 
 function stableShortHash(value: string): string {

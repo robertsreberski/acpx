@@ -405,6 +405,89 @@ test("AcpRuntimeManager streams runtime events and saves updated status", async 
   assert.equal(saved?.protocolVersion, 1);
 });
 
+test("AcpRuntimeManager returns incomplete compaction through canonical and legacy contracts", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "incomplete-turn-session",
+    acpSessionId: "incomplete-turn-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([record]);
+  let handlers: FakeClientHandlers = {};
+  let promptNumber = 0;
+  const client: FakeClient = {
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({ sessionId: "unused" }),
+    loadSession: async () => ({ agentSessionId: "unused" }),
+    hasReusableSession: (sessionId) => sessionId === "incomplete-turn-sid",
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    prompt: async () => {
+      promptNumber += 1;
+      handlers.onSessionUpdate?.({
+        sessionId: "incomplete-turn-sid",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: `compaction-${promptNumber}`,
+          title: "Context compaction",
+          kind: "other",
+          status: "completed",
+          _meta: { contextCompaction: true },
+        },
+      });
+      return { stopReason: "end_turn" };
+    },
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => false,
+    setSessionMode: async () => {},
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {
+      handlers = {};
+    },
+    setEventHandlers: (nextHandlers) => {
+      handlers = nextHandlers;
+    },
+  };
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    { clientFactory: () => client as never },
+  );
+
+  const { result } = await collectTurn(
+    manager.startTurn({
+      handle: createHandle("incomplete-turn-session"),
+      text: "first",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "req-incomplete-canonical",
+    }),
+  );
+  assert.deepEqual(result, {
+    status: "incomplete",
+    stopReason: "end_turn",
+    reason: "context_compaction",
+  });
+
+  const legacyEvents = await collectEvents(
+    manager.runTurn({
+      handle: createHandle("incomplete-turn-session"),
+      text: "second",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "req-incomplete-legacy",
+    }),
+  );
+  assert.deepEqual(legacyEvents.at(-1), {
+    type: "done",
+    stopReason: "end_turn",
+    incomplete: true,
+    reason: "context_compaction",
+  });
+});
+
 test("AcpRuntimeManager persists prompt response usage and surfaces it in status", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "response-usage-session",
@@ -1173,6 +1256,84 @@ test("AcpRuntimeManager accepts a session reply even when the prompt RPC times o
     { type: "text_delta", text: "late reply", stream: "output", tag: "agent_message_chunk" },
   ]);
   assert.deepEqual(result, { status: "completed", stopReason: "end_turn" });
+});
+
+test("AcpRuntimeManager does not salvage a timed-out reply after unresolved compaction", async () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "compacted-timeout-session",
+    acpSessionId: "compacted-timeout-sid",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+  });
+  const store = new InMemorySessionStore([record]);
+  let handlers: FakeClientHandlers = {};
+  const client: FakeClient = {
+    start: async () => {},
+    close: async () => {},
+    createSession: async () => ({ sessionId: "unused" }),
+    loadSession: async () => ({ agentSessionId: "unused" }),
+    hasReusableSession: () => true,
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    prompt: async () => {
+      setTimeout(() => {
+        handlers.onSessionUpdate?.({
+          sessionId: "compacted-timeout-sid",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "partial before compaction" },
+          },
+        });
+        handlers.onSessionUpdate?.({
+          sessionId: "compacted-timeout-sid",
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "timeout-compaction",
+            status: "completed",
+            _meta: { contextCompaction: true },
+          },
+        });
+      }, 5);
+      return await new Promise<{ stopReason: string }>(() => {});
+    },
+    requestCancelActivePrompt: async () => false,
+    hasActivePrompt: () => true,
+    setSessionMode: async () => {},
+    setSessionConfigOption: async () => {},
+    clearEventHandlers: () => {
+      handlers = {};
+    },
+    setEventHandlers: (nextHandlers) => {
+      handlers = nextHandlers;
+    },
+  };
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    { clientFactory: () => client as never },
+  );
+
+  const { events, result } = await collectTurn(
+    manager.startTurn({
+      handle: createHandle("compacted-timeout-session"),
+      text: "hello",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "req-compacted-timeout",
+      timeoutMs: 20,
+    }),
+  );
+
+  assert.equal(
+    events.some((event) => event.type === "text_delta"),
+    true,
+  );
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "TIMEOUT");
+    assert.match(result.error.message, /Timed out after 20ms/);
+  }
 });
 
 test("AcpRuntimeManager waits for late reply chunks to settle before ending a salvaged turn", async () => {
@@ -2703,7 +2864,7 @@ test("AcpRuntimeManager keeps failed reconnect results pending until PID persist
       code: "RUNTIME",
       detailCode: "SESSION_RESUME_REQUIRED",
       message:
-        "Persistent ACP session stale-backend-session could not be resumed: saved session cannot be loaded",
+        "Persistent ACP session stale-backend-session could not be resumed: saved session cannot be loaded. The saved conversation was preserved; run `sessions new` explicitly to replace it",
       retryable: true,
     },
   });
@@ -2848,8 +3009,8 @@ test("AcpRuntimeManager fails persistent turns clearly when session reuse is una
       code: "RUNTIME",
       detailCode: "SESSION_RESUME_REQUIRED",
       message:
-        "Persistent ACP session persistent-backend-session could not be resumed: agent does not support session/resume or session/load",
-      retryable: true,
+        "Persistent ACP session persistent-backend-session could not be resumed: agent does not support session/resume or session/load. The saved conversation was preserved; run `sessions new` explicitly to replace it",
+      retryable: false,
     },
   });
   assert.equal(createSessionCalls, 0);

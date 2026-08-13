@@ -12,12 +12,14 @@ import {
   resolvePermissionMode,
   type GlobalFlags,
 } from "../cli/flags.js";
+import { createOutputFormatter } from "../cli/output/output.js";
 import { type FlowDefinition, FlowRunner } from "../flows.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import { permissionModeSatisfies } from "../permissions.js";
-import type { PermissionMode } from "../types.js";
+import { EXIT_CODES, type PermissionMode } from "../types.js";
 import { isDefinedFlow } from "./authoring.js";
 import { validateFlowDefinition } from "./graph.js";
+import { IncompleteTurnError } from "./runtime-support.js";
 
 type FlowRunFlags = {
   inputJson?: string;
@@ -66,9 +68,28 @@ export async function handleFlowRun(
     },
   });
 
-  const result = await runner.run(flow, input, {
-    flowPath,
-  });
+  let result: Awaited<ReturnType<FlowRunner["run"]>>;
+  try {
+    result = await runner.run(flow, input, {
+      flowPath,
+    });
+  } catch (error) {
+    if (error instanceof IncompleteTurnError) {
+      const output = createOutputFormatter(outputPolicy.format);
+      output.onAcpMessage({
+        jsonrpc: "2.0",
+        method: "_acpx/turn_incomplete",
+        params: {
+          reason: error.reason,
+          stopReason: error.stopReason,
+        },
+      });
+      output.flush();
+      process.exitCode = EXIT_CODES.INCOMPLETE;
+      return;
+    }
+    throw error;
+  }
 
   printFlowRunResult(result, globalFlags);
 }

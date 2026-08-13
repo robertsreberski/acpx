@@ -1,4 +1,6 @@
+import { splitCommandLine } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
+import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import { effortStateFromConfigOptions } from "../../acp/effort-support.js";
 import {
   extractAcpError,
@@ -10,18 +12,23 @@ import { modelStateFromConfigOptions } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
+import { permissionDenialTakesPrecedence, permissionStatsDelta } from "../../permissions.js";
 import { textPrompt } from "../../prompt-content.js";
 import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
 } from "../../runtime/engine/lifecycle.js";
 import { runPromptTurn } from "../../runtime/engine/prompt-turn.js";
-import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
+import {
+  canCreateFirstPromptProviderSession,
+  connectAndLoadSession,
+} from "../../runtime/engine/reconnect.js";
 import {
   mergeSessionOptions,
   sessionOptionsFromRecord,
   type SessionAgentOptions,
 } from "../../runtime/engine/session-options.js";
+import { TurnCompletionTracker } from "../../runtime/engine/turn-completion.js";
 import {
   applyConfigOptionsToRecord,
   applyConfigOptionsToState,
@@ -69,10 +76,12 @@ import type {
   OutputFormatter,
   PermissionEscalationEvent,
   PermissionPolicy,
+  PermissionStats,
   RunPromptResult,
   SessionAcpxState,
   SessionRecord,
   SessionSendResult,
+  TurnCompletionResult,
 } from "../../types.js";
 import { type QueueOwnerMessage, type QueueTask, waitMs } from "../queue/ipc.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
@@ -80,6 +89,19 @@ import type { PendingRequestEvent } from "../queue/pending-request-manager.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 
 const INTERRUPT_CANCEL_WAIT_MS = 2_500;
+const ONE_SHOT_REPLY_IDLE_MS = 100;
+
+function oneShotInitialDrainIdleMs(
+  options: Pick<RunOnceOptions, "agentCommand" | "agentArgv">,
+): number | undefined {
+  const parts = options.agentArgv
+    ? { command: options.agentArgv[0] ?? "", args: options.agentArgv.slice(1) }
+    : splitCommandLine(options.agentCommand);
+  // Codex is the producer of the compaction/final-answer metadata this drain
+  // protects, so it retains the complete late-marker horizon. Other agents do
+  // not pay that one-second cost on every exec and compare row.
+  return isCodexAcpCommand(parts.command, parts.args) ? undefined : ONE_SHOT_REPLY_IDLE_MS;
+}
 
 type RunSessionPromptOptions = Omit<
   SessionSendOptions,
@@ -241,14 +263,33 @@ class AcpErrorTracker {
 }
 
 function toPromptResult(
-  stopReason: RunPromptResult["stopReason"],
+  completion: TurnCompletionResult,
   sessionId: string,
-  client: AcpClient,
+  permissionStats: PermissionStats,
 ): RunPromptResult {
-  return {
-    stopReason,
+  const common = {
     sessionId,
-    permissionStats: client.getPermissionStats(),
+    permissionStats,
+  };
+  if (completion.status === "incomplete") {
+    return {
+      status: completion.status,
+      stopReason: completion.stopReason,
+      reason: completion.reason,
+      ...common,
+    };
+  }
+  if (completion.status === "cancelled") {
+    return {
+      status: completion.status,
+      stopReason: completion.stopReason,
+      ...common,
+    };
+  }
+  return {
+    status: completion.status,
+    stopReason: completion.stopReason,
+    ...common,
   };
 }
 
@@ -864,6 +905,25 @@ function acpxExtensionNotification(method: string, params: unknown): AcpJsonRpcM
   return { jsonrpc: "2.0", method, params };
 }
 
+function emitIncompleteTurn(
+  completion: TurnCompletionResult,
+  output: OutputFormatter,
+  permissionStats: RunPromptResult["permissionStats"],
+  pendingMessages?: AcpJsonRpcMessage[],
+): void {
+  if (completion.status !== "incomplete") {
+    return;
+  }
+  const notification = acpxExtensionNotification("_acpx/turn_incomplete", {
+    reason: completion.reason,
+    stopReason: completion.stopReason,
+  });
+  pendingMessages?.push(notification);
+  if (!permissionDenialTakesPrecedence(permissionStats)) {
+    output.onAcpMessage(notification);
+  }
+}
+
 /**
  * The request as the event log carries it.
  *
@@ -1047,6 +1107,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const record = await measurePerf("session.resolve_prompt_record", async () => {
     return await resolveSessionRecord(options.sessionRecordId);
   });
+  const allowFreshSessionForFirstPrompt = canCreateFirstPromptProviderSession(record);
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
   const promptStartedAt = isoNow();
@@ -1073,6 +1134,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let bufferingConnectOutput = true;
   let promptTurnActive = false;
   let promptTurnHadSideEffects = false;
+  const completionTracker = new TurnCompletionTracker();
   const acpErrors = new AcpErrorTracker();
   let eventWriterClosed = false;
 
@@ -1169,6 +1231,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       acpErrors.observe(output, direction, message);
     },
     onSessionUpdate: (notification) => {
+      completionTracker.observe(notification);
       if (promptTurnActive) {
         promptTurnHadSideEffects = true;
       }
@@ -1291,7 +1354,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         return await connectAndLoadSession({
           client,
           record,
-          resumePolicy: options.resumePolicy,
+          resumePolicy: options.resumePolicy ?? "same-session-only",
+          allowFreshSessionForFirstPrompt,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           suppressWarnings: options.suppressSdkConsoleErrors,
@@ -1346,6 +1410,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         conversation,
         promptMessageId,
         onPromptStarted: buildPromptStartedHook(attempt),
+        completionTracker,
       });
     });
     emitPromptPerfMetric(promptStartedAt, options.verbose);
@@ -1414,7 +1479,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
-  const savePromptSuccess = async (response: Awaited<ReturnType<typeof runPromptTurn>>) => {
+  const savePromptSuccess = async (
+    response: Awaited<ReturnType<typeof runPromptTurn>>,
+    permissionStats: PermissionStats,
+  ) => {
+    emitIncompleteTurn(response, output, permissionStats, pendingMessages);
     await flushPendingMessages(false);
     output.flush();
     const now = isoNow();
@@ -1452,11 +1521,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     });
     await liveCheckpoint.checkpoint();
 
-    const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
+    const permissionStatsBeforePrompt = client.getPermissionStats();
+    const response = await runPromptWithRetries(activeSessionId);
+    const permissionStats = permissionStatsDelta(
+      client.getPermissionStats(),
+      permissionStatsBeforePrompt,
+    );
+    await savePromptSuccess(response, permissionStats);
     promptTurnActive = false;
 
     return {
-      ...toPromptResult(response.stopReason, record.acpxRecordId, client),
+      ...toPromptResult(response, record.acpxRecordId, permissionStats),
       record,
       resumed,
       loadError,
@@ -1464,7 +1539,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   };
 
   const handleInterrupt = async (): Promise<void> => {
-    await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
+    await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS).catch(() => {
+      // Cancellation is best effort; persistence, buffered output, and client
+      // cleanup still have to finish before the interrupt is reported.
+    });
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
     record.lastUsedAt = isoNow();
     applyConversation(record, conversation);
@@ -1472,6 +1550,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while process is being interrupted
     });
+    output.flush();
     if (ownClient) {
       await client.close();
     }
@@ -1524,6 +1603,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
   const shouldMarkAcpErrorsEmitted = rendersAcpErrors(options.errorEmissionPolicy);
   let promptTurnActive = false;
   let promptTurnHadSideEffects = false;
+  const completionTracker = new TurnCompletionTracker();
   const acpErrors = new AcpErrorTracker();
   const client = new AcpClient({
     agentCommand: options.agentCommand,
@@ -1544,6 +1624,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
       acpErrors.observe(output, direction, message);
     },
     onSessionUpdate: (notification) => {
+      completionTracker.observe(notification);
       if (promptTurnActive) {
         promptTurnHadSideEffects = true;
       }
@@ -1565,7 +1646,14 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
   const runExecPromptAttempt = async (sessionId: string) => {
     acpErrors.reset();
     return await measurePerf("runtime.exec.prompt", async () => {
-      return await withTimeout(client.prompt(sessionId, options.prompt), options.timeoutMs);
+      return await runPromptTurn({
+        client,
+        sessionId,
+        prompt: options.prompt,
+        timeoutMs: options.timeoutMs,
+        completionTracker,
+        initialDrainIdleMs: oneShotInitialDrainIdleMs(options),
+      });
     });
   };
 
@@ -1619,13 +1707,23 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           sessionId,
         });
 
+        const permissionStatsBeforePrompt = client.getPermissionStats();
         const response = await runExecPromptWithRetries(sessionId);
+        const permissionStats = permissionStatsDelta(
+          client.getPermissionStats(),
+          permissionStatsBeforePrompt,
+        );
         promptTurnActive = false;
+        emitIncompleteTurn(response, output, permissionStats);
         output.flush();
-        return toPromptResult(response.stopReason, sessionId, client);
+        return toPromptResult(response, sessionId, permissionStats);
       },
       async () => {
-        await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
+        await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS).catch(() => {
+          // Keep flushing and closing even if the adapter cannot acknowledge
+          // cancellation during shutdown.
+        });
+        output.flush();
         await client.close();
       },
     );
@@ -1671,4 +1769,5 @@ export const sessionRuntimeTestInternals = {
   shouldRetryRuntimePrompt,
   createPendingRequestSink,
   mergeQueuedTaskSessionPreferences,
+  oneShotInitialDrainIdleMs,
 };

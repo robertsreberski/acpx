@@ -8,7 +8,7 @@ import { TimeoutError } from "../src/async-control.js";
 import { decision, decisionEdge } from "../src/flows/decision.js";
 import { validateFlowDefinition } from "../src/flows/graph.js";
 import { extractJsonObject, parseJsonObject, parseStrictJsonObject } from "../src/flows/json.js";
-import { createRunId } from "../src/flows/runtime-support.js";
+import { createQuietCaptureOutput, createRunId } from "../src/flows/runtime-support.js";
 import {
   FlowRunner,
   acp,
@@ -35,6 +35,42 @@ const FLOW_AUTHORING_TEST_ROOTS = [
   path.resolve(process.cwd(), "examples/flows"),
   path.resolve(process.cwd(), "test/fixtures"),
 ];
+
+test("flow quiet capture suppresses only the internally routed incomplete line", () => {
+  const stderrChunks: string[] = [];
+  const capture = createQuietCaptureOutput({
+    write(chunk: string) {
+      stderrChunks.push(chunk);
+    },
+  });
+
+  capture.formatter.onError({
+    code: "RUNTIME",
+    message: "adapter diagnostic",
+  });
+  capture.formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    method: "_acpx/turn_incomplete",
+    params: {
+      reason: "context_compaction",
+      stopReason: "end_turn",
+    },
+  });
+  capture.formatter.onAcpMessage({
+    jsonrpc: "2.0",
+    id: "prompt-1",
+    result: {
+      stopReason: "end_turn",
+      usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+    },
+  });
+  capture.formatter.flush();
+
+  const stderr = stderrChunks.join("");
+  assert.match(stderr, /\[acpx\] error: RUNTIME adapter diagnostic/);
+  assert.match(stderr, /\[acpx\] tokens: input=7 output=3 total=10/);
+  assert.doesNotMatch(stderr, /\[acpx\] incomplete:/);
+});
 
 async function collectFlowFiles(root: string): Promise<string[]> {
   const entries = await fs.readdir(root, { withFileTypes: true });
@@ -836,6 +872,163 @@ test("FlowRunner writes isolated ACP bundle traces and artifacts", async () => {
   });
 });
 
+test("FlowRunner routes incomplete compaction without parsing partial output", async () => {
+  await withTempHome(async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-incomplete-"));
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
+    let parseCalled = false;
+
+    try {
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: `${MOCK_AGENT_COMMAND} --supports-load-session`,
+          agentArgv: ["node", MOCK_AGENT_PATH, "--supports-load-session"],
+          cwd,
+        }),
+        permissionMode: "approve-all",
+        outputRoot,
+      });
+      const flow = defineFlow({
+        name: "incomplete-compaction-route-test",
+        startAt: "compacted",
+        nodes: {
+          compacted: acp({
+            session: { isolated: true },
+            prompt: () => "compact-no-final",
+            parse: () => {
+              parseCalled = true;
+              return { shouldNotExist: true };
+            },
+          }),
+          after_incomplete: action({
+            run: ({ results, outputs }) => ({
+              outcome: results.compacted?.outcome,
+              partialWasPublished: Object.hasOwn(outputs, "compacted"),
+            }),
+          }),
+        },
+        edges: [
+          {
+            from: "compacted",
+            switch: {
+              on: "$result.outcome",
+              cases: { incomplete: "after_incomplete" },
+            },
+          },
+        ],
+      });
+
+      const result = await runner.run(flow, {});
+      assert.equal(result.state.status, "completed");
+      assert.equal(result.state.results.compacted?.outcome, "incomplete");
+      assert.equal(parseCalled, false);
+      assert.deepEqual(result.state.outputs.after_incomplete, {
+        outcome: "incomplete",
+        partialWasPublished: false,
+      });
+
+      const steps = JSON.parse(
+        await fs.readFile(path.join(result.runDir, "projections", "steps.json"), "utf8"),
+      ) as Array<{
+        nodeId?: string;
+        trace?: {
+          turn?: { status?: string; stopReason?: string; reason?: string };
+          rawResponseArtifact?: { path?: string };
+        };
+      }>;
+      const compactedStep = steps.find((step) => step.nodeId === "compacted");
+      assert.deepEqual(compactedStep?.trace?.turn, {
+        status: "incomplete",
+        stopReason: "end_turn",
+        reason: "context_compaction",
+      });
+      const rawResponsePath = compactedStep?.trace?.rawResponseArtifact?.path;
+      assert.equal(typeof rawResponsePath, "string");
+      await fs.access(path.join(result.runDir, rawResponsePath ?? ""));
+
+      const traceEvents = (await fs.readFile(path.join(result.runDir, "trace.ndjson"), "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type?: string; nodeId?: string });
+      assert.equal(
+        traceEvents.some(
+          (event) => event.type === "acp_response_parsed" && event.nodeId === "compacted",
+        ),
+        false,
+      );
+    } finally {
+      await fs.rm(outputRoot, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("FlowRunner routes cancelled ACP turns without parsing partial output", async () => {
+  await withTempHome(async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-cancelled-"));
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
+    let parseCalled = false;
+
+    try {
+      const runner = new FlowRunner({
+        resolveAgent: () => ({
+          agentName: "mock",
+          agentCommand: MOCK_AGENT_COMMAND,
+          cwd,
+        }),
+        permissionMode: "approve-all",
+        outputRoot,
+      });
+      const flow = defineFlow({
+        name: "cancelled-turn-route-test",
+        startAt: "cancelled_turn",
+        nodes: {
+          cancelled_turn: acp({
+            session: { isolated: true },
+            prompt: () => "cancel-turn",
+            parse: () => {
+              parseCalled = true;
+              return { shouldNotExist: true };
+            },
+          }),
+          after_cancel: action({
+            run: ({ results, outputs }) => ({
+              outcome: results.cancelled_turn?.outcome,
+              partialWasPublished: Object.hasOwn(outputs, "cancelled_turn"),
+            }),
+          }),
+        },
+        edges: [
+          {
+            from: "cancelled_turn",
+            switch: {
+              on: "$result.outcome",
+              cases: { cancelled: "after_cancel" },
+            },
+          },
+        ],
+      });
+
+      const result = await runner.run(flow, {});
+      assert.equal(result.state.status, "completed");
+      assert.equal(result.state.results.cancelled_turn?.outcome, "cancelled");
+      assert.equal(parseCalled, false);
+      assert.deepEqual(result.state.outputs.after_cancel, {
+        outcome: "cancelled",
+        partialWasPublished: false,
+      });
+      assert.deepEqual(result.state.steps[0]?.trace?.turn, {
+        status: "cancelled",
+        stopReason: "cancelled",
+      });
+    } finally {
+      await fs.rm(outputRoot, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("FlowRunner writes persistent ACP bundle traces and session bindings", async () => {
   await withTempHome(async () => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-persistent-trace-"));
@@ -1628,9 +1821,31 @@ test("FlowRunner times out async ACP parse callbacks", async () => {
       outputRoot,
     });
     const runnerHarness = runner as unknown as {
-      runIsolatedPrompt: () => Promise<string>;
+      runIsolatedPrompt: () => Promise<{
+        rawText: string;
+        completion: { status: "completed"; stopReason: "end_turn" };
+        sessionInfo: never;
+        conversation: {
+          sessionId: string;
+          messageStart: number;
+          messageEnd: number;
+          eventStartSeq: number;
+          eventEndSeq: number;
+        };
+      }>;
     };
-    runnerHarness.runIsolatedPrompt = async () => "hello";
+    runnerHarness.runIsolatedPrompt = async () => ({
+      rawText: "hello",
+      completion: { status: "completed", stopReason: "end_turn" },
+      sessionInfo: undefined as never,
+      conversation: {
+        sessionId: "stub-session",
+        messageStart: 0,
+        messageEnd: 0,
+        eventStartSeq: 1,
+        eventEndSeq: 1,
+      },
+    });
 
     const flow = defineFlow({
       name: "acp-parse-timeout-test",

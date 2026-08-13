@@ -86,6 +86,7 @@ acpx [global_options] flow run <file> [--input-json <json> | --input-file <path>
 - Reuses one implicit main ACP session by default for non-isolated `acp` nodes.
 - `acp` nodes may override their working directory per step, which lets flows prepare an isolated workspace with an action node and then keep the agent session inside that cwd.
 - `acp` and `action` nodes use the global `--timeout` value as their default step timeout. If `--timeout` is omitted, flows default to 15 minutes per active step.
+- An `acp` node whose Codex turn ends after context compaction without a final answer records outcome `incomplete`. Its raw response and `trace.turn` are preserved, its `parse` callback is not called, and an edge may route on `$result.outcome == "incomplete"`. Without a matching outcome edge, `flow run` exits `6`.
 - Flows may declare permission requirements. If a flow requires an explicit grant such as `approve-all`, `acpx` fails fast before starting the flow and tells you which permission flag to pass.
 - `--input-json` passes flow input inline as JSON.
 - `--input-file` reads flow input JSON from disk.
@@ -241,7 +242,7 @@ Behavior:
 
 - Finds existing session for scope key `(agentCommand, cwd, name?)`
 - Does not auto-create sessions; missing scope exits with code `4` and guidance to run `sessions new`
-- Sends prompt on resumed/new session
+- Reuses or resumes the exact saved provider session. If the adapter cannot resume or load it, the prompt fails instead of silently starting a replacement conversation. Run `sessions new` explicitly when a fresh conversation is intended.
 - If another prompt is already running for that session, submits to the running queue owner instead of starting a second ACP subprocess
 - By default waits for queued prompt completion; `--no-wait` returns after queue acknowledgement
 - Updates session metadata after completion
@@ -267,6 +268,7 @@ Behavior:
 - Creates temporary ACP session
 - Sends prompt once
 - Does not write/use a saved session record
+- Reports unresolved Codex context compaction as incomplete with exit code `6`, then discards the temporary session. A retry or follow-up is always explicit.
 - Supports prompt text from args, stdin, `--file <path>`, and `--file -`
 
 ## `compare` subcommand
@@ -288,7 +290,7 @@ Behavior:
 - `--format quiet` prints `<agent>\t<status>` per row.
 - Agents run serially in the requested workspace. The command does not create saved sessions or separate compare transcript directories. Use `--format json` when you need a machine-readable artifact.
 
-`CompareRow.status` is `ok`, `cancelled`, `permission_denied`, or `error`.
+`CompareRow.status` is `ok`, `cancelled`, `permission_denied`, `incomplete`, or `error`. An incomplete row has `incomplete_reason: "context_compaction"`; any error, permission denial, or cancellation keeps its normal higher-priority command exit status ahead of incomplete.
 
 ## `cancel` command
 
@@ -595,7 +597,7 @@ For prompt commands:
 Use `sessions new [--name <name>]` when you explicitly want a fresh scoped session.
 Use `sessions ensure [--name <name>]` when you want idempotent "get-or-create" behavior.
 
-If a saved session PID is dead, `acpx` respawns the agent, tries `session/resume` when advertised or `session/load` otherwise, and transparently falls back to `session/new` when reconnecting fails.
+If a saved session PID is dead, `acpx` respawns the agent and tries `session/resume` when advertised or `session/load` otherwise. Persistent prompts fail closed when that exact provider session cannot be restored. The only no-history exception is the first prompt after `sessions new` when the recorded capabilities advertise neither reuse method: `acpx` may initialize that empty conversation with `session/new` while preserving its local record identity. Once a prompt has been attempted, `acpx` never replaces the provider session during a later prompt; use `sessions new` explicitly to start over.
 
 ### Prompt queueing
 
@@ -605,7 +607,7 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 2. other `acpx` invocations enqueue prompts through local IPC
 3. owner drains queued prompts one-by-one after each completed turn
 4. after the queue drains, owner waits for new work up to TTL (`--ttl`, default 300s)
-5. submitter either blocks until completion (default) or exits immediately with `--no-wait`
+5. submitter either blocks until completion (default) or exits immediately with `--no-wait`; a later incomplete result from a no-wait turn is written to the session event stream as `_acpx/turn_incomplete`
 6. if interrupted (`Ctrl+C`) during an active turn, `acpx` sends `session/cancel` first, waits briefly for cancelled completion, then force-kills only if needed
 
 ### Soft-close behavior
@@ -629,14 +631,14 @@ When a prompt is already in flight for a session, `acpx` uses a per-session queu
 
 - `text` (default): human-readable stream
 - `json`: raw ACP NDJSON stream for automation
-- `quiet`: assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr
+- `quiet`: assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr, while incomplete prompts emit one `[acpx] incomplete:` line
 - `--format json --json-strict`: same ACP NDJSON stream, with non-JSON stderr output suppressed
 
 ### Prompt/exec output behavior
 
-- `text`: assistant text, tool status blocks, client-operation logs, plan updates, and `[done] <reason>`
-- `json`: one raw ACP JSON-RPC message per line
-- `quiet`: concatenated assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr
+- `text`: assistant text, tool status blocks, client-operation logs, plan updates, `[done] <reason>`, and an explicit `[incomplete]` line when applicable
+- `json`: one ACP JSON-RPC message per line, including acpx extension notifications under the `_acpx/*` method namespace
+- `quiet`: concatenated assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr and incomplete prompts emit one `[acpx] incomplete:` line
 
 When `--suppress-reads` is enabled:
 
@@ -650,13 +652,25 @@ ACP message examples:
 {"jsonrpc":"2.0","id":"req-1","method":"session/prompt","params":{"sessionId":"019c...","prompt":"hi"}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}
 {"jsonrpc":"2.0","id":"req-1","result":{"stopReason":"end_turn"}}
+{"jsonrpc":"2.0","method":"_acpx/turn_incomplete","params":{"reason":"context_compaction","stopReason":"end_turn"}}
 ```
 
 Hard rule for the ACP stream:
 
-- no acpx-specific event envelope,
+- ACP messages are never wrapped in an acpx-specific event envelope,
+- acpx-authored status is a JSON-RPC extension notification under `_acpx/*`,
 - no synthetic `type`/`stream` wrapper fields,
 - no ACP payload key renaming.
+
+### Incomplete Codex turns
+
+Codex adapters can report an exact context-compaction marker on a tool update. If the same prompt attempt then returns any non-cancel stop reason without a later non-empty agent message carrying exact Codex `final_answer` phase metadata, `acpx` classifies the turn as `incomplete` rather than successful. It does not infer this state from prose, tool titles, token counts, or other heuristics.
+
+- Waited `prompt`, `exec`, and `compare` commands exit with code `6` unless an error, permission denial, cancellation, or timeout already determines a higher-priority result.
+- Persistent `prompt` records `_acpx/turn_incomplete` in the session event stream and preserves the exact provider session. Submit a new prompt explicitly to continue it; `acpx` never invents or replays a follow-up.
+- `exec` and `compare` report incomplete before discarding their temporary sessions.
+- `--no-wait` reports queue acknowledgement immediately; if the background turn is incomplete, the notification remains in the durable per-session event stream.
+- The embedding runtime returns status `incomplete`, reason `context_compaction`, and the adapter's actual non-cancel `stopReason` (commonly `end_turn`). Its legacy `runTurn()` adapter ends with a `done` event carrying `incomplete: true` and the same reason.
 
 ### Control-command JSON mapping
 
@@ -709,7 +723,7 @@ Per-tool policy:
 - `autoDeny` wins over `autoApprove`, which wins over `escalate`, which wins over `defer`; unmatched requests use `defaultAction` when set, otherwise the selected permission mode.
 - `defer` marks requests whose decision belongs to an out-of-band reviewer. Without `--defer` it resolves like `escalate` and differs only in the reported `action`; with `--defer` the request is parked for [`respond`](#respond-command).
 - `escalate` and `defer` prompt inline when a TTY is available and only emit an escalation event when one is not; see [permissions](permissions.md).
-- Reusing a warm queue owner from a build that predates `defer` fails with `QUEUE_OWNER_PROTOCOL_MISMATCH`; close the session so a current owner can start.
+- Reusing a warm queue owner that predates the current completion-result protocol fails with `QUEUE_OWNER_PROTOCOL_MISMATCH`. Existing owner work is left untouched; close it explicitly after that work finishes so a current owner can start.
 - Non-interactive escalations deny the current request. Text mode prints a `[permission]` notice; JSON mode keeps raw ACP NDJSON and includes escalation details, including tool input when supplied by the agent, on the `session/request_permission` response at `_meta.acpx.permissionEscalation`.
 
 ## Exit codes
@@ -722,6 +736,7 @@ Per-tool policy:
 | `3`   | Timeout                                                                                                   |
 | `4`   | No session found (prompt requires an explicit `sessions new`), or the owner that parked a request is gone |
 | `5`   | Permission denied (permission requested, none approved, and at least one denied/cancelled)                |
+| `6`   | Incomplete turn (Codex context compaction ended without a final answer)                                   |
 | `130` | Interrupted (`SIGINT`/`SIGTERM`)                                                                          |
 
 ## Environment variables

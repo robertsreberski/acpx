@@ -427,6 +427,8 @@ function mapOutcomeToStatus(outcome: FlowNodeOutcome): ViewerNodeStatus {
       return "failed";
     case "cancelled":
       return "cancelled";
+    case "incomplete":
+      return "incomplete";
     default:
       return "queued";
   }

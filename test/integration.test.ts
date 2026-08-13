@@ -8,6 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
+import { TurnCompletionTracker } from "../src/runtime/engine/turn-completion.js";
 import {
   createSessionConversation,
   recordPromptSubmission,
@@ -72,6 +73,357 @@ test("integration: exec echo baseline", async () => {
       assert.equal(result.code, 0, result.stderr);
       assert.match(result.stdout, /hello/);
     } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: an empty persistent session can start on an agent without session reuse", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(homeDir, "first-prompt-no-reuse.ndjson");
+    const agentCommand = `${MOCK_AGENT_COMMAND} --call-log ${JSON.stringify(callLog)}`;
+    const agentArgs = ["--agent", agentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+      const createdPayload = JSON.parse(created.stdout.trim()) as { acpxRecordId?: string };
+      const recordId = createdPayload.acpxRecordId;
+      assert.equal(typeof recordId, "string");
+
+      const prompt = await runCli(
+        [...agentArgs, "--format", "quiet", "prompt", "echo first turn"],
+        homeDir,
+      );
+      assert.equal(prompt.code, 0, `${prompt.stdout}${prompt.stderr}`);
+      assert.match(prompt.stdout, /first turn/);
+
+      const calls = await readMockAgentCalls(callLog);
+      const newSessions = calls.filter((call) => call.method === "session/new");
+      assert.equal(newSessions.length, 2);
+      assert.notEqual(newSessions[0]?.sessionId, newSessions[1]?.sessionId);
+      assert.equal(calls.filter((call) => call.method === "session/prompt").length, 1);
+
+      const storedRecord = JSON.parse(
+        await fs.readFile(sessionRecordPath(homeDir, recordId as string), "utf8"),
+      ) as { acpx_record_id?: string; acp_session_id?: string };
+      assert.equal(storedRecord.acpx_record_id, recordId);
+      assert.equal(storedRecord.acp_session_id, newSessions[1]?.sessionId);
+    } finally {
+      await runCli([...agentArgs, "sessions", "close"], homeDir).catch(() => undefined);
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: SIGINT flushes buffered one-shot output", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      for (const format of ["quiet", "text"] as const) {
+        const marker = `partial-before-${format}-interrupt`;
+        const callLog = path.join(homeDir, `interrupt-${format}.ndjson`);
+        const agentCommand = `${MOCK_AGENT_COMMAND} --call-log ${JSON.stringify(callLog)} --ignore-sigterm --close-delay-ms 900`;
+        const child = spawn(
+          process.execPath,
+          [
+            CLI_PATH,
+            "--agent",
+            agentCommand,
+            "--approve-all",
+            "--cwd",
+            cwd,
+            "--format",
+            format,
+            "exec",
+            `stream-sleep 5000 ${marker}`,
+          ],
+          {
+            env: { ...process.env, HOME: homeDir },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        const closePromise = awaitChildClose(child);
+
+        try {
+          await waitFor(async () => {
+            const calls = await readMockAgentCalls(callLog);
+            return calls.some(
+              (call) => call.method === "session/update-sent" && call.text === marker,
+            )
+              ? true
+              : null;
+          }, 5_000);
+          child.kill("SIGINT");
+
+          const result = await Promise.race([
+            closePromise,
+            sleep(10_000).then(() => {
+              throw new Error(`${format} exec did not exit after SIGINT`);
+            }),
+          ]);
+          assert.equal(result.code, 130, `${result.stdout}${result.stderr}`);
+          assert.match(result.stdout, new RegExp(marker));
+          if (format === "text") {
+            assert.match(result.stdout, /\[done\] cancelled/);
+          }
+        } finally {
+          await stopChildProcess(child, 5_000, `${format} interrupted exec`).catch(() => undefined);
+        }
+      }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec reports unresolved compaction as incomplete and discards the session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "exec", "compact-no-final"],
+        homeDir,
+      );
+      assert.equal(result.code, 6, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const incomplete = payloads.find((payload) => payload.method === "_acpx/turn_incomplete") as
+        | { params?: { reason?: string; stopReason?: string } }
+        | undefined;
+      assert.deepEqual(incomplete?.params, {
+        reason: "context_compaction",
+        stopReason: "end_turn",
+      });
+
+      const sessionFiles = await fs
+        .readdir(path.join(homeDir, ".acpx", "sessions"))
+        .catch(() => [] as string[]);
+      assert.deepEqual(sessionFiles, []);
+
+      const limited = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "exec", "compact-no-final-max-tokens"],
+        homeDir,
+      );
+      assert.equal(limited.code, 6, limited.stderr);
+      const limitedIncomplete = parseJsonRpcOutputLines(limited.stdout).find(
+        (payload) => payload.method === "_acpx/turn_incomplete",
+      ) as { params?: { reason?: string; stopReason?: string } } | undefined;
+      assert.deepEqual(limitedIncomplete?.params, {
+        reason: "context_compaction",
+        stopReason: "max_tokens",
+      });
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: incomplete output stays format-safe and a post-compaction final completes", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const textResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "text", "exec", "compact-no-final"],
+        homeDir,
+      );
+      assert.equal(textResult.code, 6, textResult.stderr);
+      assert.match(
+        textResult.stdout,
+        /\[incomplete\] context_compaction .* explicit follow-up required/,
+      );
+      assert.doesNotMatch(textResult.stdout, /\[done\]/);
+
+      const quietResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "exec", "compact-no-final"],
+        homeDir,
+      );
+      assert.equal(quietResult.code, 6, quietResult.stderr);
+      assert.equal(quietResult.stdout.trim(), "");
+      assert.match(
+        quietResult.stderr,
+        /incomplete: context_compaction; no final answer was emitted/,
+      );
+
+      const strictResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "exec", "compact-no-final"],
+        homeDir,
+      );
+      assert.equal(strictResult.code, 6, strictResult.stderr);
+      assert.equal(strictResult.stderr, "");
+      const strictPayloads = parseJsonRpcOutputLines(strictResult.stdout);
+      assert.equal(
+        strictPayloads.some((payload) => payload.method === "_acpx/turn_incomplete"),
+        true,
+      );
+
+      const finalResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "exec", "compact-final"],
+        homeDir,
+      );
+      assert.equal(finalResult.code, 0, finalResult.stderr);
+      assert.equal(finalResult.stdout.trim(), "answer after compaction");
+
+      const lateFinalResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "exec", "compact-late-final"],
+        homeDir,
+      );
+      assert.equal(lateFinalResult.code, 0, lateFinalResult.stderr);
+      assert.equal(lateFinalResult.stdout.trim(), "late answer after compaction");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: persistent prompt keeps the exact session after incomplete compaction", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(cwd, "agent-calls.ndjson");
+    const agentArgs = [
+      "--agent",
+      `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --call-log ${JSON.stringify(callLog)}`,
+      "--approve-all",
+      "--cwd",
+      cwd,
+    ];
+
+    try {
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+
+      const incomplete = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "compact-no-final"],
+        homeDir,
+      );
+      assert.equal(incomplete.code, 6, incomplete.stderr);
+      assert.equal(
+        parseJsonRpcOutputLines(incomplete.stdout).some(
+          (payload) => payload.method === "_acpx/turn_incomplete",
+        ),
+        true,
+      );
+
+      const durableIncomplete = await readSessionStreamNotifications(
+        homeDir,
+        "_acpx/turn_incomplete",
+      );
+      assert.deepEqual(durableIncomplete, [
+        { reason: "context_compaction", stopReason: "end_turn" },
+      ]);
+
+      const followUp = await runCli(
+        [...agentArgs, "--format", "quiet", "prompt", "echo resumed-after-incomplete"],
+        homeDir,
+      );
+      assert.equal(followUp.code, 0, followUp.stderr);
+      assert.equal(followUp.stdout.trim(), "resumed-after-incomplete");
+
+      const calls = await readMockAgentCalls(callLog);
+      const createdSessionId = calls.find((call) => call.method === "session/new")?.sessionId;
+      assert.equal(typeof createdSessionId, "string");
+      const promptCalls = calls.filter((call) => call.method === "session/prompt");
+      assert.deepEqual(
+        promptCalls.map((call) => call.sessionId),
+        [createdSessionId, createdSessionId],
+      );
+      assert.equal(calls.filter((call) => call.method === "session/new").length, 1);
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: replayed compaction from session load does not taint the next prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentArgs = [
+      "--agent",
+      `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --replay-load-session-compaction`,
+      "--approve-all",
+      "--cwd",
+      cwd,
+    ];
+
+    try {
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+
+      const result = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "echo after replay"],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      assert.equal(
+        payloads.some((payload) => payload.method === "_acpx/turn_incomplete"),
+        false,
+      );
+      assert.equal(
+        payloads
+          .flatMap((payload) => extractAgentMessageChunkText(payload) ?? [])
+          .join("")
+          .trim(),
+        "after replay",
+      );
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: no-wait prompt records incomplete compaction durably", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const queued = await runCli(
+        [
+          ...baseAgentArgs(cwd),
+          "--format",
+          "json",
+          "--ttl",
+          "60",
+          "prompt",
+          "--no-wait",
+          "compact-no-final",
+        ],
+        homeDir,
+      );
+      assert.equal(queued.code, 0, queued.stderr);
+      assert.equal(
+        (JSON.parse(queued.stdout.trim()) as { action?: string }).action,
+        "prompt_queued",
+      );
+
+      const notification = await waitFor(async () => {
+        const found = await readSessionStreamNotifications(homeDir, "_acpx/turn_incomplete");
+        return found[0] ?? null;
+      }, 5_000);
+      assert.deepEqual(notification, {
+        reason: "context_compaction",
+        stopReason: "end_turn",
+      });
+    } finally {
+      await runCli([...baseAgentArgs(cwd), "--format", "json", "sessions", "close"], homeDir).catch(
+        () => undefined,
+      );
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
@@ -158,6 +510,366 @@ test("integration: flow run --no-fs disables advertised filesystem capabilities"
         writeTextFile: false,
       });
     } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: unrouted incomplete flow exits with code 6", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-incomplete-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-incomplete-definition-"));
+    const flowPath = path.join(flowDir, "unrouted-incomplete.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { acp, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "unrouted-incomplete",',
+          '  startAt: "compacted",',
+          "  nodes: {",
+          "    compacted: acp({",
+          "      session: { isolated: true },",
+          '      prompt: () => "compact-no-final",',
+          "    }),",
+          "  },",
+          "  edges: [],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "quiet", "flow", "run", flowPath],
+        homeDir,
+      );
+      assert.equal(result.code, 6, result.stderr);
+      assert.match(result.stderr, /incomplete: context_compaction/);
+      assert.doesNotMatch(result.stderr, /\[acpx\] error:/);
+
+      const strictResult = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "flow", "run", flowPath],
+        homeDir,
+      );
+      assert.equal(strictResult.code, 6, strictResult.stderr);
+      assert.equal(strictResult.stderr, "");
+      assert.deepEqual(parseJsonRpcOutputLines(strictResult.stdout).at(-1), {
+        jsonrpc: "2.0",
+        method: "_acpx/turn_incomplete",
+        params: {
+          reason: "context_compaction",
+          stopReason: "end_turn",
+        },
+      });
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: routed incomplete flow stays clean in json-strict mode", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-routed-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-routed-definition-"));
+    const flowPath = path.join(flowDir, "routed-incomplete.flow.ts");
+
+    try {
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { acp, action, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "routed-incomplete",',
+          '  startAt: "compacted",',
+          "  nodes: {",
+          "    compacted: acp({",
+          "      session: { isolated: true },",
+          '      prompt: () => "compact-no-final",',
+          "    }),",
+          "    handled: action({",
+          "      run: ({ results }) => ({ outcome: results.compacted?.outcome }),",
+          "    }),",
+          "  },",
+          "  edges: [{",
+          '    from: "compacted",',
+          '    switch: { on: "$result.outcome", cases: { incomplete: "handled" } },',
+          "  }],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "flow", "run", flowPath],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stderr, "");
+      const payload = JSON.parse(result.stdout.trim()) as {
+        status?: string;
+        outputs?: { handled?: { outcome?: string } };
+      };
+      assert.equal(payload.status, "completed");
+      assert.equal(payload.outputs?.handled?.outcome, "incomplete");
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: permission denial takes precedence over unresolved compaction", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-permission-compaction-cwd-"));
+    const flowDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-permission-compaction-flow-"));
+    const flowPath = path.join(flowDir, "permission-compaction.flow.ts");
+    const denyAgentArgs = ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--deny-all", "--cwd", cwd];
+    const flowAgentArgs = [
+      "--agent",
+      LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+      "--approve-reads",
+      "--cwd",
+      cwd,
+    ];
+
+    try {
+      const quiet = await runCli(
+        [...denyAgentArgs, "--format", "quiet", "exec", "permission-denied-compact"],
+        homeDir,
+      );
+      assert.equal(quiet.code, 5, quiet.stderr);
+      assert.match(quiet.stderr, /\[acpx\] error: PERMISSION_DENIED/);
+      assert.doesNotMatch(quiet.stderr, /\[acpx\] incomplete:/);
+      assert.equal(quiet.stdout, "");
+
+      const strict = await runCli(
+        [
+          ...denyAgentArgs,
+          "--format",
+          "json",
+          "--json-strict",
+          "exec",
+          "permission-denied-compact",
+        ],
+        homeDir,
+      );
+      assert.equal(strict.code, 5, strict.stderr);
+      assert.equal(strict.stderr, "");
+      assert.equal(
+        parseJsonRpcOutputLines(strict.stdout).some(
+          (payload) => payload.method === "_acpx/turn_incomplete",
+        ),
+        false,
+      );
+
+      await fs.writeFile(
+        flowPath,
+        [
+          'import { acp, action, defineFlow } from "acpx/flows";',
+          "",
+          "export default defineFlow({",
+          '  name: "permission-before-compaction",',
+          '  startAt: "approved",',
+          "  nodes: {",
+          "    approved: acp({",
+          '      session: { handle: "shared" },',
+          '      prompt: () => "permission read warmup",',
+          "    }),",
+          "    compacted: acp({",
+          '      session: { handle: "shared" },',
+          '      prompt: () => "permission-denied-compact",',
+          "    }),",
+          "    handled: action({",
+          "      run: ({ results }) => ({ outcome: results.compacted?.outcome }),",
+          "    }),",
+          "  },",
+          "  edges: [",
+          '    { from: "approved", to: "compacted" },',
+          "    {",
+          '      from: "compacted",',
+          '      switch: { on: "$result.outcome", cases: { failed: "handled" } },',
+          "    },",
+          "  ],",
+          "});",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const flow = await runCli(
+        [...flowAgentArgs, "--format", "json", "flow", "run", flowPath],
+        homeDir,
+      );
+      assert.equal(flow.code, 0, flow.stderr);
+      const payload = JSON.parse(flow.stdout.trim()) as {
+        status?: string;
+        outputs?: { handled?: { outcome?: string } };
+      };
+      assert.equal(payload.status, "completed");
+      assert.equal(payload.outputs?.handled?.outcome, "failed");
+    } finally {
+      await fs.rm(flowDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: reused client reports permission stats for each turn", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-permission-delta-cwd-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = homeDir;
+
+    try {
+      const { createSessionWithClient, sendSessionDirect } =
+        await import("../src/session/session.js");
+      const { textPrompt } = await import("../src/prompt-content.js");
+      const outputMethods: string[] = [];
+      const outputFormatter = {
+        setContext: () => {},
+        onAcpMessage: (message: object) => {
+          const method = "method" in message ? message.method : undefined;
+          if (typeof method === "string") {
+            outputMethods.push(method);
+          }
+        },
+        onError: () => {},
+        onPermissionEscalation: () => {},
+        flush: () => {},
+      };
+      const created = await createSessionWithClient({
+        agentCommand: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+        cwd,
+        permissionMode: "approve-reads",
+        timeoutMs: 10_000,
+      });
+
+      try {
+        const send = async (message: string, permissionMode: "approve-reads" | "deny-all") =>
+          await sendSessionDirect({
+            sessionId: created.record.acpxRecordId,
+            prompt: textPrompt(message),
+            permissionMode,
+            outputFormatter,
+            timeoutMs: 10_000,
+            client: created.client,
+          });
+
+        const approved = await send("permission read warmup", "approve-reads");
+        assert.deepEqual(approved.permissionStats, {
+          requested: 1,
+          approved: 1,
+          denied: 0,
+          cancelled: 0,
+        });
+
+        outputMethods.length = 0;
+        const denied = await send("permission-denied-compact", "deny-all");
+        assert.equal(denied.status, "incomplete");
+        assert.deepEqual(denied.permissionStats, {
+          requested: 1,
+          approved: 0,
+          denied: 1,
+          cancelled: 0,
+        });
+        assert.equal(outputMethods.includes("_acpx/turn_incomplete"), false);
+
+        outputMethods.length = 0;
+        const incomplete = await send("compact-no-final", "deny-all");
+        assert.equal(incomplete.status, "incomplete");
+        assert.deepEqual(incomplete.permissionStats, {
+          requested: 0,
+          approved: 0,
+          denied: 0,
+          cancelled: 0,
+        });
+        assert.equal(outputMethods.includes("_acpx/turn_incomplete"), true);
+      } finally {
+        await created.client.close();
+      }
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: SIGINT flushes buffered persistent-session output", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-persistent-interrupt-cwd-"));
+    const previousHome = process.env.HOME;
+    process.env.HOME = homeDir;
+
+    try {
+      const { createSessionWithClient, sendSessionDirect } =
+        await import("../src/session/session.js");
+      const { textPrompt } = await import("../src/prompt-content.js");
+      const marker = "persistent-update-before-interrupt";
+      let flushCalls = 0;
+      let markerObserved = false;
+      let interruptSent = false;
+      const outputFormatter = {
+        setContext: () => {},
+        onAcpMessage: () => {},
+        onError: () => {},
+        onPermissionEscalation: () => {},
+        flush: () => {
+          flushCalls += 1;
+        },
+      };
+      const created = await createSessionWithClient({
+        agentCommand: LOAD_CAPABLE_MOCK_AGENT_COMMAND,
+        cwd,
+        permissionMode: "approve-all",
+        timeoutMs: 10_000,
+      });
+
+      try {
+        const interrupted = sendSessionDirect({
+          sessionId: created.record.acpxRecordId,
+          prompt: textPrompt(`stream-sleep 5000 ${marker}`),
+          permissionMode: "approve-all",
+          outputFormatter,
+          timeoutMs: 10_000,
+          client: created.client,
+          onSessionUpdate: (notification) => {
+            const update = notification.update;
+            const observedText =
+              update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+                ? update.content.text
+                : undefined;
+            if (observedText !== marker || interruptSent) {
+              return;
+            }
+            markerObserved = true;
+            interruptSent = true;
+            process.emit("SIGINT");
+          },
+        });
+
+        await assert.rejects(interrupted, /Interrupted/);
+        assert.equal(markerObserved, true);
+        assert.equal(flushCalls, 1);
+      } finally {
+        await created.client.close();
+      }
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
@@ -2206,7 +2918,7 @@ test("integration: prompt --model updates existing session model before prompt",
 test("integration: status preserves model actually reported after set model", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models --report-model-as fast-model`;
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models --report-model-as fast-model`;
 
     try {
       const created = await runCli(
@@ -2295,7 +3007,7 @@ test("integration: sessions new --model fails when the model config update fails
 test("integration: set model routes through the advertised config option and succeeds", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`;
 
     try {
       // Create session
@@ -2513,7 +3225,7 @@ test("integration: prompt-time legacy model changes do not resurrect cleared eff
 test("integration: set model rejects with clear error on ACP invalid params", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const invalidModelAgentCommand = `${MOCK_AGENT_COMMAND} --set-session-model-invalid-params`;
+    const invalidModelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --set-session-model-invalid-params`;
 
     try {
       // Create session
@@ -2599,7 +3311,7 @@ test("integration: status shows model after session creation with --model", asyn
 test("integration: status shows updated model after set model", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const modelAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-models`;
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models`;
 
     try {
       // Create session with --model
@@ -4291,10 +5003,13 @@ test("integration: config agent command with flags is split correctly and stores
   });
 });
 
-test("integration: prompt recovers when loadSession fails on empty session without emitting load error", async () => {
+test("integration: prompt preserves the exact session when loadSession fails on an empty session", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const flakyLoadAgentCommand = `${MOCK_AGENT_COMMAND} --load-session-fails-on-empty`;
+    const callLog = path.join(cwd, "agent-calls.ndjson");
+    const flakyLoadAgentCommand =
+      `${MOCK_AGENT_COMMAND} --load-session-fails-on-empty ` +
+      `--call-log ${JSON.stringify(callLog)}`;
 
     try {
       const created = await runCli(
@@ -4332,7 +5047,7 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         ],
         homeDir,
       );
-      assert.equal(prompt.code, 0, prompt.stderr);
+      assert.notEqual(prompt.code, 0, prompt.stderr);
 
       const payloads = prompt.stdout
         .trim()
@@ -4341,12 +5056,12 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         .map((line) => JSON.parse(line) as { jsonrpc?: string; result?: { stopReason?: string } });
       assert.equal(
         payloads.some((payload) => Object.hasOwn(payload, "error")),
-        false,
+        true,
         prompt.stdout,
       );
       assert.equal(
         payloads.some((payload) => payload.result?.stopReason === "end_turn"),
-        true,
+        false,
         prompt.stdout,
       );
 
@@ -4361,7 +5076,7 @@ test("integration: prompt recovers when loadSession fails on empty session witho
         messages?: unknown[];
       };
 
-      assert.notEqual(storedRecord.acp_session_id, originalSessionId);
+      assert.equal(storedRecord.acp_session_id, originalSessionId);
       const messages = Array.isArray(storedRecord.messages) ? storedRecord.messages : [];
       assert.equal(
         messages.some(
@@ -4370,10 +5085,14 @@ test("integration: prompt recovers when loadSession fails on empty session witho
             message !== null &&
             "Agent" in (message as Record<string, unknown>),
         ),
-        true,
+        false,
       );
 
-      const closed = await runCli(
+      const calls = await readMockAgentCalls(callLog);
+      assert.equal(calls.filter((call) => call.method === "session/new").length, 1);
+      assert.equal(calls.filter((call) => call.method === "session/prompt").length, 0);
+
+      const fresh = await runCli(
         [
           "--agent",
           flakyLoadAgentCommand,
@@ -4383,11 +5102,19 @@ test("integration: prompt recovers when loadSession fails on empty session witho
           "--format",
           "json",
           "sessions",
-          "close",
+          "new",
         ],
         homeDir,
       );
-      assert.equal(closed.code, 0, closed.stderr);
+      assert.equal(fresh.code, 0, fresh.stderr);
+      const freshSessionId = (JSON.parse(fresh.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof freshSessionId, "string");
+      assert.notEqual(freshSessionId, originalSessionId);
+      assert.equal(
+        (await readMockAgentCalls(callLog)).filter((call) => call.method === "session/new").length,
+        2,
+      );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -4459,10 +5186,13 @@ test("integration: exec retries stop after partial prompt output", async () => {
   });
 });
 
-test("integration: prompt recovers when loadSession returns not found without emitting load error", async () => {
+test("integration: prompt preserves the exact session when loadSession returns not found", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
-    const notFoundLoadAgentCommand = `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-not-found`;
+    const callLog = path.join(cwd, "agent-calls.ndjson");
+    const notFoundLoadAgentCommand =
+      `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-not-found ` +
+      `--call-log ${JSON.stringify(callLog)}`;
 
     try {
       const created = await runCli(
@@ -4500,7 +5230,7 @@ test("integration: prompt recovers when loadSession returns not found without em
         ],
         homeDir,
       );
-      assert.equal(prompt.code, 0, prompt.stderr);
+      assert.notEqual(prompt.code, 0, prompt.stderr);
 
       const payloads = prompt.stdout
         .trim()
@@ -4510,12 +5240,12 @@ test("integration: prompt recovers when loadSession returns not found without em
 
       assert.equal(
         payloads.some((payload) => Object.hasOwn(payload, "error")),
-        false,
+        true,
         prompt.stdout,
       );
       assert.equal(
         payloads.some((payload) => payload.result?.stopReason === "end_turn"),
-        true,
+        false,
         prompt.stdout,
       );
 
@@ -4528,7 +5258,11 @@ test("integration: prompt recovers when loadSession returns not found without em
       const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
         acp_session_id?: string;
       };
-      assert.notEqual(storedRecord.acp_session_id, originalSessionId);
+      assert.equal(storedRecord.acp_session_id, originalSessionId);
+
+      const calls = await readMockAgentCalls(callLog);
+      assert.equal(calls.filter((call) => call.method === "session/new").length, 1);
+      assert.equal(calls.filter((call) => call.method === "session/prompt").length, 0);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -5418,7 +6152,7 @@ test("integration: a mode the rebound adapter refuses is reported instead of pas
 });
 
 function baseAgentArgs(cwd: string): string[] {
-  return ["--agent", MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
+  return ["--agent", LOAD_CAPABLE_MOCK_AGENT_COMMAND, "--approve-all", "--cwd", cwd];
 }
 
 function baseLoadCapableAgentArgs(cwd: string): string[] {
@@ -5743,7 +6477,7 @@ async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise
         'echo %~1 | findstr /B /C:"--max-turns=" >nul && shift & goto shift_known',
         'echo %~1 | findstr /B /C:"--allowed-tools=" >nul && shift & goto shift_known',
         'echo %~1 | findstr /B /C:"--disallowed-tools=" >nul && shift & goto shift_known',
-        `"${process.execPath}" "${MOCK_AGENT_PATH}" %*`,
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" --supports-load-session %*`,
         "",
       ].join("\r\n"),
       { encoding: "utf8" },
@@ -5770,7 +6504,7 @@ async function writeFakeQoderAgent(binDir: string, argLogPath?: string): Promise
       "      ;;",
       "  esac",
       "done",
-      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" --supports-load-session "$@"`,
       "",
     ].join("\n"),
     { encoding: "utf8", mode: 0o755 },
@@ -6399,7 +7133,7 @@ test("runPromptTurn: prompt response usage is recorded after usage update drain"
   });
 });
 
-test("runPromptTurn: late session updates after successful prompt reach the drain", async () => {
+test("runPromptTurn: successful prompt uses the bounded post-response settle window", async () => {
   const observed: string[] = [];
   let lateUpdateEmitted = false;
   const client = {
@@ -6408,8 +7142,6 @@ test("runPromptTurn: late session updates after successful prompt reach the drai
       return { stopReason: "end_turn" as const };
     },
     waitForSessionUpdatesIdle: async (options?: { idleMs?: number; timeoutMs?: number }) => {
-      // Simulate a late assistant_delta / tool_call arriving shortly after prompt resolves.
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
       lateUpdateEmitted = true;
       observed.push(`drain-completed(idle=${options?.idleMs ?? 0})`);
     },
@@ -6428,6 +7160,186 @@ test("runPromptTurn: late session updates after successful prompt reach the drai
   assert.equal(result.source, "rpc");
   assert.equal(lateUpdateEmitted, true, "late session update must be consumed before turn closes");
   assert.deepEqual(observed, ["prompt-resolved", "drain-completed(idle=1000)"]);
+});
+
+test("runPromptTurn: an adaptive drain keeps ordinary one-shot completion short", async () => {
+  const drainIdleMs: number[] = [];
+  const result = await runPromptTurn({
+    client: {
+      prompt: async () => ({ stopReason: "end_turn" as const }),
+      waitForSessionUpdatesIdle: async (options) => {
+        drainIdleMs.push(options?.idleMs ?? 0);
+      },
+    },
+    sessionId: "session-fast-drain",
+    prompt: "hello",
+    completionTracker: new TurnCompletionTracker(),
+    initialDrainIdleMs: 100,
+  });
+
+  assert.deepEqual(drainIdleMs, [100]);
+  assert.deepEqual(result, {
+    status: "completed",
+    stopReason: "end_turn",
+    source: "rpc",
+  });
+});
+
+test("runPromptTurn: an adaptive drain extends after a late compaction marker", async () => {
+  const drainIdleMs: number[] = [];
+  const tracker = new TurnCompletionTracker();
+  const client = {
+    prompt: async () => ({ stopReason: "end_turn" as const }),
+    waitForSessionUpdatesIdle: async (options?: { idleMs?: number; timeoutMs?: number }) => {
+      const idleMs = options?.idleMs ?? 0;
+      drainIdleMs.push(idleMs);
+      if (idleMs >= 100) {
+        tracker.observe({
+          sessionId: "session-compaction-grace",
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "compact-1",
+            status: "completed",
+            _meta: { contextCompaction: true },
+          },
+        });
+      }
+    },
+  };
+
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-compaction-grace",
+    prompt: "hello",
+    completionTracker: tracker,
+    initialDrainIdleMs: 100,
+  });
+
+  assert.deepEqual(drainIdleMs, [100, 1_000]);
+  assert.deepEqual(result, {
+    status: "incomplete",
+    stopReason: "end_turn",
+    reason: "context_compaction",
+    source: "rpc",
+  });
+});
+
+test("runPromptTurn: an adaptive drain accepts a final answer after a late marker", async () => {
+  const drainIdleMs: number[] = [];
+  const tracker = new TurnCompletionTracker();
+  const client = {
+    prompt: async () => ({ stopReason: "end_turn" as const }),
+    waitForSessionUpdatesIdle: async (options?: { idleMs?: number }) => {
+      const idleMs = options?.idleMs ?? 0;
+      drainIdleMs.push(idleMs);
+      if (drainIdleMs.length === 1) {
+        tracker.observe({
+          sessionId: "session-late-compaction-final",
+          update: {
+            sessionUpdate: "tool_call_update" as const,
+            toolCallId: "compact-late-final",
+            status: "completed" as const,
+            _meta: { contextCompaction: true },
+          },
+        });
+      } else {
+        tracker.observe({
+          sessionId: "session-late-compaction-final",
+          update: {
+            sessionUpdate: "agent_message_chunk" as const,
+            content: { type: "text" as const, text: "late final verdict" },
+            _meta: { codex: { phase: "final_answer" } },
+          },
+        });
+      }
+    },
+  };
+
+  const result = await runPromptTurn({
+    client,
+    sessionId: "session-late-compaction-final",
+    prompt: "hello",
+    completionTracker: tracker,
+    initialDrainIdleMs: 100,
+  });
+
+  assert.deepEqual(drainIdleMs, [100, 1_000]);
+  assert.deepEqual(result, {
+    status: "completed",
+    stopReason: "end_turn",
+    source: "rpc",
+  });
+});
+
+test("runPromptTurn: a known compaction goes straight to the full settle window", async () => {
+  const drainIdleMs: number[] = [];
+  const tracker = new TurnCompletionTracker();
+  const client = {
+    prompt: async () => {
+      tracker.observe({
+        sessionId: "session-compaction-final",
+        update: {
+          sessionUpdate: "tool_call_update" as const,
+          toolCallId: "compact-1",
+          status: "completed" as const,
+          _meta: { contextCompaction: true },
+        },
+      });
+      return { stopReason: "end_turn" as const };
+    },
+    waitForSessionUpdatesIdle: async (options?: { idleMs?: number }) => {
+      const idleMs = options?.idleMs ?? 0;
+      drainIdleMs.push(idleMs);
+      if (idleMs >= 1_000) {
+        tracker.observe({
+          sessionId: "session-compaction-final",
+          update: {
+            sessionUpdate: "agent_message_chunk" as const,
+            content: { type: "text" as const, text: "final verdict" },
+            _meta: { codex: { phase: "final_answer" } },
+          },
+        });
+      }
+    },
+  };
+
+  assert.deepEqual(
+    await runPromptTurn({
+      client,
+      sessionId: "session-compaction-final",
+      prompt: "hello",
+      completionTracker: tracker,
+      initialDrainIdleMs: 100,
+    }),
+    { status: "completed", stopReason: "end_turn", source: "rpc" },
+  );
+  assert.deepEqual(drainIdleMs, [1_000]);
+});
+
+test("runPromptTurn: a one-shot timeout does not add an unsalvageable reply drain", async () => {
+  const drainIdleMs: number[] = [];
+  const tracker = new TurnCompletionTracker();
+
+  await assert.rejects(
+    async () =>
+      await runPromptTurn({
+        client: {
+          prompt: async () => await new Promise<never>(() => {}),
+          waitForSessionUpdatesIdle: async (options) => {
+            drainIdleMs.push(options?.idleMs ?? 0);
+          },
+        },
+        sessionId: "session-one-shot-timeout",
+        prompt: "hello",
+        timeoutMs: 1,
+        completionTracker: tracker,
+        initialDrainIdleMs: 100,
+      }),
+    /Timed out after 1ms/,
+  );
+
+  assert.deepEqual(drainIdleMs, []);
+  assert.equal(tracker.hasUnansweredCompaction(), false);
 });
 
 test("runPromptTurn: missing waitForSessionUpdatesIdle still returns cleanly on success", async () => {
