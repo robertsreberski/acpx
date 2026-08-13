@@ -933,23 +933,20 @@ class SessionService implements AcpxSessionService {
     limit?: number;
   }): Promise<AcpxTranscriptPage> {
     const record = await this.requireExactRecord(input.acpxRecordId);
-    let legacyImportPending = false;
-    const liveOwner = await readLiveQueueOwner(record.acpxRecordId);
-    const legacyOwnerCanAppend = liveOwner !== undefined && !queueOwnerWritesTimeline(liveOwner);
-    if (
-      record.timeline?.legacy_import_complete !== true ||
-      legacyOwnerCanAppend ||
-      (!record.timeline && record.lastSeq > 0)
-    ) {
-      // Retained pre-ledger traffic used to appear only after the next prompt,
-      // because prompt execution was the first path that opened a timeline
-      // writer. Scan it on every transcript read: a warm pre-ledger owner can
-      // append more compatibility traffic after an earlier scan completed.
-      legacyImportPending = await SessionTimelineWriter.refreshLegacyCompatibility(
-        record.acpxRecordId,
-        { legacyOwnerCanAppend },
-      );
-    }
+    // Retained pre-ledger traffic used to appear only after the next prompt,
+    // because prompt execution was the first path that opened a timeline
+    // writer. Admission and owner capability are resolved inside the timeline
+    // lock so an old-to-modern handoff cannot turn a stale legacy decision into
+    // a duplicate import of the modern writer's compatibility copy.
+    const legacyImportPending = await SessionTimelineWriter.refreshLegacyCompatibility(
+      record.acpxRecordId,
+      {
+        legacyOwnerCanAppend: async () => {
+          const liveOwner = await readLiveQueueOwner(record.acpxRecordId);
+          return liveOwner !== undefined && !queueOwnerWritesTimeline(liveOwner);
+        },
+      },
+    );
     const page = await listSessionTimelinePage(input.acpxRecordId, {
       before: input.before,
       limit: input.limit,

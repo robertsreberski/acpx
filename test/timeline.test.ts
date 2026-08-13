@@ -876,6 +876,53 @@ test("an unlink failure cannot poison the in-process timeline lock queue", async
   });
 });
 
+test("a stale legacy-owner observation cannot duplicate a modern compatibility twin", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-stale-legacy-owner", cwd);
+    const legacy = updateMessage(record.acpSessionId, "legacy");
+    const modern = updateMessage(record.acpSessionId, "modern");
+    record.lastSeq = 1;
+    record.eventLog.last_write_at = "2026-08-12T10:00:00.000Z";
+    await writeSessionRecord(record);
+    await fs.writeFile(
+      sessionEventActivePath(record.acpxRecordId),
+      `${JSON.stringify(legacy)}\n`,
+      "utf8",
+    );
+    await SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId, {
+      legacyOwnerCanAppend: () => true,
+    });
+
+    const writer = await SessionEventWriter.open(await resolveSessionRecord(record.acpxRecordId));
+    await writer.appendMessage(modern);
+    await writer.close({ checkpoint: true });
+
+    // The service may have decided to refresh while the old owner was still
+    // visible, but the callback is evaluated only now, under the timeline
+    // lock. It sees the modern owner and the completed metadata, so it skips.
+    let capabilityChecks = 0;
+    assert.equal(
+      await SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId, {
+        legacyOwnerCanAppend: () => {
+          capabilityChecks += 1;
+          return false;
+        },
+      }),
+      false,
+    );
+    assert.equal(capabilityChecks, 1);
+    const page = await listSessionTimelinePage(record.acpxRecordId, { limit: 20 });
+    assert.deepEqual(
+      page.items.flatMap((item) =>
+        "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+      ),
+      [legacy, modern],
+    );
+  });
+});
+
 test("live writer locks never become stale merely because a turn is old", async () => {
   await withTempHome(async (homeDir) => {
     const keeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {

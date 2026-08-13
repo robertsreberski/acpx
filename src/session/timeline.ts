@@ -819,13 +819,25 @@ export class SessionTimelineWriter {
 
   static async refreshLegacyCompatibility(
     sessionId: string,
-    options: { legacyOwnerCanAppend?: boolean } = {},
+    options: { legacyOwnerCanAppend?: () => boolean | Promise<boolean> } = {},
   ): Promise<boolean> {
     return await withSessionTimelineLock(sessionId, async () => {
       const record = await resolveSessionRecord(sessionId);
+      // Capability is sampled only after taking the timeline lock. A value
+      // captured by the caller before waiting here can become stale while a
+      // modern owner takes over and appends an authoritative event plus its
+      // compatibility twin, causing that twin to be imported a second time.
+      const legacyOwnerCanAppend = (await options.legacyOwnerCanAppend?.()) === true;
+      if (
+        record.timeline?.legacy_import_complete === true &&
+        !legacyOwnerCanAppend &&
+        (record.timeline !== undefined || record.lastSeq === 0)
+      ) {
+        return false;
+      }
       const writer = await SessionTimelineWriter.openWhileLocked(record);
       const pending = await writer.importLegacyCompatibilityMessagesBounded();
-      if (options.legacyOwnerCanAppend === true) {
+      if (legacyOwnerCanAppend) {
         // A caught-up legacy stream is only a snapshot while its owner lives.
         // Persist the need for one final scan so an owner that appends and then
         // exits cannot strand its suffix forever. The next no-owner read or a
