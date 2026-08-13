@@ -368,14 +368,21 @@ test("agent and provider inventories require and retain one canonical workspace 
     });
     assert.deepEqual(agentCwds, [project]);
 
+    for (const path of ["/api/v1/agents", "/api/v1/agents/codex/sessions"]) {
+      const response = await fetch(`${running.origin}${path}`);
+      assert.equal(response.status, 400, path);
+    }
+
+    // A directory outside the configured roots is still refused, but now as an
+    // unauthorized workspace rather than malformed input, so the console can
+    // offer to authorize it instead of presenting a dead validation error.
     for (const path of [
-      "/api/v1/agents",
       `/api/v1/agents?cwd=${encodeURIComponent(escape)}`,
-      "/api/v1/agents/codex/sessions",
       `/api/v1/agents/codex/sessions?cwd=${encodeURIComponent(escape)}`,
     ]) {
       const response = await fetch(`${running.origin}${path}`);
-      assert.equal(response.status, 400, path);
+      assert.equal(response.status, 403, path);
+      assert.equal((await response.json()).error.code, "WORKSPACE_NOT_AUTHORIZED", path);
     }
 
     const provider = await fetch(

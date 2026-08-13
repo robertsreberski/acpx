@@ -412,6 +412,6 @@ export async function assertRetainedWorkspaceAllowed(
 }
 
 export class ConsoleInputError extends Error {
-  readonly statusCode = 400;
-  readonly code = "INVALID_INPUT";
+  readonly statusCode: number = 400;
+  readonly code: string = "INVALID_INPUT";
 }

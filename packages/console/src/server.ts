@@ -7,7 +7,6 @@ import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import {
   assertRetainedWorkspaceAllowed,
-  assertWorkspaceAllowed,
   consoleDisplayHost,
   ConsoleInputError,
   type ResolvedConsoleConfig,
@@ -32,6 +31,12 @@ import {
   requiredString,
 } from "./security.js";
 import { writeSseFrameOrDisconnect } from "./sse.js";
+import {
+  assertWorkspaceUsable,
+  canonicalDirectory,
+  suggestWorkspaces,
+  writeWorkspaceGrant,
+} from "./workspace-authorization.js";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const SSE_REPLAY_LIMIT = 512;
@@ -361,7 +366,14 @@ async function canonicalAllowedWorkspace(
       config.stateDir,
     );
   } catch {
-    return undefined;
+    // A session started in an operator-authorized directory sits outside the
+    // configured roots by design. Without this it would be created and then
+    // immediately filtered out of every read.
+    try {
+      return await assertWorkspaceUsable(cwd, config.workspaceRoots, config.stateDir);
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -394,7 +406,6 @@ async function requireAllowedSession(
 async function scopedProviderSessions(
   sessions: ProviderSession[],
   cwd: string,
-  config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
 ): Promise<ProviderSession[]> {
   const canonical = await Promise.all(
     sessions.map(async (session) => {
@@ -402,7 +413,8 @@ async function scopedProviderSessions(
         return undefined;
       }
       try {
-        return await assertWorkspaceAllowed(session.cwd, config.workspaceRoots);
+        // Canonicalized for comparison only; `cwd` is already authorized.
+        return await canonicalDirectory(session.cwd);
       } catch {
         return undefined;
       }
@@ -474,12 +486,36 @@ async function handleApi(
     });
     return true;
   }
+  if (method === "GET" && path === "/api/v1/workspaces/suggestions") {
+    sendJson(response, 200, {
+      suggestions: await suggestWorkspaces(
+        url.searchParams.get("prefix") ?? "",
+        context.config.workspaceRoots,
+        context.config.stateDir,
+      ),
+    });
+    return true;
+  }
+  if (method === "POST" && path === "/api/v1/workspaces/authorizations") {
+    // Authorizing a workspace widens what this console can reach, so it is a
+    // CSRF-checked mutation and the grant is recorded against the canonical
+    // path rather than the text the operator typed.
+    const body = await readJsonBody(request);
+    const canonical = await canonicalDirectory(requiredString(body, "path"));
+    await writeWorkspaceGrant(context.config.stateDir, canonical);
+    sendJson(response, 201, { path: canonical });
+    return true;
+  }
   if (method === "GET" && path === "/api/v1/agents") {
     const cwdParam = url.searchParams.get("cwd");
     if (!cwdParam) {
       throw new ConsoleInputError("Agent inventory requires an explicit cwd");
     }
-    const cwd = await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots);
+    const cwd = await assertWorkspaceUsable(
+      cwdParam,
+      context.config.workspaceRoots,
+      context.config.stateDir,
+    );
     sendJson(response, 200, { agents: await context.service.listAgents({ cwd }) });
     return true;
   }
@@ -492,9 +528,10 @@ async function handleApi(
         "ACPX Console only accepts the defer-risky permission policy",
       );
     }
-    const cwd = await assertWorkspaceAllowed(
+    const cwd = await assertWorkspaceUsable(
       requiredString(body, "cwd"),
       context.config.workspaceRoots,
+      context.config.stateDir,
     );
     const session = await context.service.createSession({
       agentId: requiredString(body, "agentId"),
@@ -515,9 +552,10 @@ async function handleApi(
   }
   if (method === "POST" && path === "/api/v1/sessions/adopt") {
     const body = await readJsonBody(request);
-    const cwd = await assertWorkspaceAllowed(
+    const cwd = await assertWorkspaceUsable(
       requiredString(body, "cwd"),
       context.config.workspaceRoots,
+      context.config.stateDir,
     );
     const session = await context.service.adoptSession({
       agentId: requiredString(body, "agentId"),
@@ -542,7 +580,11 @@ async function handleApi(
     if (!cwdParam) {
       throw new ConsoleInputError("Provider session inventory requires an explicit cwd");
     }
-    const cwd = await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots);
+    const cwd = await assertWorkspaceUsable(
+      cwdParam,
+      context.config.workspaceRoots,
+      context.config.stateDir,
+    );
     const client = request.socket.remoteAddress ?? "unknown";
     const page = await context.providerEnumerationLimiter.run(
       client,
@@ -555,7 +597,7 @@ async function handleApi(
     );
     sendJson(response, 200, {
       ...page,
-      sessions: await scopedProviderSessions(page.sessions, cwd, context.config),
+      sessions: await scopedProviderSessions(page.sessions, cwd),
     });
     return true;
   }

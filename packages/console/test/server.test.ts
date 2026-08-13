@@ -468,7 +468,33 @@ test("session creation enforces the configured real workspace boundary", async (
       headers: mutationHeaders(auth),
       body: JSON.stringify({ agentId: "codex", cwd: outside }),
     });
-    assert.equal(denied.status, 400);
+    assert.equal(denied.status, 403);
+    assert.equal(
+      ((await denied.json()) as { error: { code: string } }).error.code,
+      "WORKSPACE_NOT_AUTHORIZED",
+    );
+
+    // The refusal lifts only for the exact directory the operator authorized.
+    const authorized = await fetch(`${running.origin}/api/v1/workspaces/authorizations`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "request-authorize"),
+      body: JSON.stringify({ path: outside }),
+    });
+    assert.equal(authorized.status, 201);
+    const nowAllowed = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "request-authorized-create"),
+      body: JSON.stringify({ agentId: "codex", cwd: outside }),
+    });
+    assert.equal(nowAllowed.status, 201);
+
+    const stillDenied = await fetch(`${running.origin}/api/v1/sessions`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "request-sibling"),
+      body: JSON.stringify({ agentId: "codex", cwd: tmpdir() }),
+    });
+    assert.equal(stillDenied.status, 403);
+
     const allowed = await fetch(`${running.origin}/api/v1/sessions`, {
       method: "POST",
       headers: mutationHeaders(auth, "request-67890"),
