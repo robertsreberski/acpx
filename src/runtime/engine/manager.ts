@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { normalizeAgentCommandInput } from "../../acp/client-process.js";
 import { AcpClient } from "../../acp/client.js";
+import { effortStateFromConfigOptions } from "../../acp/effort-support.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { modelStateFromConfigOptions } from "../../acp/model-support.js";
@@ -24,15 +25,19 @@ import { defaultSessionEventLog } from "../../session/event-log.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
 import {
   clearDesiredConfigOption,
+  reconcileDesiredEffortForModelChange,
   setCurrentModelId,
   setDesiredConfigOption,
+  setDesiredEffort,
   setDesiredModelId,
   setDesiredModeId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
 import {
-  applyRequestedModelIfAdvertised,
+  applyRequestedModelAndEffortIfAdvertised,
+  clearDesiredEffortAfterUnrefreshedModelChange,
   currentModelIdFromSetModelResponse,
+  reapplyDesiredEffortAfterModelChange,
 } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import type {
@@ -461,6 +466,56 @@ type CreatedRuntimeSession = {
     | Awaited<ReturnType<AcpClient["loadSession"]>>;
 };
 
+async function applyRuntimeCreationPreferences(params: {
+  client: AcpClient;
+  record: SessionRecord;
+  session: CreatedRuntimeSession;
+  sessionOptions: SessionAgentOptions | undefined;
+  agentCommand: string;
+  timeoutMs: number | undefined;
+}): Promise<void> {
+  const application = await applyRequestedModelAndEffortIfAdvertised({
+    client: params.client,
+    sessionId: params.session.sessionId,
+    requestedModel: params.sessionOptions?.model,
+    requestedEffort: params.sessionOptions?.effort,
+    models: params.session.sessionResult.models,
+    configOptions: params.session.sessionResult.configOptions,
+    agentCommand: params.agentCommand,
+    timeoutMs: params.timeoutMs,
+  });
+  applyRuntimeCreationPreferenceState(params, application);
+}
+
+function applyRuntimeCreationPreferenceState(
+  params: Pick<
+    Parameters<typeof applyRuntimeCreationPreferences>[0],
+    "record" | "session" | "sessionOptions"
+  >,
+  application: Awaited<ReturnType<typeof applyRequestedModelAndEffortIfAdvertised>>,
+): void {
+  applyConfigOptionsToRecord(params.record, application.model.response);
+  applyConfigOptionsToRecord(params.record, application.effort.response);
+  const latestConfigResponse = application.effort.response ?? application.model.response;
+  syncAdvertisedModelState(
+    params.record,
+    latestConfigResponse
+      ? (modelStateFromConfigOptions(latestConfigResponse.configOptions) ??
+          params.session.sessionResult.models)
+      : params.session.sessionResult.models,
+  );
+  if (application.model.applied) {
+    setCurrentModelId(
+      params.record,
+      currentModelIdFromSetModelResponse(application.model.response, params.sessionOptions?.model),
+    );
+  }
+  persistSessionOptions(params.record, params.sessionOptions);
+  if (application.effort.applied) {
+    setDesiredEffort(params.record, params.sessionOptions?.effort, application.effort.configId);
+  }
+}
+
 type RuntimeTurnTaskState = {
   pendingCancel: boolean;
   turnActive: boolean;
@@ -516,11 +571,18 @@ function applyDesiredConfigOptionToTurn(
 ): void {
   const nextState = cloneSessionAcpxState(turn.acpxState) ?? {};
   const modelConfigId = modelStateFromConfigOptions(nextState.config_options)?.configId;
+  const effortConfigId = effortStateFromConfigOptions(nextState.config_options)?.configId;
   if (configId === modelConfigId) {
     nextState.session_options = { ...nextState.session_options, model: value };
     clearDesiredConfigOption(nextState, configId);
   } else if (configId === "mode") {
     nextState.desired_mode_id = value;
+  } else if (configId === effortConfigId) {
+    nextState.session_options = { ...nextState.session_options, effort: value };
+    nextState.desired_config_options = {
+      ...nextState.desired_config_options,
+      [configId]: value,
+    };
   } else {
     nextState.desired_config_options = {
       ...nextState.desired_config_options,
@@ -536,10 +598,13 @@ function applyDesiredConfigOptionToRecord(
   value: string,
 ): void {
   const modelConfigId = modelStateFromConfigOptions(record.acpx?.config_options)?.configId;
+  const effortConfigId = effortStateFromConfigOptions(record.acpx?.config_options)?.configId;
   if (configId === modelConfigId) {
     setDesiredModelId(record, value, configId);
   } else if (configId === "mode") {
     setDesiredModeId(record, value);
+  } else if (configId === effortConfigId) {
+    setDesiredEffort(record, value, configId);
   } else {
     setDesiredConfigOption(record, configId, value);
   }
@@ -790,29 +855,15 @@ export class AcpRuntimeManager {
     record.protocolVersion = client.initializeResult?.protocolVersion;
     record.agentCapabilities = client.initializeResult?.agentCapabilities;
     applyConfigOptionsToRecord(record, session.sessionResult);
-    const modelApplication = await applyRequestedModelIfAdvertised({
+    await applyRuntimeCreationPreferences({
       client,
-      sessionId: session.sessionId,
-      requestedModel: input.sessionOptions?.model,
-      models: session.sessionResult.models,
+      record,
+      session,
+      sessionOptions: input.sessionOptions,
       agentCommand,
       timeoutMs: this.options.timeoutMs,
     });
-    applyConfigOptionsToRecord(record, modelApplication.response);
-    syncAdvertisedModelState(
-      record,
-      modelApplication.response
-        ? modelStateFromConfigOptions(modelApplication.response.configOptions)
-        : session.sessionResult.models,
-    );
-    if (modelApplication.applied) {
-      setCurrentModelId(
-        record,
-        currentModelIdFromSetModelResponse(modelApplication.response, input.sessionOptions?.model),
-      );
-    }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
-    persistSessionOptions(record, input.sessionOptions);
     await this.options.sessionStore.save(record);
     return record;
   }
@@ -1046,6 +1097,7 @@ export class AcpRuntimeManager {
       },
       setSessionModel: async (modelId: string) => {
         await this.waitForRuntimeControlSession(task, turn);
+        const previousState = cloneSessionAcpxState(turn.acpxState);
         const models = advertisedModelState(turn.acpxState);
         const response = await turn.client.setSessionModel(turn.activeSessionId, modelId, models);
         applyConfigOptionResponseToTurn(turn, response);
@@ -1054,7 +1106,30 @@ export class AcpRuntimeManager {
         nextState.current_model_id = currentModelIdFromSetModelResponse(response, modelId);
         clearDesiredConfigOption(nextState, models?.configId);
         turn.acpxState = nextState;
-        return response;
+        if (!response) {
+          turn.acpxState = clearDesiredEffortAfterUnrefreshedModelChange({
+            state: turn.acpxState,
+            modelResponse: response,
+            previousModelId: models?.currentModelId,
+            requestedModelId: modelId,
+            previousEffortConfigId: effortStateFromConfigOptions(previousState?.config_options)
+              ?.configId,
+          });
+          return response;
+        }
+        const effort = await reapplyDesiredEffortAfterModelChange({
+          client: turn.client,
+          sessionId: turn.activeSessionId,
+          previousState,
+          nextState: turn.acpxState,
+          timeoutMs: this.options.timeoutMs,
+          onReconciledState: async (state) => {
+            turn.acpxState = state;
+            await turn.liveCheckpoint.checkpoint();
+          },
+        });
+        turn.acpxState = effort.state;
+        return effort.response ?? response;
       },
       setSessionConfigOption: async (configId: string, value: string) => {
         const result = await task.state.activeController!.setResolvedSessionConfigOption(
@@ -1109,13 +1184,30 @@ export class AcpRuntimeManager {
       },
       configId,
     );
+    const previousState = cloneSessionAcpxState(turn.acpxState);
+    const modelConfigId = advertisedModelState(previousState)?.configId;
     const response = await turn.client.setSessionConfigOption(
       turn.activeSessionId,
       resolvedConfigId,
       value,
     );
     this.applyRuntimeConfigOptionState(turn, resolvedConfigId, value, response);
-    return { configId: resolvedConfigId, response };
+    if (resolvedConfigId !== modelConfigId) {
+      return { configId: resolvedConfigId, response };
+    }
+    const effort = await reapplyDesiredEffortAfterModelChange({
+      client: turn.client,
+      sessionId: turn.activeSessionId,
+      previousState,
+      nextState: turn.acpxState,
+      timeoutMs: this.options.timeoutMs,
+      onReconciledState: async (state) => {
+        turn.acpxState = state;
+        await turn.liveCheckpoint.checkpoint();
+      },
+    });
+    turn.acpxState = effort.state;
+    return { configId: resolvedConfigId, response: effort.response ?? response };
   }
 
   private applyRuntimeConfigOptionState(
@@ -1428,9 +1520,14 @@ export class AcpRuntimeManager {
     const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
     const controller = this.activeControllers.get(record.acpxRecordId);
     if (controller) {
+      const previousState = cloneSessionAcpxState(record.acpx);
+      const modelConfigId = advertisedModelState(previousState)?.configId;
       const { configId, response } = await controller.setResolvedSessionConfigOption(key, value);
       applyConfigOptionsToRecord(record, response);
       applyDesiredConfigOptionToRecord(record, configId, value);
+      if (configId === modelConfigId) {
+        record.acpx = reconcileDesiredEffortForModelChange(previousState, record.acpx).state;
+      }
       await this.options.sessionStore.save(record);
       return;
     }
@@ -1439,10 +1536,25 @@ export class AcpRuntimeManager {
       record,
       sessionMode,
       async ({ client, sessionId, record: connectedRecord }) => {
+        const previousState = cloneSessionAcpxState(connectedRecord.acpx);
         const configId = resolveSupportedConfigOptionId(connectedRecord, key);
+        const modelConfigId = advertisedModelState(previousState)?.configId;
         const response = await client.setSessionConfigOption(sessionId, configId, value);
         applyConfigOptionsToRecord(connectedRecord, response);
         applyDesiredConfigOptionToRecord(connectedRecord, configId, value);
+        if (configId === modelConfigId) {
+          const effort = await reapplyDesiredEffortAfterModelChange({
+            client,
+            sessionId,
+            previousState,
+            nextState: connectedRecord.acpx,
+            timeoutMs: this.options.timeoutMs,
+            onReconciledState: (state) => {
+              connectedRecord.acpx = state;
+            },
+          });
+          connectedRecord.acpx = effort.state;
+        }
       },
     );
     await this.options.sessionStore.save(result.record);

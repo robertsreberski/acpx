@@ -4,6 +4,7 @@ export type SystemPromptOption = string | { append: string };
 
 export type SessionAgentOptions = {
   model?: string;
+  effort?: string;
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
@@ -24,12 +25,20 @@ export function mergeSessionOptions(
   fallback: SessionAgentOptions | undefined,
 ): SessionAgentOptions | undefined {
   const merged: SessionAgentOptions = { ...fallback };
-  assignDefinedOption(merged, "model", preferred?.model);
-  assignDefinedOption(merged, "allowedTools", preferred?.allowedTools);
-  assignDefinedOption(merged, "maxTurns", preferred?.maxTurns);
-  assignDefinedOption(merged, "systemPrompt", preferred?.systemPrompt);
+  assignPreferredSessionOptions(merged, preferred);
   assignDefinedOption(merged, "env", mergeEnvRecords(fallback?.env, preferred?.env));
   return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function assignPreferredSessionOptions(
+  target: SessionAgentOptions,
+  preferred: SessionAgentOptions | undefined,
+): void {
+  assignDefinedOption(target, "model", preferred?.model);
+  assignDefinedOption(target, "effort", preferred?.effort);
+  assignDefinedOption(target, "allowedTools", preferred?.allowedTools);
+  assignDefinedOption(target, "maxTurns", preferred?.maxTurns);
+  assignDefinedOption(target, "systemPrompt", preferred?.systemPrompt);
 }
 
 function mergeEnvRecords(
@@ -80,6 +89,7 @@ export function sessionOptionsFromRecord(record: SessionRecord): SessionAgentOpt
 
   const sessionOptions: SessionAgentOptions = {};
   assignStoredOption(sessionOptions, "model", nonEmptyString(stored.model));
+  assignStoredOption(sessionOptions, "effort", nonEmptyString(stored.effort));
   assignStoredOption(sessionOptions, "allowedTools", storedAllowedTools(stored.allowed_tools));
   assignStoredOption(sessionOptions, "maxTurns", storedMaxTurns(stored.max_turns));
   assignStoredOption(
@@ -99,6 +109,9 @@ function persistedSessionOptions(
 ): PersistedSessionOptions | undefined {
   const next = {
     model: nonEmptyString(options.model),
+    ...(nonEmptyString(options.effort) !== undefined
+      ? { effort: nonEmptyString(options.effort) }
+      : {}),
     allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : undefined,
     max_turns: typeof options.maxTurns === "number" ? options.maxTurns : undefined,
     system_prompt: normalizeSystemPromptOption(options.systemPrompt),
@@ -110,6 +123,7 @@ function persistedSessionOptions(
 function hasPersistedSessionOptions(options: PersistedSessionOptions): boolean {
   return (
     options.model !== undefined ||
+    options.effort !== undefined ||
     options.allowed_tools !== undefined ||
     options.max_turns !== undefined ||
     options.system_prompt !== undefined ||

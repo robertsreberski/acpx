@@ -74,6 +74,15 @@ export type QueueSetModelRequest = {
   timeoutMs?: number;
 };
 
+export type QueueApplySessionPreferencesRequest = {
+  type: "apply_session_preferences";
+  requestId: string;
+  ownerGeneration?: number;
+  modelId?: string;
+  effort: string;
+  timeoutMs?: number;
+};
+
 export type QueueSetConfigOptionRequest = {
   type: "set_config_option";
   requestId: string;
@@ -111,6 +120,7 @@ export type QueueRequest =
   | QueueCancelRequest
   | QueueSetModeRequest
   | QueueSetModelRequest
+  | QueueApplySessionPreferencesRequest
   | QueueSetConfigOptionRequest
   | QueueCloseSessionRequest
   | QueueListRequestsRequest
@@ -165,6 +175,16 @@ export type QueueOwnerSetModelResultMessage = {
   response?: SetSessionConfigOptionResponse;
 };
 
+export type QueueOwnerApplySessionPreferencesResultMessage = {
+  type: "apply_session_preferences_result";
+  requestId: string;
+  ownerGeneration?: number;
+  modelId?: string;
+  effort: string;
+  effortConfigId: string;
+  response: SetSessionConfigOptionResponse;
+};
+
 export type QueueOwnerSetConfigOptionResultMessage = {
   type: "set_config_option_result";
   requestId: string;
@@ -215,6 +235,7 @@ export type QueueOwnerMessage =
   | QueueOwnerCancelResultMessage
   | QueueOwnerSetModeResultMessage
   | QueueOwnerSetModelResultMessage
+  | QueueOwnerApplySessionPreferencesResultMessage
   | QueueOwnerSetConfigOptionResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerListRequestsResultMessage
@@ -340,7 +361,7 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   }
 
   const sessionOptions: QueueSessionOptions = {};
-  if (!assignSessionModel(sessionOptions, record.model)) {
+  if (!assignSessionSelectionOptions(sessionOptions, record)) {
     return null;
   }
   if (!assignSessionAllowedTools(sessionOptions, record.allowedTools)) {
@@ -359,6 +380,15 @@ function parseSessionOptions(value: unknown): QueueSessionOptions | null | undef
   return sessionOptions;
 }
 
+function assignSessionSelectionOptions(
+  options: QueueSessionOptions,
+  record: Record<string, unknown>,
+): boolean {
+  const modelValid = assignSessionModel(options, record.model);
+  const effortValid = assignSessionEffort(options, record.effort);
+  return modelValid && effortValid;
+}
+
 function assignSessionModel(options: QueueSessionOptions, value: unknown): boolean {
   if (value == null) {
     return true;
@@ -367,6 +397,17 @@ function assignSessionModel(options: QueueSessionOptions, value: unknown): boole
     return false;
   }
   options.model = value;
+  return true;
+}
+
+function assignSessionEffort(options: QueueSessionOptions, value: unknown): boolean {
+  if (value == null) {
+    return true;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+  options.effort = value;
   return true;
 }
 
@@ -505,6 +546,8 @@ function parseTypedQueueRequest(
       return parseStringFieldRequest(request, context, "set_mode", "modeId");
     case "set_model":
       return parseStringFieldRequest(request, context, "set_model", "modelId");
+    case "apply_session_preferences":
+      return parseApplySessionPreferencesRequest(request, context);
     case "set_config_option":
       return parseSetConfigOptionRequest(request, context);
     default:
@@ -661,11 +704,35 @@ function parseSetConfigOptionRequest(
   return { type: "set_config_option", ...context, configId, value };
 }
 
+function parseApplySessionPreferencesRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueApplySessionPreferencesRequest | null {
+  const effort = parseNonEmptyString(request.effort);
+  const modelId = request.modelId === undefined ? undefined : parseNonEmptyString(request.modelId);
+  if (!effort || (request.modelId !== undefined && !modelId)) {
+    return null;
+  }
+  return {
+    type: "apply_session_preferences",
+    ...context,
+    ...(modelId ? { modelId } : {}),
+    effort,
+  };
+}
+
 function parseNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string" || value.trim().length === 0) {
     return null;
   }
   return value;
+}
+
+function parseOptionalNonEmptyString(value: unknown): string | undefined | null {
+  if (value === undefined) {
+    return undefined;
+  }
+  return parseNonEmptyString(value);
 }
 
 function parseSessionSendResult(raw: unknown): SessionSendResult | null {
@@ -776,6 +843,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_mode_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_mode_result", "modeId"),
   set_model_result: parseSetModelOwnerMessage,
+  apply_session_preferences_result: parseApplySessionPreferencesOwnerMessage,
   set_config_option_result: parseSetConfigOptionOwnerMessage,
   list_requests_result: parseListRequestsOwnerMessage,
   respond_request_result: parseRespondResultOwnerMessage,
@@ -879,6 +947,34 @@ function parseSetConfigOptionOwnerMessage(
   return {
     type: "set_config_option_result",
     ...context,
+    response: response as SetSessionConfigOptionResponse,
+  };
+}
+
+function parseApplySessionPreferencesOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerApplySessionPreferencesResultMessage | null {
+  const modelId = parseOptionalNonEmptyString(message.modelId);
+  const effort = parseNonEmptyString(message.effort);
+  const effortConfigId = parseNonEmptyString(message.effortConfigId);
+  const response = asRecord(message.response);
+  const validFields = [
+    modelId !== null,
+    effort !== null,
+    effortConfigId !== null,
+    response !== undefined,
+    Array.isArray(response?.configOptions),
+  ];
+  if (validFields.includes(false)) {
+    return null;
+  }
+  return {
+    type: "apply_session_preferences_result",
+    ...context,
+    ...(modelId ? { modelId } : {}),
+    effort: effort as string,
+    effortConfigId: effortConfigId as string,
     response: response as SetSessionConfigOptionResponse,
   };
 }

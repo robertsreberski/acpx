@@ -24,6 +24,7 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
     let closeSessionCalls = 0;
     const modes: string[] = [];
     const configRequests: Array<{ id: string; value: string }> = [];
+    const preferenceRequests: Array<{ modelId?: string; effort: string }> = [];
 
     const owner = await SessionQueueOwner.start(lease, {
       ...noParkedRequestControlHandlers,
@@ -45,6 +46,13 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
         configRequests.push({ id: configId, value });
         return {
           configOptions: [],
+        };
+      },
+      applySessionPreferences: async (modelId, effort) => {
+        preferenceRequests.push({ ...(modelId ? { modelId } : {}), effort });
+        return {
+          effortConfigId: "reasoning_effort",
+          response: { configOptions: [] },
         };
       },
     });
@@ -117,6 +125,40 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
       configLines.close();
       configSocket.destroy();
 
+      const preferenceSocket = await connectSocket(lease.socketPath);
+      const preferenceLines = readline.createInterface({ input: preferenceSocket });
+      const preferenceIterator = preferenceLines[Symbol.asyncIterator]();
+      preferenceSocket.write(
+        `${JSON.stringify({
+          type: "apply_session_preferences",
+          requestId: "req-preferences",
+          modelId: "smart-model",
+          effort: "xhigh",
+          timeoutMs: 250,
+        })}\n`,
+      );
+
+      const preferenceAccepted = (await nextJsonLine(preferenceIterator)) as { type: string };
+      const preferenceResult = (await nextJsonLine(preferenceIterator)) as {
+        type: string;
+        modelId?: string;
+        effort: string;
+        effortConfigId: string;
+        response: { configOptions: unknown[] };
+      };
+      assert.equal(preferenceAccepted.type, "accepted");
+      assert.deepEqual(preferenceResult, {
+        type: "apply_session_preferences_result",
+        requestId: "req-preferences",
+        ownerGeneration: lease.ownerGeneration,
+        modelId: "smart-model",
+        effort: "xhigh",
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      });
+      preferenceLines.close();
+      preferenceSocket.destroy();
+
       const closeSocket = await connectSocket(lease.socketPath);
       const closeLines = readline.createInterface({ input: closeSocket });
       const closeIterator = closeLines[Symbol.asyncIterator]();
@@ -143,6 +185,7 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
       assert.equal(closeSessionCalls, 1);
       assert.deepEqual(modes, ["plan"]);
       assert.deepEqual(configRequests, [{ id: "thinking_level", value: "high" }]);
+      assert.deepEqual(preferenceRequests, [{ modelId: "smart-model", effort: "xhigh" }]);
     } finally {
       await owner.close();
       await releaseQueueOwnerLease(lease);
@@ -289,6 +332,7 @@ test("SessionQueueOwner serves the parked-request verbs in the persisted wire sh
     const answers: Array<{ pendingRequestId: string; answer: unknown }> = [];
 
     const owner = await SessionQueueOwner.start(lease, {
+      ...noParkedRequestControlHandlers,
       cancelPrompt: async () => false,
       closeSession: async () => false,
       setSessionMode: async () => {

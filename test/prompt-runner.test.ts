@@ -187,6 +187,7 @@ test("runSessionSetConfigOptionDirect falls back to createSession and returns up
     assert.deepEqual(persisted.acpx?.desired_config_options, {
       reasoning_effort: "high",
     });
+    assert.equal(persisted.acpx?.session_options?.effort, "high");
   });
 });
 

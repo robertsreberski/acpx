@@ -10,6 +10,8 @@ Repo: https://github.com/openclaw/acpx
 
 - Docs/readme: rewrite the project front door to the house standard and route detailed CLI guidance to the existing documentation.
 
+- CLI/effort: add portable `--effort <level>` selection across one-shot, persistent, queued, compare, flow, and embedded runtime paths; apply model before effort, validate against model-specific ACP config options, and persist explicit effort choices.
+
 ### Breaking
 
 ### Fixes

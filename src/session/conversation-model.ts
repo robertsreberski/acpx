@@ -588,6 +588,7 @@ function cloneSessionOptions(
   }
   return {
     model: options.model,
+    ...(options.effort !== undefined ? { effort: options.effort } : {}),
     allowed_tools: options.allowed_tools ? [...options.allowed_tools] : undefined,
     max_turns: options.max_turns,
     ...(options.system_prompt !== undefined

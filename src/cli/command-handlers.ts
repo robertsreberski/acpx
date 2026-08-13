@@ -188,6 +188,7 @@ function sessionOptionsFromGlobalFlags(
 ): NonNullable<Parameters<SessionModule["createSession"]>[0]["sessionOptions"]> {
   return {
     model: globalFlags.model,
+    effort: globalFlags.effort,
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,
@@ -374,6 +375,7 @@ export async function handlePrompt(
     waitForCompletion: flags.wait !== false,
     sessionOptions: {
       model: globalFlags.model,
+      effort: globalFlags.effort,
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,
@@ -461,6 +463,7 @@ export async function handleExec(
     promptRetries: globalFlags.promptRetries,
     sessionOptions: {
       model: globalFlags.model,
+      effort: globalFlags.effort,
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
       systemPrompt: globalFlags.systemPrompt,

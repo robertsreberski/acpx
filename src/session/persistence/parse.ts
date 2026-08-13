@@ -510,6 +510,7 @@ function assignParsedSessionOptions(state: SessionAcpxState, raw: unknown): void
 
   const parsedSessionOptions: NonNullable<SessionAcpxState["session_options"]> = {};
   assignSessionOptionModel(parsedSessionOptions, sessionOptions.model);
+  assignSessionOptionEffort(parsedSessionOptions, sessionOptions.effort);
   assignSessionOptionAllowedTools(parsedSessionOptions, sessionOptions.allowed_tools);
   assignSessionOptionMaxTurns(parsedSessionOptions, sessionOptions.max_turns);
   assignSessionOptionSystemPrompt(parsedSessionOptions, sessionOptions.system_prompt);
@@ -526,6 +527,15 @@ function assignSessionOptionModel(
 ): void {
   if (typeof value === "string") {
     options.model = value;
+  }
+}
+
+function assignSessionOptionEffort(
+  options: NonNullable<SessionAcpxState["session_options"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    options.effort = value;
   }
 }
 

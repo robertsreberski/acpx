@@ -135,6 +135,7 @@ function assignQueueOwnerSessionOptions(
 
   options.sessionOptions = {};
   assignSessionModel(options.sessionOptions, sessionOpts.model);
+  assignSessionEffort(options.sessionOptions, sessionOpts.effort);
   assignSessionAllowedTools(options.sessionOptions, sessionOpts.allowedTools);
   assignSessionMaxTurns(options.sessionOptions, sessionOpts.maxTurns);
   assignSessionSystemPrompt(options.sessionOptions, sessionOpts.systemPrompt);
@@ -147,6 +148,15 @@ function assignSessionModel(
 ): void {
   if (typeof value === "string" && value.trim().length > 0) {
     options.model = value;
+  }
+}
+
+function assignSessionEffort(
+  options: NonNullable<QueueOwnerRuntimeOptions["sessionOptions"]>,
+  value: unknown,
+): void {
+  if (typeof value === "string" && value.trim().length > 0) {
+    options.effort = value;
   }
 }
 

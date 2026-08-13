@@ -3,8 +3,11 @@ import path from "node:path";
 import test from "node:test";
 import {
   AcpRuntimeError,
+  isRequestedEffortUnsupportedError,
   isRequestedModelUnsupportedError,
+  REQUESTED_EFFORT_UNSUPPORTED_ERROR_CODE,
   REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE,
+  RequestedEffortUnsupportedError,
   RequestedModelUnsupportedError,
   decodeAcpxRuntimeHandleState,
   isAcpRuntimeError,
@@ -95,6 +98,13 @@ test("runtime exports the model capability error signal", () => {
   assert.equal(error.code, REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE);
   assert.equal(error.reason, "missing-capability");
   assert.equal(isRequestedModelUnsupportedError(error), true);
+});
+
+test("runtime exports the effort capability error signal", () => {
+  const error = new RequestedEffortUnsupportedError("effort unsupported", "missing-capability");
+  assert.equal(error.code, REQUESTED_EFFORT_UNSUPPORTED_ERROR_CODE);
+  assert.equal(error.reason, "missing-capability");
+  assert.equal(isRequestedEffortUnsupportedError(error), true);
 });
 
 test("runtime lifecycle helpers update records from runtime snapshots and conversations", () => {

@@ -47,6 +47,7 @@ export type GlobalFlags = PermissionFlags & {
   verbose?: boolean;
   format: OutputFormat;
   model?: string;
+  effort?: string;
   allowedTools?: string[];
   maxTurns?: number;
   systemPrompt?: SystemPromptOption;
@@ -341,6 +342,11 @@ export function addGlobalFlags(command: Command): Command {
     .option("--suppress-reads", "Suppress raw read-file contents in output")
     .option("--model <id>", "Agent model id")
     .option(
+      "--effort <level>",
+      "Reasoning effort advertised by the selected model",
+      (value: string) => parseNonEmptyValue("Effort", value),
+    )
+    .option(
       "--allowed-tools <list>",
       'Allowed tool names as a comma-separated list (use "" for no tools)',
       parseAllowedTools,
@@ -465,6 +471,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     verbose,
     format,
     model: resolveModelOption(opts.model),
+    effort: resolveEffortOption(opts.effort),
     allowedTools: stringArrayOption(opts.allowedTools),
     maxTurns: numberOption(opts.maxTurns),
     systemPrompt: resolveSystemPromptFlag(opts),
@@ -549,6 +556,11 @@ function assertOutputFlagCompatibility(
 function resolveModelOption(value: unknown): string | undefined {
   const model = stringOption(value);
   return model === undefined ? undefined : parseNonEmptyValue("Model", model);
+}
+
+function resolveEffortOption(value: unknown): string | undefined {
+  const effort = stringOption(value);
+  return effort === undefined ? undefined : parseNonEmptyValue("Effort", effort);
 }
 
 export function resolveOutputPolicy(format: OutputFormat, jsonStrict: boolean): OutputPolicy {

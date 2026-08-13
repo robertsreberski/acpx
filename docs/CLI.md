@@ -131,6 +131,7 @@ All global options:
 | `--defer`                                | Park `defer`-matched permission requests       | The turn stays blocked and the request waits for [`respond`](#respond-command). Owner-level: fixed when the session's queue owner starts.        |
 | `--defer-max-age <seconds>`              | How long a parked request waits                | Default `86400`. `0` never expires. Expiry resolves like a rejection. Owner-level, like `--defer`.                                               |
 | `--model <id>`                           | Set agent model                                | Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata. |
+| `--effort <level>`                       | Set reasoning effort                           | Uses the selected model's advertised ACP thought-level config option. Values are adapter- and model-specific; the model is applied first.        |
 | `--verbose`                              | Enable verbose logs                            | Prints ACP/debug details to stderr.                                                                                                              |
 
 Permission flags are mutually exclusive. Using more than one of `--approve-all`, `--approve-reads`, `--deny-all` is a usage error.
@@ -151,6 +152,7 @@ acpx --no-fs codex exec 'use agent-native file operations'
 acpx --no-terminal codex exec 'summarize without terminal capability'
 acpx --timeout 120 codex 'investigate flaky test failures'
 acpx --ttl 30 codex 'keep queue owner warm for quick follow-up'
+acpx --model gpt-5.6-sol --effort high codex 'review the changed files'
 acpx --verbose codex 'debug adapter startup issues'
 ```
 
@@ -280,7 +282,7 @@ acpx [global_options] compare <agent>... -- prompt words after the delimiter
 Behavior:
 
 - Runs each agent with the same temporary `exec`-style ACP session.
-- Uses the same global execution controls as `exec`, including `--cwd`, `--timeout`, permission flags, `--policy`, auth, terminal advertising, retries, model/system options, and `--format`.
+- Uses the same global execution controls as `exec`, including `--cwd`, `--timeout`, permission flags, `--policy`, auth, terminal advertising, retries, model/effort/system options, and `--format`.
 - `--format text` prints one summary table row per agent.
 - `--format json` or command-local `--json` prints a `CompareRow[]` summary payload.
 - `--format quiet` prints `<agent>\t<status>` per row.
@@ -328,6 +330,7 @@ Behavior:
 - Routes through queue-owner IPC when an owner is active.
 - Falls back to a direct client reconnect when no owner is running.
 - **`set model <id>`**: Uses the advertised model config option through `session/set_config_option`; adapters that explicitly advertise legacy `models` metadata use `session/set_model`.
+- Setting an advertised thought-level option directly, such as `set reasoning_effort high`, updates the same saved effort preference used by `--effort`.
 
 ## `requests` command
 

@@ -7,9 +7,13 @@ import { persistSessionOptions } from "../../runtime/engine/session-options.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
-import { setCurrentModelId, syncAdvertisedModelState } from "../../session/mode-preference.js";
 import {
-  applyRequestedModelIfAdvertised,
+  setCurrentModelId,
+  setDesiredEffort,
+  syncAdvertisedModelState,
+} from "../../session/mode-preference.js";
+import {
+  applyRequestedModelAndEffortIfAdvertised,
   currentModelIdFromSetModelResponse,
 } from "../../session/model-application.js";
 import {
@@ -30,7 +34,7 @@ import type {
   SessionListOptions,
   SessionListResult,
 } from "./contracts.js";
-import { setSessionModel } from "./session-control.js";
+import { applySessionPreferences, setSessionModel } from "./session-control.js";
 
 type CreatedSessionState = {
   sessionId: string;
@@ -39,7 +43,29 @@ type CreatedSessionState = {
   sessionModels: SessionCreateResult["models"];
   requestedModelApplied: boolean;
   requestedModelResponse?: Awaited<ReturnType<AcpClient["setSessionModel"]>>;
+  requestedEffortApplied: boolean;
+  requestedEffortConfigId?: string;
+  requestedEffortResponse?: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>;
 };
+
+async function applyRequestedCreationPreferences(params: {
+  client: AcpClient;
+  sessionId: string;
+  sessionResult: Pick<SessionCreateResult, "models" | "configOptions">;
+  options: SessionCreateOptions;
+}) {
+  return await applyRequestedModelAndEffortIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
+    requestedModel: params.options.sessionOptions?.model,
+    requestedEffort: params.options.sessionOptions?.effort,
+    models: params.sessionResult.models,
+    configOptions: params.sessionResult.configOptions,
+    agentCommand: params.options.agentCommand,
+    timeoutMs: params.options.timeoutMs,
+    onWarning: params.options.onModelWarning,
+  });
+}
 
 async function createSessionRecordWithClient(
   client: AcpClient,
@@ -92,10 +118,12 @@ function applyCreatedSessionModelState(
 ): void {
   applyConfigOptionsToRecord(record, state.sessionResult);
   applyConfigOptionsToRecord(record, state.requestedModelResponse);
+  applyConfigOptionsToRecord(record, state.requestedEffortResponse);
+  const latestConfigResponse = state.requestedEffortResponse ?? state.requestedModelResponse;
   syncAdvertisedModelState(
     record,
-    state.requestedModelResponse
-      ? modelStateFromConfigOptions(state.requestedModelResponse.configOptions)
+    latestConfigResponse
+      ? (modelStateFromConfigOptions(latestConfigResponse.configOptions) ?? state.sessionModels)
       : state.sessionModels,
   );
   if (state.requestedModelApplied) {
@@ -103,6 +131,9 @@ function applyCreatedSessionModelState(
       record,
       currentModelIdFromSetModelResponse(state.requestedModelResponse, requestedModel),
     );
+  }
+  if (state.requestedEffortApplied) {
+    setDesiredEffort(record, record.acpx?.session_options?.effort, state.requestedEffortConfigId);
   }
 }
 
@@ -112,22 +143,22 @@ async function createFreshSessionState(
   cwd: string,
 ): Promise<CreatedSessionState> {
   const createdSession = await withTimeout(client.createSession(cwd), options.timeoutMs);
-  const modelApplication = await applyRequestedModelIfAdvertised({
+  const application = await applyRequestedCreationPreferences({
     client,
     sessionId: createdSession.sessionId,
-    requestedModel: options.sessionOptions?.model,
-    models: createdSession.models,
-    agentCommand: options.agentCommand,
-    timeoutMs: options.timeoutMs,
-    onWarning: options.onModelWarning,
+    sessionResult: createdSession,
+    options,
   });
   return {
     sessionId: createdSession.sessionId,
     agentSessionId: normalizeRuntimeSessionId(createdSession.agentSessionId),
     sessionResult: createdSession,
     sessionModels: createdSession.models,
-    requestedModelApplied: modelApplication.applied,
-    requestedModelResponse: modelApplication.response,
+    requestedModelApplied: application.model.applied,
+    requestedModelResponse: application.model.response,
+    requestedEffortApplied: application.effort.applied,
+    requestedEffortConfigId: application.effort.configId,
+    requestedEffortResponse: application.effort.response,
   };
 }
 
@@ -158,22 +189,22 @@ async function resumeSessionRecordWithClient(
       options.timeoutMs,
     );
     const sessionModels = resumedSession.models;
-    const modelApplication = await applyRequestedModelIfAdvertised({
+    const application = await applyRequestedCreationPreferences({
       client,
       sessionId: options.resumeSessionId,
-      requestedModel: options.sessionOptions?.model,
-      models: sessionModels,
-      agentCommand: options.agentCommand,
-      timeoutMs: options.timeoutMs,
-      onWarning: options.onModelWarning,
+      sessionResult: resumedSession,
+      options,
     });
     return {
       sessionId: options.resumeSessionId,
       agentSessionId: normalizeRuntimeSessionId(resumedSession.agentSessionId),
       sessionResult: resumedSession,
       sessionModels,
-      requestedModelApplied: modelApplication.applied,
-      requestedModelResponse: modelApplication.response,
+      requestedModelApplied: application.model.applied,
+      requestedModelResponse: application.model.response,
+      requestedEffortApplied: application.effort.applied,
+      requestedEffortConfigId: application.effort.configId,
+      requestedEffortResponse: application.effort.response,
     };
   } catch (error) {
     throw new Error(
@@ -295,24 +326,8 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     boundary: walkBoundary,
   });
   if (existing) {
-    const requestedModel = options.sessionOptions?.model;
-    if (requestedModel) {
-      const result = await setSessionModel({
-        sessionId: existing.acpxRecordId,
-        modelId: requestedModel,
-        mcpServers: options.mcpServers,
-        nonInteractivePermissions: options.nonInteractivePermissions,
-        authCredentials: options.authCredentials,
-        authPolicy: options.authPolicy,
-        fs: options.fs,
-        terminal: options.terminal,
-        timeoutMs: options.timeoutMs,
-        verbose: options.verbose,
-      });
-      return { record: result.record, created: false };
-    }
     return {
-      record: existing,
+      record: await applyEnsureSessionPreferences(existing, options),
       created: false,
     };
   }
@@ -340,6 +355,61 @@ export async function ensureSession(options: SessionEnsureOptions): Promise<Sess
     record,
     created: true,
   };
+}
+
+async function applyEnsureSessionPreferences(
+  existing: SessionRecord,
+  options: SessionEnsureOptions,
+): Promise<SessionRecord> {
+  const requestedModel = options.sessionOptions?.model;
+  const requestedEffort = options.sessionOptions?.effort;
+  if (requestedEffort) {
+    return await applyEnsuredPreferences(existing, requestedModel, requestedEffort, options);
+  }
+  return requestedModel ? await applyEnsuredModel(existing, requestedModel, options) : existing;
+}
+
+async function applyEnsuredModel(
+  existing: SessionRecord,
+  requestedModel: string,
+  options: SessionEnsureOptions,
+): Promise<SessionRecord> {
+  const result = await setSessionModel({
+    sessionId: existing.acpxRecordId,
+    modelId: requestedModel,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    fs: options.fs,
+    terminal: options.terminal,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
+  return result.record;
+}
+
+async function applyEnsuredPreferences(
+  record: SessionRecord,
+  requestedModel: string | undefined,
+  requestedEffort: string,
+  options: SessionEnsureOptions,
+): Promise<SessionRecord> {
+  const result = await applySessionPreferences({
+    sessionId: record.acpxRecordId,
+    modelId: requestedModel,
+    effort: requestedEffort,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    fs: options.fs,
+    terminal: options.terminal,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+    onModelWarning: options.onModelWarning,
+  });
+  return result.record;
 }
 
 export { DEFAULT_QUEUE_OWNER_TTL_MS };

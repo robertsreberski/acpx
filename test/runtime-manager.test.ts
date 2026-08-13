@@ -67,7 +67,13 @@ type FakeClient = {
     sessionId: string,
     cwd: string,
     options: { suppressReplayUpdates: boolean },
-  ) => Promise<{ agentSessionId?: string }>;
+  ) => Promise<{
+    agentSessionId?: string;
+    configOptions?: SetSessionConfigOptionResponse["configOptions"];
+    models?: SessionModelState;
+    configOptionsPresent?: boolean;
+    legacyModelMetadataPresent?: boolean;
+  }>;
   getAgentLifecycleSnapshot: () => {
     pid?: number;
     startedAt?: string;
@@ -1365,6 +1371,111 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   assert.deepEqual(events, []);
   assert.deepEqual(result, { status: "cancelled", stopReason: "cancelled" });
   assert.equal(handlers.onSessionUpdate, undefined);
+});
+
+test("AcpRuntimeManager times out effort replay after an active model config change", async () => {
+  const configOptions = (model: string, effort: string, effortConfigId = "reasoning_effort") => [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select" as const,
+      currentValue: model,
+      options: [
+        { value: "default-model", name: "Default" },
+        { value: "smart-model", name: "Smart" },
+      ],
+    },
+    {
+      id: effortConfigId,
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select" as const,
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  const record = makeSessionRecord({
+    acpxRecordId: "active-model-effort-timeout",
+    acpSessionId: "active-model-effort-timeout-session",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: { model: "default-model", effort: "high" },
+      desired_config_options: { reasoning_effort: "high" },
+      config_options: configOptions("default-model", "high"),
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  let resolvePromptStart!: () => void;
+  let resolvePrompt!: (value: { stopReason: string }) => void;
+  const promptStarted = new Promise<void>((resolve) => {
+    resolvePromptStart = resolve;
+  });
+  const promptResult = new Promise<{ stopReason: string }>((resolve) => {
+    resolvePrompt = resolve;
+  });
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store, timeoutMs: 20 }),
+    {
+      clientFactory: () =>
+        ({
+          start: async () => {},
+          close: async () => {},
+          hasReusableSession: () => true,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            resolvePromptStart();
+            return await promptResult;
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => true,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string) => {
+            if (configId === "model") {
+              return {
+                configOptions: configOptions("smart-model", "medium", "refreshed_effort"),
+              };
+            }
+            return await new Promise<SetSessionConfigOptionResponse>(() => {});
+          },
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  const handle = createHandle(record.acpxRecordId);
+  const turn = manager.startTurn({
+    handle,
+    text: "wait",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "active-model-effort-timeout-request",
+    timeoutMs: 5_000,
+  });
+  const eventsPromise = collectEvents(turn.events);
+  await promptStarted;
+
+  await assert.rejects(
+    async () => await manager.setConfigOption(handle, "model", "smart-model"),
+    /Timed out after 20ms/,
+  );
+
+  const stored = await store.load(record.acpxRecordId);
+  assert.equal(stored?.acpx?.session_options?.model, "smart-model");
+  assert.equal(stored?.acpx?.session_options?.effort, "high");
+  assert.deepEqual(stored?.acpx?.desired_config_options, {
+    refreshed_effort: "high",
+  });
+
+  resolvePrompt({ stopReason: "end_turn" });
+  assert.deepEqual(await turn.result, { status: "completed", stopReason: "end_turn" });
+  assert.deepEqual(await eventsPromise, []);
 });
 
 test("AcpRuntimeManager rejects unsupported advertised config option keys after refresh", async () => {
@@ -3169,10 +3280,35 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
   });
 });
 
-test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTools/maxTurns", async () => {
+test("AcpRuntimeManager persists sessionOptions with model-aware effort", async () => {
   const store = new InMemorySessionStore();
   const factoryCalls: Array<Record<string, unknown>> = [];
   const setModelCalls: Array<{ sessionId: string; modelId: string }> = [];
+  const preferenceCalls: string[] = [];
+  const configOptions = (model: string, effort: string) => [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select" as const,
+      currentValue: model,
+      options: [
+        { value: "default", name: "Default" },
+        { value: "fast", name: "Fast" },
+      ],
+    },
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select" as const,
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
   const manager = new AcpRuntimeManager(
     createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
     {
@@ -3193,6 +3329,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
                 { modelId: "fast", name: "Fast" },
               ],
             },
+            configOptions: configOptions("default", "medium"),
           }),
           loadSession: async () => ({ agentSessionId: "unused" }),
           hasReusableSession: () => false,
@@ -3206,8 +3343,13 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
           setSessionMode: async () => {},
           setSessionModel: async (sessionId: string, modelId: string) => {
             setModelCalls.push({ sessionId, modelId });
+            preferenceCalls.push(`model:${modelId}`);
+            return { configOptions: configOptions(modelId, "medium") };
           },
-          setSessionConfigOption: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string, value: string) => {
+            preferenceCalls.push(`${configId}:${value}`);
+            return { configOptions: configOptions("fast", value) };
+          },
           clearEventHandlers: () => {},
           setEventHandlers: () => {},
         } as never;
@@ -3218,6 +3360,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
   const sessionOptions = {
     systemPrompt: { append: "Also review tests." },
     model: "fast",
+    effort: "high",
     allowedTools: ["read", "edit"],
     maxTurns: 5,
   };
@@ -3230,15 +3373,106 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
 
   assert.deepEqual(factoryCalls[0]?.sessionOptions, sessionOptions);
   assert.deepEqual(setModelCalls, [{ sessionId: "new-sid", modelId: "fast" }]);
+  assert.deepEqual(preferenceCalls, ["model:fast", "reasoning_effort:high"]);
   assert.equal(record.acpx?.current_model_id, "fast");
   assert.deepEqual(record.acpx?.available_models, ["default", "fast"]);
   assert.deepEqual(record.acpx?.session_options, {
     model: "fast",
+    effort: "high",
     allowed_tools: ["read", "edit"],
     max_turns: 5,
     system_prompt: { append: "Also review tests." },
     env: undefined,
   });
+  assert.deepEqual(record.acpx?.desired_config_options, { reasoning_effort: "high" });
+});
+
+test("AcpRuntimeManager re-applies persisted effort before prompting a rebound session", async () => {
+  const configOptions = (effort: string): SetSessionConfigOptionResponse["configOptions"] => [
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  const record = makeSessionRecord({
+    acpxRecordId: "runtime-rebound-effort",
+    acpSessionId: "runtime-rebound-effort-session",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: { effort: "high" },
+      desired_config_options: { reasoning_effort: "high" },
+      config_options: configOptions("high"),
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  const calls: string[] = [];
+  let activeEffort = "medium";
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+          start: async () => {
+            calls.push("start");
+          },
+          close: async () => {},
+          createSession: async () => ({ sessionId: "unused" }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: () => false,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => {
+            calls.push("load");
+            return {
+              agentSessionId: "runtime-agent-session",
+              configOptions: configOptions("medium"),
+              configOptionsPresent: true,
+              legacyModelMetadataPresent: false,
+            };
+          },
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            calls.push(`prompt:${activeEffort}`);
+            return { stopReason: "end_turn" };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string, value: string) => {
+            calls.push(`set:${configId}:${value}`);
+            activeEffort = value;
+            return { configOptions: configOptions(value) };
+          },
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+
+  const { result } = await collectTurn(
+    manager.startTurn({
+      handle: createHandle(record.acpxRecordId),
+      text: "check effort",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "runtime-rebound-effort-request",
+    }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(calls, ["start", "load", "set:reasoning_effort:high", "prompt:high"]);
+  const stored = store.records.get(record.acpxRecordId);
+  assert.equal(stored?.acpx?.session_options?.effort, "high");
+  assert.deepEqual(stored?.acpx?.desired_config_options, { reasoning_effort: "high" });
 });
 
 test("persistSessionOptions preserves an explicit empty allowedTools list", () => {

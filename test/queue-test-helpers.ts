@@ -195,6 +195,10 @@ export async function nextJsonLine(
  * real owner rather than one per test.
  */
 export const noParkedRequestControlHandlers = {
+  applySessionPreferences: async () => ({
+    effortConfigId: "reasoning_effort",
+    response: { configOptions: [] },
+  }),
   listPendingRequests: async (): Promise<PendingRequest[]> => [],
   respondToPendingRequest: async (pendingRequestId: string): Promise<PendingRequest> => {
     throw new PendingRequestNotAnswerableError(

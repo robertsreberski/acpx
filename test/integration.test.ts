@@ -1471,6 +1471,556 @@ test("integration: exec --model sets the advertised model config option", async 
   });
 });
 
+test("integration: exec applies model before model-specific effort", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "smart-model",
+          "--effort",
+          "xhigh",
+          "exec",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const requests = payloads.filter(
+        (payload) =>
+          payload.method === "session/set_config_option" || payload.method === "session/prompt",
+      );
+      assert.deepEqual(
+        requests.map((request) => ({
+          method: request.method,
+          configId: (request.params as { configId?: unknown } | undefined)?.configId,
+          value: (request.params as { value?: unknown } | undefined)?.value,
+        })),
+        [
+          { method: "session/set_config_option", configId: "model", value: "smart-model" },
+          {
+            method: "session/set_config_option",
+            configId: "reasoning_effort",
+            value: "xhigh",
+          },
+          { method: "session/prompt", configId: undefined, value: undefined },
+        ],
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec rejects effort unavailable for the selected model before prompting", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "smart-model",
+          "--effort",
+          "medium",
+          "exec",
+          "echo should-not-run",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const errorMessage = (
+        payloads.find((payload) => payload.error) as { error?: { message?: string } } | undefined
+      )?.error?.message;
+      assert.match(errorMessage ?? "", /model "smart-model"/);
+      assert.match(errorMessage ?? "", /Available efforts: high, xhigh/);
+      assert.equal(
+        payloads.some((payload) => payload.method === "session/prompt"),
+        false,
+        "prompt must not run after effort validation fails",
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec --effort fails when the agent advertises no effort control", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--effort", "high", "exec", "echo no"],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+      assert.match(`${result.stderr}\n${result.stdout}`, /did not advertise a thought-level/);
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      assert.equal(
+        payloads.some((payload) => payload.method === "session/prompt"),
+        false,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: persistent sessions retain effort when later prompts omit the flag", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--effort",
+          "high",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      const prompted = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "prompt",
+          "echo retained",
+        ],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+      const payloads = parseJsonRpcOutputLines(prompted.stdout);
+      const effortIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown } | undefined)?.configId === "reasoning_effort",
+      );
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(effortIndex >= 0, "expected saved effort to be re-applied");
+      assert(promptIndex > effortIndex, "saved effort must be applied before the prompt");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sparse reconnect metadata does not erase saved effort", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options --omit-reconnect-config-options`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--effort",
+          "high",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const prompted = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "prompt",
+          "echo sparse",
+        ],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+      const payloads = parseJsonRpcOutputLines(prompted.stdout);
+      const effortIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown } | undefined)?.configId === "reasoning_effort",
+      );
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(effortIndex >= 0, "expected saved effort to be forced onto sparse reconnect");
+      assert(promptIndex > effortIndex, "saved effort must be applied before the prompt");
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { effort: "high" });
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        "high",
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: set model clears a saved effort unsupported by the new model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "smart-model",
+          "--effort",
+          "xhigh",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const changed = await runCli(
+        ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "set", "model", "fast-model"],
+        homeDir,
+      );
+      assert.equal(changed.code, 0, changed.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { model: "fast-model" });
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        undefined,
+      );
+
+      const prompted = await runCli(
+        ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "prompt", "echo changed"],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt model switch reconciles saved effort unless --effort is explicit", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "smart-model",
+          "--effort",
+          "xhigh",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const prompted = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--model",
+          "fast-model",
+          "prompt",
+          "echo model-only",
+        ],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { model: "fast-model" });
+      assert.equal(acpxState.current_model_id, "fast-model");
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        undefined,
+      );
+    } finally {
+      await runCli(
+        ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "sessions", "close"],
+        homeDir,
+      ).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt model switch migrates effort keyed by the prior config id", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts`;
+    const args = ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "--ttl", "0"];
+
+    try {
+      const created = await runCli(
+        [
+          ...args,
+          "--model",
+          "default-model",
+          "--effort",
+          "medium",
+          "--format",
+          "json",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const warmed = await runCli([...args, "prompt", "echo warm"], homeDir);
+      assert.equal(warmed.code, 0, warmed.stderr);
+
+      const recordPath = sessionRecordPath(homeDir, sessionId);
+      const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as {
+        acpx?: {
+          session_options?: Record<string, unknown>;
+          desired_config_options?: Record<string, unknown>;
+          config_options?: Array<Record<string, unknown>>;
+        };
+      };
+      assert(record.acpx);
+      const sessionOptions = { ...record.acpx.session_options };
+      delete sessionOptions.effort;
+      record.acpx.session_options = sessionOptions;
+      record.acpx.desired_config_options = { legacy_effort: "medium" };
+      record.acpx.config_options = record.acpx.config_options?.map((option) =>
+        option.id === "reasoning_effort" ? { ...option, id: "legacy_effort" } : option,
+      );
+      await fs.writeFile(recordPath, `${JSON.stringify(record)}\n`, "utf8");
+
+      const prompted = await runCli(
+        [...args, "--model", "fast-model", "prompt", "echo model-only"],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, {
+        model: "fast-model",
+        effort: "medium",
+      });
+      assert.deepEqual(acpxState.desired_config_options, {
+        reasoning_effort: "medium",
+      });
+    } finally {
+      await runCli([...args, "sessions", "close"], homeDir).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: sessions ensure applies model and effort through a warm owner", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(cwd, "effort-owner-calls.ndjson");
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts --call-log ${JSON.stringify(callLog)}`;
+    const args = ["--agent", agentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const created = await runCli([...args, "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+
+      const warmed = await runCli([...args, "--ttl", "0", "prompt", "echo warm"], homeDir);
+      assert.equal(warmed.code, 0, warmed.stderr);
+      const warmCalls = await readMockAgentCalls(callLog);
+      const warmPrompt = warmCalls.findLast((call) => call.method === "session/prompt");
+      const { pid: ownerPid } = await readQueueOwnerLock(homeDir, warmPrompt?.sessionId ?? "");
+      assert.equal(
+        warmPrompt?.parentPid,
+        ownerPid,
+        "expected the prompt agent to belong to the owner",
+      );
+
+      const ensured = await runCli(
+        [...args, "--model", "smart-model", "--effort", "xhigh", "sessions", "ensure"],
+        homeDir,
+      );
+      assert.equal(ensured.code, 0, ensured.stderr);
+
+      const calls = await readMockAgentCalls(callLog);
+      const preferenceCalls = calls.filter(
+        (call) =>
+          call.parentPid === ownerPid &&
+          call.method === "session/set_config_option" &&
+          (call.configId === "model" || call.configId === "reasoning_effort"),
+      );
+      assert.deepEqual(
+        preferenceCalls.slice(-2).map((call) => [call.configId, call.value]),
+        [
+          ["model", "smart-model"],
+          ["reasoning_effort", "xhigh"],
+        ],
+      );
+
+      const prompted = await runCli([...args, "prompt", "echo configured"], homeDir);
+      assert.equal(prompted.code, 0, prompted.stderr);
+      const configuredPrompt = (await readMockAgentCalls(callLog)).findLast(
+        (call) => call.method === "session/prompt" && call.text === "echo configured",
+      );
+      assert.equal(configuredPrompt?.parentPid, ownerPid);
+      assert.notEqual(configuredPrompt?.pid, warmPrompt?.pid);
+      assert.equal(configuredPrompt?.modelId, "smart-model");
+      assert.equal(configuredPrompt?.effort, "xhigh");
+
+      const setEffort = await runCli([...args, "set", "reasoning_effort", "high"], homeDir);
+      assert.equal(setEffort.code, 0, setEffort.stderr);
+
+      const directEffortPromptResult = await runCli(
+        [...args, "prompt", "echo direct-effort"],
+        homeDir,
+      );
+      assert.equal(directEffortPromptResult.code, 0, directEffortPromptResult.stderr);
+      const directEffortPrompt = (await readMockAgentCalls(callLog)).findLast(
+        (call) => call.method === "session/prompt" && call.text === "echo direct-effort",
+      );
+      assert.equal(directEffortPrompt?.parentPid, ownerPid);
+      assert.notEqual(directEffortPrompt?.pid, configuredPrompt?.pid);
+      assert.equal(directEffortPrompt?.modelId, "smart-model");
+      assert.equal(directEffortPrompt?.effort, "high");
+
+      const rejected = await runCli(
+        [...args, "--model", "fast-model", "--effort", "xhigh", "sessions", "ensure"],
+        homeDir,
+      );
+      assert.notEqual(rejected.code, 0);
+      const rejectedState = await readStoredSessionAcpxState(homeDir, warmPrompt?.sessionId ?? "");
+      assert.deepEqual(rejectedState.session_options, { model: "fast-model" });
+      assert.equal(rejectedState.current_model_id, "fast-model");
+      assert.equal(
+        (rejectedState.desired_config_options as Record<string, unknown> | undefined)
+          ?.reasoning_effort,
+        undefined,
+      );
+
+      const afterRejected = await runCli([...args, "prompt", "echo after-rejected"], homeDir);
+      assert.equal(afterRejected.code, 0, afterRejected.stderr);
+      const afterRejectedPrompt = (await readMockAgentCalls(callLog)).findLast(
+        (call) => call.method === "session/prompt" && call.text === "echo after-rejected",
+      );
+      assert.equal(afterRejectedPrompt?.parentPid, ownerPid);
+      assert.notEqual(afterRejectedPrompt?.pid, directEffortPrompt?.pid);
+      assert.equal(afterRejectedPrompt?.modelId, "fast-model");
+      assert.equal(afterRejectedPrompt?.effort, "medium");
+    } finally {
+      await runCli([...args, "sessions", "close"], homeDir).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: failed prompt effort persists an already-applied model change", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const callLog = path.join(cwd, "effort-failure-calls.ndjson");
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --model-dependent-efforts --call-log ${JSON.stringify(callLog)}`;
+    const args = ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "--format", "json"];
+
+    try {
+      const created = await runCli([...args, "sessions", "new"], homeDir);
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const rejected = await runCli(
+        [...args, "--model", "smart-model", "--effort", "low", "prompt", "echo never"],
+        homeDir,
+      );
+      assert.notEqual(rejected.code, 0);
+
+      const rejectedState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(rejectedState.session_options, { model: "smart-model" });
+      assert.equal(rejectedState.current_model_id, "smart-model");
+      assert.equal(
+        (rejectedState.desired_config_options as Record<string, unknown> | undefined)
+          ?.reasoning_effort,
+        undefined,
+      );
+      const calls = await readMockAgentCalls(callLog);
+      assert.equal(
+        calls.some((call) => call.method === "session/prompt" && call.text === "echo never"),
+        false,
+      );
+    } finally {
+      await runCli([...args, "sessions", "close"], homeDir).catch(() => {});
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: exec --model fails when agent does not advertise models", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1835,6 +2385,124 @@ test("integration: legacy model metadata preserves session/set_model compatibili
       assert.equal(
         (JSON.parse(setResult.stdout.trim()) as { modelId?: string }).modelId,
         "default-model",
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: legacy model changes clear effort saved for the previous model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-legacy-models --advertise-config-options --omit-model-config-option`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--effort",
+          "high",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const setModel = await runCli(
+        ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "set", "model", "alternate-model"],
+        homeDir,
+      );
+      assert.equal(setModel.code, 0, setModel.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { model: "alternate-model" });
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        undefined,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt-time legacy model changes do not resurrect cleared effort", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-legacy-models --advertise-config-options --omit-model-config-option`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--effort",
+          "high",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const prompted = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "alternate-model",
+          "prompt",
+          "echo legacy switch",
+        ],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+
+      const payloads = parseJsonRpcOutputLines(prompted.stdout);
+      const modelIndex = payloads.findIndex((payload) => payload.method === "session/set_model");
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(modelIndex >= 0, "expected legacy session/set_model");
+      assert(promptIndex > modelIndex, "model must be applied before the prompt");
+      assert.equal(
+        payloads
+          .slice(modelIndex + 1, promptIndex)
+          .some(
+            (payload) =>
+              payload.method === "session/set_config_option" &&
+              (payload.params as { configId?: unknown } | undefined)?.configId ===
+                "reasoning_effort",
+          ),
+        false,
+        "cleared effort must not be re-applied after a legacy model change",
+      );
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { model: "alternate-model" });
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        undefined,
       );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
@@ -4535,9 +5203,14 @@ test("integration: session remains resumable after queue owner exits and agent h
 
 type MockAgentCall = {
   pid: number;
+  parentPid: number;
   method: string;
   sessionId?: string;
   modeId?: string;
+  modelId?: string;
+  effort?: string;
+  configId?: string;
+  value?: string;
   text?: string;
 };
 

@@ -1,6 +1,9 @@
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
+import path from "node:path";
 import { isProcessAlive } from "../../process-liveness.js";
+import { createAtomicWriteTempPath } from "../../session/persistence/atomic-write.js";
 import { getAcpxVersion } from "../../version.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir, queueSocketPath } from "./paths.js";
 
@@ -16,6 +19,9 @@ const PROCESS_SIGTERM_GRACE_MS = 4_000;
 const PROCESS_SIGKILL_GRACE_MS = 1_500;
 const PROCESS_POLL_MS = 50;
 const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
+const QUEUE_OWNER_RETIREMENT_WAIT_MS = 7_000;
+const QUEUE_OWNER_RETIREMENT_POLL_MS = 25;
+const QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS = 250;
 
 /**
  * Version of the queue owner IPC contract this build speaks.
@@ -30,12 +36,17 @@ const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
  * 2: permission policies carry `defer` rules and permission_escalation events
  *    carry action "defer". A v1 owner drops unknown rule lists, so a request
  *    the user asked to park is instead settled by the permission mode.
+ * 3: prompt session options carry `effort`, and clients may send the
+ *    `apply_session_preferences` control request. A v2 owner silently drops
+ *    effort from prompt options and cannot apply the combined control.
  */
-export const QUEUE_PROTOCOL_VERSION = 2;
+export const QUEUE_PROTOCOL_VERSION = 3;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
+/** First protocol version that understands effort-bearing requests. */
+export const QUEUE_PROTOCOL_EFFORT_VERSION = 3;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided
@@ -90,6 +101,37 @@ export type QueueOwnerLease = {
   parking?: boolean;
   parkingMaxAgeMs?: number;
 };
+
+type QueueOwnerLeaseMutationState = {
+  pending: Promise<void>;
+  releasePromise: Promise<void> | undefined;
+  releasing: boolean;
+};
+
+const queueOwnerLeaseMutationStates = new WeakMap<QueueOwnerLease, QueueOwnerLeaseMutationState>();
+
+function queueOwnerLeaseMutationState(lease: QueueOwnerLease): QueueOwnerLeaseMutationState {
+  const existing = queueOwnerLeaseMutationStates.get(lease);
+  if (existing) {
+    return existing;
+  }
+  const created: QueueOwnerLeaseMutationState = {
+    pending: Promise.resolve(),
+    releasePromise: undefined,
+    releasing: false,
+  };
+  queueOwnerLeaseMutationStates.set(lease, created);
+  return created;
+}
+
+function enqueueQueueOwnerLeaseMutation(
+  state: QueueOwnerLeaseMutationState,
+  mutation: () => Promise<void>,
+): Promise<void> {
+  const result = state.pending.then(mutation);
+  state.pending = result.catch(() => undefined);
+  return result;
+}
 
 /** Protocol version an owner speaks, defaulting to the pre-field behavior. */
 export function queueOwnerProtocolVersion(owner: QueueOwnerRecord): number {
@@ -280,24 +322,358 @@ async function retireStaleQueueOwner(
   sessionId: string,
   owner: QueueOwnerRecord | undefined,
 ): Promise<void> {
-  if (owner && isProcessAlive(owner.pid)) {
-    await terminateProcess(owner.pid);
+  if (owner) {
+    const result = await terminateQueueOwnerIfCurrent(sessionId, owner);
+    if (result === "failed") {
+      throw new Error(`Failed to retire stale queue owner for session ${sessionId}`);
+    }
+    return;
   }
 
   await cleanupStaleQueueOwner(sessionId, owner);
 }
 
-export async function readQueueOwnerRecord(
-  sessionId: string,
-): Promise<QueueOwnerRecord | undefined> {
-  const lockPath = queueLockFilePath(sessionId);
+type QueueOwnerRetirementMarker = {
+  markerId: string;
+  livenessPath: string;
+  pid: number;
+  ownerGeneration: number;
+  createdAt: string;
+};
+
+function retirementMarkerPath(lockPath: string): string {
+  return `${lockPath}.retiring`;
+}
+
+function parseRetirementMarker(
+  raw: Record<string, unknown>,
+): QueueOwnerRetirementMarker | undefined {
+  if (
+    typeof raw.markerId !== "string" ||
+    raw.markerId.length === 0 ||
+    typeof raw.livenessPath !== "string" ||
+    raw.livenessPath.length === 0 ||
+    !isPositiveInteger(raw.pid) ||
+    !isPositiveInteger(raw.ownerGeneration) ||
+    typeof raw.createdAt !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    markerId: raw.markerId,
+    livenessPath: raw.livenessPath,
+    pid: raw.pid,
+    ownerGeneration: raw.ownerGeneration,
+    createdAt: raw.createdAt,
+  };
+}
+
+async function readRetirementMarker(
+  markerPath: string,
+): Promise<QueueOwnerRetirementMarker | undefined> {
   try {
-    const payload = await fs.readFile(lockPath, "utf8");
-    const parsed = parseQueueOwnerRecord(JSON.parse(payload));
-    return parsed ?? undefined;
+    const raw = JSON.parse(await fs.readFile(markerPath, "utf8")) as Record<string, unknown>;
+    return parseRetirementMarker(raw);
   } catch {
     return undefined;
   }
+}
+
+async function retirementMarkerIsActive(marker: QueueOwnerRetirementMarker): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection(marker.livenessPath);
+    const timeout = setTimeout(() => finish(false), QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS);
+    const finish = (active: boolean): void => {
+      clearTimeout(timeout);
+      socket.destroy();
+      resolve(active);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+function retirementMarkerQuarantinePrefix(lockPath: string): string {
+  return `${retirementMarkerPath(lockPath)}.quarantine.`;
+}
+
+async function listRetirementMarkerPaths(lockPath: string): Promise<string[]> {
+  const markerPath = retirementMarkerPath(lockPath);
+  const markerName = path.basename(markerPath);
+  const quarantinePrefix = `${markerName}.quarantine.`;
+  try {
+    const entries = await fs.readdir(path.dirname(markerPath));
+    return entries
+      .filter((entry) => entry === markerName || entry.startsWith(quarantinePrefix))
+      .map((entry) => path.join(path.dirname(markerPath), entry));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function createRetirementQuarantinePath(lockPath: string): string {
+  return `${retirementMarkerQuarantinePrefix(lockPath)}${process.pid}.${randomUUID()}`;
+}
+
+async function restoreQuarantinedRetirementMarker(
+  lockPath: string,
+  quarantinePath: string,
+): Promise<void> {
+  try {
+    await fs.link(quarantinePath, retirementMarkerPath(lockPath));
+    await fs.unlink(quarantinePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "ENOENT") {
+      throw error;
+    }
+    // If another marker already owns the shared path, keep this uniquely named
+    // quarantine visible until its marker owner releases it.
+  }
+}
+
+async function inspectSharedRetirementMarker(
+  lockPath: string,
+): Promise<QueueOwnerRetirementMarker | undefined> {
+  const markerPath = retirementMarkerPath(lockPath);
+  const initial = await readRetirementMarker(markerPath);
+  if (initial && (await retirementMarkerIsActive(initial))) {
+    return initial;
+  }
+
+  const quarantinePath = createRetirementQuarantinePath(lockPath);
+  try {
+    await fs.rename(markerPath, quarantinePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+
+  const quarantined = await readRetirementMarker(quarantinePath);
+  if (quarantined && (await retirementMarkerIsActive(quarantined))) {
+    await restoreQuarantinedRetirementMarker(lockPath, quarantinePath);
+    return quarantined;
+  }
+  await fs.unlink(quarantinePath).catch(() => undefined);
+  return undefined;
+}
+
+async function inspectUniqueRetirementMarker(
+  markerPath: string,
+): Promise<QueueOwnerRetirementMarker | undefined> {
+  const marker = await readRetirementMarker(markerPath);
+  if (marker && (await retirementMarkerIsActive(marker))) {
+    return marker;
+  }
+  await fs.unlink(markerPath).catch(() => undefined);
+  return undefined;
+}
+
+async function activeRetirementMarkers(lockPath: string): Promise<QueueOwnerRetirementMarker[]> {
+  const sharedPath = retirementMarkerPath(lockPath);
+  const markerPaths = await listRetirementMarkerPaths(lockPath);
+  const markers = await Promise.all(
+    markerPaths.map(async (markerPath) =>
+      markerPath === sharedPath
+        ? await inspectSharedRetirementMarker(lockPath)
+        : await inspectUniqueRetirementMarker(markerPath),
+    ),
+  );
+  const byMarkerId = new Map<string, QueueOwnerRetirementMarker>();
+  for (const marker of markers) {
+    if (marker) {
+      byMarkerId.set(marker.markerId, marker);
+    }
+  }
+  return [...byMarkerId.values()];
+}
+
+async function queueOwnerRetirementIsActive(lockPath: string): Promise<boolean> {
+  return (await activeRetirementMarkers(lockPath)).length > 0;
+}
+
+async function waitForQueueOwnerRetirement(lockPath: string): Promise<void> {
+  const deadline = Date.now() + QUEUE_OWNER_RETIREMENT_WAIT_MS;
+  while (await queueOwnerRetirementIsActive(lockPath)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for queue owner retirement lock ${lockPath}`);
+    }
+    await waitMs(QUEUE_OWNER_RETIREMENT_POLL_MS);
+  }
+}
+
+type QueueOwnerRetirementMarkerLease = {
+  marker: QueueOwnerRetirementMarker;
+  livenessServer: net.Server;
+};
+
+function retirementMarkerLivenessPath(markerId: string): string {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\acpx-retire-${markerId}`
+    : path.join("/tmp", `acpx-retire-${markerId}.sock`);
+}
+
+async function startRetirementMarkerLiveness(
+  markerId: string,
+): Promise<{ livenessPath: string; livenessServer: net.Server }> {
+  const livenessPath = retirementMarkerLivenessPath(markerId);
+  if (process.platform !== "win32") {
+    await fs.unlink(livenessPath).catch(() => undefined);
+  }
+  const livenessServer = net.createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => reject(error);
+    livenessServer.once("error", onError);
+    livenessServer.listen(livenessPath, () => {
+      livenessServer.off("error", onError);
+      resolve();
+    });
+  });
+  livenessServer.unref();
+  return { livenessPath, livenessServer };
+}
+
+async function stopRetirementMarkerLiveness(lease: QueueOwnerRetirementMarkerLease): Promise<void> {
+  if (lease.livenessServer.listening) {
+    await new Promise<void>((resolve) => lease.livenessServer.close(() => resolve()));
+  }
+  if (process.platform !== "win32") {
+    await fs.unlink(lease.marker.livenessPath).catch(() => undefined);
+  }
+}
+
+async function tryCreateRetirementMarker(
+  lockPath: string,
+  expected: QueueOwnerRecord,
+): Promise<QueueOwnerRetirementMarkerLease | undefined> {
+  const markerPath = retirementMarkerPath(lockPath);
+  const markerId = randomUUID();
+  const temporaryPath = `${markerPath}.publish.${markerId}.tmp`;
+  const liveness = await startRetirementMarkerLiveness(markerId);
+  const marker: QueueOwnerRetirementMarker = {
+    markerId,
+    livenessPath: liveness.livenessPath,
+    pid: process.pid,
+    ownerGeneration: expected.ownerGeneration,
+    createdAt: nowIso(),
+  };
+  const lease: QueueOwnerRetirementMarkerLease = {
+    marker,
+    livenessServer: liveness.livenessServer,
+  };
+  let keepLiveness = false;
+  try {
+    await fs.writeFile(temporaryPath, `${JSON.stringify(marker)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    await fs.link(temporaryPath, markerPath);
+    const competingMarker = (await activeRetirementMarkers(lockPath)).some(
+      (active) => active.markerId !== marker.markerId,
+    );
+    if (competingMarker) {
+      await removeOwnedRetirementMarkers(lockPath, marker.markerId);
+      return undefined;
+    }
+    keepLiveness = true;
+    return lease;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      throw error;
+    }
+    return undefined;
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => {
+      // Best effort after publishing the completed marker through a hard link.
+    });
+    if (!keepLiveness) {
+      await stopRetirementMarkerLiveness(lease);
+    }
+  }
+}
+
+async function removeSharedRetirementMarkerIfOwned(
+  lockPath: string,
+  markerId: string,
+): Promise<void> {
+  const markerPath = retirementMarkerPath(lockPath);
+  const quarantinePath = createRetirementQuarantinePath(lockPath);
+  try {
+    await fs.rename(markerPath, quarantinePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+  const marker = await readRetirementMarker(quarantinePath);
+  if (marker?.markerId === markerId) {
+    await fs.unlink(quarantinePath).catch(() => undefined);
+    return;
+  }
+  await restoreQuarantinedRetirementMarker(lockPath, quarantinePath);
+}
+
+async function removeUniqueRetirementMarkerIfOwned(
+  markerPath: string,
+  markerId: string,
+): Promise<void> {
+  if ((await readRetirementMarker(markerPath))?.markerId === markerId) {
+    await fs.unlink(markerPath).catch(() => undefined);
+  }
+}
+
+async function removeOwnedRetirementMarkers(lockPath: string, markerId: string): Promise<void> {
+  const sharedPath = retirementMarkerPath(lockPath);
+  // A concurrent stale-marker cleanup may move the shared marker to a unique
+  // quarantine between scans. Re-scan so the immutable marker identity is
+  // removed without ever unlinking a path owned by another marker.
+  for (let pass = 0; pass < 3; pass += 1) {
+    const markerPaths = await listRetirementMarkerPaths(lockPath);
+    await Promise.all(
+      markerPaths.map(async (markerPath) =>
+        markerPath === sharedPath
+          ? await removeSharedRetirementMarkerIfOwned(lockPath, markerId)
+          : await removeUniqueRetirementMarkerIfOwned(markerPath, markerId),
+      ),
+    );
+  }
+}
+
+export async function readQueueOwnerRecord(
+  sessionId: string,
+): Promise<QueueOwnerRecord | undefined> {
+  const state = await readQueueOwnerRecordState(sessionId);
+  return state.kind === "record" ? state.owner : undefined;
+}
+
+type QueueOwnerRecordReadState =
+  | { kind: "record"; owner: QueueOwnerRecord }
+  | { kind: "missing" }
+  | { kind: "unreadable" };
+
+async function readQueueOwnerRecordStateAtPath(
+  recordPath: string,
+): Promise<QueueOwnerRecordReadState> {
+  try {
+    const payload = await fs.readFile(recordPath, "utf8");
+    const parsed = parseQueueOwnerRecord(JSON.parse(payload));
+    return parsed ? { kind: "record", owner: parsed } : { kind: "unreadable" };
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unreadable" };
+  }
+}
+
+async function readQueueOwnerRecordState(sessionId: string): Promise<QueueOwnerRecordReadState> {
+  return await readQueueOwnerRecordStateAtPath(queueLockFilePath(sessionId));
 }
 
 export async function terminateProcess(pid: number): Promise<boolean> {
@@ -400,6 +776,7 @@ export async function tryAcquireQueueOwnerLease(
   const mcpConfigMetadata = createMcpConfigMetadata(mcpConfigPath, mcpConfigFingerprint);
   await ensureQueueDir();
   const lockPath = queueLockFilePath(sessionId);
+  await waitForQueueOwnerRetirement(lockPath);
   const socketPath = queueSocketPath(sessionId);
   const createdAt = clock();
   const ownerGeneration = createOwnerGeneration();
@@ -422,11 +799,21 @@ export async function tryAcquireQueueOwnerLease(
     2,
   );
 
+  const temporaryPath = createAtomicWriteTempPath(lockPath);
+  await fs.writeFile(temporaryPath, `${payload}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
   try {
-    await fs.writeFile(lockPath, `${payload}\n`, {
-      encoding: "utf8",
-      flag: "wx",
-    });
+    try {
+      // Publish only a complete record. Writing directly with `wx` creates the
+      // inode before its contents are visible, so a contender can misclassify
+      // the in-progress owner record as stale and unlink the winning lease.
+      await fs.link(temporaryPath, lockPath);
+    } catch (error) {
+      return await handleLeaseCollision(sessionId, error);
+    }
     await removeSocketFile(socketPath).catch(() => {
       // best-effort stale socket cleanup after ownership is acquired
     });
@@ -440,8 +827,10 @@ export async function tryAcquireQueueOwnerLease(
       ...(parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs }),
       ...mcpConfigMetadata,
     };
-  } catch (error) {
-    return await handleLeaseCollision(sessionId, error);
+  } finally {
+    await fs.unlink(temporaryPath).catch(() => {
+      // Best effort after publishing the completed lease through a hard link.
+    });
   }
 }
 
@@ -524,60 +913,271 @@ function resolveLeaseArguments(
   return { mcpConfigPath: undefined, clock: nowIsoFactory };
 }
 
-export async function refreshQueueOwnerLease(
+export function refreshQueueOwnerLease(
   lease: QueueOwnerLease,
   options: {
     queueDepth: number;
   },
   nowIsoFactory: () => string = nowIso,
 ): Promise<void> {
-  const payload = JSON.stringify(
-    {
-      pid: process.pid,
-      sessionId: lease.sessionId,
-      socketPath: lease.socketPath,
-      createdAt: lease.createdAt,
-      heartbeatAt: nowIsoFactory(),
-      ownerGeneration: lease.ownerGeneration,
-      queueDepth: Math.max(0, Math.round(options.queueDepth)),
-      queueProtocol: QUEUE_PROTOCOL_VERSION,
-      acpxVersion: getAcpxVersion(),
-      ...(lease.parking ? { parking: true } : {}),
-      ...(lease.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: lease.parkingMaxAgeMs }),
-      ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
-      ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
-    },
-    null,
-    2,
-  );
-  await fs.writeFile(lease.lockPath, `${payload}\n`, {
-    encoding: "utf8",
-  });
-}
-
-export async function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
-  await removeSocketFile(lease.socketPath).catch(() => {
-    // ignore best-effort cleanup failures
-  });
-
-  await fs.unlink(lease.lockPath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
+  const state = queueOwnerLeaseMutationState(lease);
+  if (state.releasing) {
+    return Promise.resolve();
+  }
+  return enqueueQueueOwnerLeaseMutation(state, async () => {
+    if (state.releasing) {
+      return;
+    }
+    const payload = JSON.stringify(
+      {
+        pid: process.pid,
+        sessionId: lease.sessionId,
+        socketPath: lease.socketPath,
+        createdAt: lease.createdAt,
+        heartbeatAt: nowIsoFactory(),
+        ownerGeneration: lease.ownerGeneration,
+        queueDepth: Math.max(0, Math.round(options.queueDepth)),
+        queueProtocol: QUEUE_PROTOCOL_VERSION,
+        acpxVersion: getAcpxVersion(),
+        ...(lease.parking ? { parking: true } : {}),
+        ...(lease.parkingMaxAgeMs === undefined ? {} : { parkingMaxAgeMs: lease.parkingMaxAgeMs }),
+        ...(lease.mcpConfigPath ? { mcpConfigPath: lease.mcpConfigPath } : {}),
+        ...(lease.mcpConfigFingerprint ? { mcpConfigFingerprint: lease.mcpConfigFingerprint } : {}),
+      },
+      null,
+      2,
+    );
+    const temporaryPath = createAtomicWriteTempPath(lease.lockPath);
+    try {
+      await fs.writeFile(temporaryPath, `${payload}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      if (!state.releasing) {
+        await fs.rename(temporaryPath, lease.lockPath);
+      }
+    } finally {
+      await fs.unlink(temporaryPath).catch(() => undefined);
     }
   });
 }
 
+export function releaseQueueOwnerLease(lease: QueueOwnerLease): Promise<void> {
+  const state = queueOwnerLeaseMutationState(lease);
+  if (state.releasePromise) {
+    return state.releasePromise;
+  }
+  state.releasing = true;
+  state.releasePromise = enqueueQueueOwnerLeaseMutation(state, async () => {
+    try {
+      const expected = queueOwnerRecordIdentityForLease(lease);
+      const result = await removeQueueOwnerRecordIfCurrent(lease.lockPath, expected);
+      if (result === "failed") {
+        throw new Error(`Failed to release queue owner lease for session ${lease.sessionId}`);
+      }
+    } catch (error) {
+      // Teardown remains a one-way barrier for refreshes, but a transient
+      // filesystem failure must not prevent a later release attempt.
+      state.releasePromise = undefined;
+      throw error;
+    }
+  });
+  return state.releasePromise;
+}
+
+async function readQueueOwnerForTermination(
+  sessionId: string,
+): Promise<QueueOwnerRecord | undefined> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const state = await readQueueOwnerRecordState(sessionId);
+    if (state.kind === "record") {
+      return state.owner;
+    }
+    if (state.kind === "missing") {
+      return undefined;
+    }
+    await waitMs(10);
+  }
+  throw new Error(`Failed to read queue owner for session ${sessionId}`);
+}
+
 export async function terminateQueueOwnerForSession(sessionId: string): Promise<void> {
-  const owner = await readQueueOwnerRecord(sessionId);
-  if (!owner) {
-    return;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const owner = await readQueueOwnerForTermination(sessionId);
+    if (!owner) {
+      return;
+    }
+    const result = await terminateQueueOwnerIfCurrent(sessionId, owner);
+    if (result === "retired") {
+      return;
+    }
+    if (result === "failed") {
+      throw new Error(`Failed to terminate queue owner for session ${sessionId}`);
+    }
+    // A session-wide close owns replacement cleanup too. Re-read the record so
+    // the next attempt targets the replacement's immutable identity.
+  }
+  throw new Error(`Queue owner changed repeatedly while terminating session ${sessionId}`);
+}
+
+function isSameQueueOwner(
+  owner: QueueOwnerRecord | undefined,
+  expected: QueueOwnerRecord,
+): boolean {
+  return owner?.pid === expected.pid && owner.ownerGeneration === expected.ownerGeneration;
+}
+
+export type QueueOwnerTerminationResult = "retired" | "replaced" | "failed";
+
+function changedQueueOwnerResult(
+  owner: QueueOwnerRecord | undefined,
+  expected: QueueOwnerRecord,
+): QueueOwnerTerminationResult | undefined {
+  if (isSameQueueOwner(owner, expected)) {
+    return undefined;
+  }
+  return owner ? "replaced" : "retired";
+}
+
+async function changedQueueOwnerResultFromDisk(
+  sessionId: string,
+  expected: QueueOwnerRecord,
+): Promise<QueueOwnerTerminationResult | undefined> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const state = await readQueueOwnerRecordState(sessionId);
+    if (state.kind === "record") {
+      return changedQueueOwnerResult(state.owner, expected);
+    }
+    if (state.kind === "missing") {
+      return "retired";
+    }
+    await waitMs(10);
+  }
+  return "failed";
+}
+
+async function terminateExpectedOwnerProcess(expected: QueueOwnerRecord): Promise<boolean> {
+  if (!isProcessAlive(expected.pid)) {
+    return true;
+  }
+  if (await terminateProcess(expected.pid)) {
+    return true;
+  }
+  return !isProcessAlive(expected.pid);
+}
+
+function createRetiringOwnerQuarantinePath(lockPath: string): string {
+  return `${lockPath}.retired.${process.pid}.${randomUUID()}`;
+}
+
+async function restoreQuarantinedQueueOwnerRecord(
+  lockPath: string,
+  quarantinePath: string,
+): Promise<void> {
+  try {
+    await fs.link(quarantinePath, lockPath);
+    await fs.unlink(quarantinePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "ENOENT") {
+      throw error;
+    }
+    // A newer owner may already hold the shared path. Keep this uniquely named
+    // record rather than deleting a replacement whose identity we do not own.
+  }
+}
+
+function queueOwnerRecordIdentityForLease(lease: QueueOwnerLease): QueueOwnerRecord {
+  return {
+    pid: process.pid,
+    sessionId: lease.sessionId,
+    socketPath: lease.socketPath,
+    createdAt: lease.createdAt,
+    heartbeatAt: lease.createdAt,
+    ownerGeneration: lease.ownerGeneration,
+    queueDepth: 0,
+  };
+}
+
+async function removeQueueOwnerRecordIfCurrent(
+  lockPath: string,
+  expected: QueueOwnerRecord,
+): Promise<QueueOwnerTerminationResult> {
+  const quarantinePath = createRetiringOwnerQuarantinePath(lockPath);
+  try {
+    await fs.rename(lockPath, quarantinePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return "retired";
+    }
+    throw error;
   }
 
-  if (isProcessAlive(owner.pid)) {
-    await terminateProcess(owner.pid);
+  const quarantined = await readQueueOwnerRecordStateAtPath(quarantinePath);
+  if (quarantined.kind === "record" && isSameQueueOwner(quarantined.owner, expected)) {
+    await fs.unlink(quarantinePath).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    });
+    // Do not unlink the deterministic socket here. A legacy replacement can
+    // publish after the atomic rename without honoring the retirement marker;
+    // the next owner removes the dead socket only after acquiring the lock.
+    return "retired";
   }
 
-  await cleanupStaleQueueOwner(sessionId, owner);
+  await restoreQuarantinedQueueOwnerRecord(lockPath, quarantinePath);
+  return quarantined.kind === "record" ? "replaced" : "failed";
+}
+
+async function retireMarkedQueueOwner(
+  sessionId: string,
+  lockPath: string,
+  expected: QueueOwnerRecord,
+): Promise<QueueOwnerTerminationResult> {
+  const markedOwnerResult = await changedQueueOwnerResultFromDisk(sessionId, expected);
+  if (markedOwnerResult) {
+    return markedOwnerResult;
+  }
+  if (!(await terminateExpectedOwnerProcess(expected))) {
+    return "failed";
+  }
+  const terminatedOwnerResult = await changedQueueOwnerResultFromDisk(sessionId, expected);
+  if (terminatedOwnerResult) {
+    return terminatedOwnerResult;
+  }
+  return await removeQueueOwnerRecordIfCurrent(lockPath, expected);
+}
+
+export async function terminateQueueOwnerIfCurrent(
+  sessionId: string,
+  expected: QueueOwnerRecord,
+): Promise<QueueOwnerTerminationResult> {
+  const lockPath = queueLockFilePath(sessionId);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await waitForQueueOwnerRetirement(lockPath);
+    const changedOwner = await changedQueueOwnerResultFromDisk(sessionId, expected);
+    if (changedOwner) {
+      return changedOwner;
+    }
+
+    const markerLease = await tryCreateRetirementMarker(lockPath, expected);
+    if (!markerLease) {
+      continue;
+    }
+
+    try {
+      return await retireMarkedQueueOwner(sessionId, lockPath, expected);
+    } finally {
+      try {
+        await removeOwnedRetirementMarkers(lockPath, markerLease.marker.markerId);
+      } finally {
+        await stopRetirementMarkerLiveness(markerLease);
+      }
+    }
+  }
+
+  return "failed";
 }
 
 export async function waitMs(ms: number): Promise<void> {

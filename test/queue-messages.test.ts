@@ -63,6 +63,7 @@ test("parseQueueRequest accepts prompt session options", () => {
     permissionMode: "approve-reads",
     sessionOptions: {
       model: "fast-model",
+      effort: "high",
       allowedTools: ["Read", "Grep"],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
@@ -85,6 +86,7 @@ test("parseQueueRequest accepts prompt session options", () => {
     waitForCompletion: true,
     sessionOptions: {
       model: "fast-model",
+      effort: "high",
       allowedTools: ["Read", "Grep"],
       maxTurns: 4,
       systemPrompt: { append: "keep it brief" },
@@ -104,6 +106,19 @@ test("parseQueueRequest rejects invalid prompt session options", () => {
       permissionMode: "approve-reads",
       sessionOptions: {
         model: "   ",
+      },
+      waitForCompletion: true,
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueRequest({
+      type: "submit_prompt",
+      requestId: "req-session-options-invalid-effort",
+      message: "hello",
+      permissionMode: "approve-reads",
+      sessionOptions: {
+        effort: "   ",
       },
       waitForCompletion: true,
     }),
@@ -231,6 +246,25 @@ test("parseQueueRequest accepts control requests and explicit prompt blocks", ()
 
   assert.deepEqual(
     parseQueueRequest({
+      type: "apply_session_preferences",
+      requestId: "req-preferences",
+      ownerGeneration: 6,
+      modelId: "smart-model",
+      effort: "xhigh",
+      timeoutMs: 2_500,
+    }),
+    {
+      type: "apply_session_preferences",
+      requestId: "req-preferences",
+      ownerGeneration: 6,
+      modelId: "smart-model",
+      effort: "xhigh",
+      timeoutMs: 2_500,
+    },
+  );
+
+  assert.deepEqual(
+    parseQueueRequest({
       type: "submit_prompt",
       requestId: "req-prompt",
       message: "ignored text fallback",
@@ -276,6 +310,15 @@ test("parseQueueRequest rejects invalid control and prompt payload shapes", () =
       requestId: "req-config",
       configId: "thinking_level",
       value: "   ",
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueRequest({
+      type: "apply_session_preferences",
+      requestId: "req-preferences",
+      modelId: "smart-model",
+      effort: "   ",
     }),
     null,
   );
@@ -410,6 +453,26 @@ test("parseQueueOwnerMessage accepts structured non-error owner messages", () =>
           },
         ],
       },
+    },
+  );
+
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "apply_session_preferences_result",
+      requestId: "req-preferences",
+      modelId: "smart-model",
+      effort: "xhigh",
+      effortConfigId: "reasoning_effort",
+      response: { configOptions: [] },
+    }),
+    {
+      type: "apply_session_preferences_result",
+      requestId: "req-preferences",
+      ownerGeneration: undefined,
+      modelId: "smart-model",
+      effort: "xhigh",
+      effortConfigId: "reasoning_effort",
+      response: { configOptions: [] },
     },
   );
 });
@@ -567,6 +630,16 @@ test("parseQueueOwnerMessage rejects invalid structured owner message payloads",
     parseQueueOwnerMessage({
       type: "set_config_option_result",
       requestId: "req-config",
+      response: {},
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "apply_session_preferences_result",
+      requestId: "req-preferences",
+      effort: "high",
+      effortConfigId: "reasoning_effort",
       response: {},
     }),
     null,
