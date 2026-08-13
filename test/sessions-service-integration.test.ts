@@ -254,6 +254,89 @@ test("allocated session starts fail closed across keys without repeating the pro
   });
 });
 
+test("post-dispatch timeout remains in doubt and a fresh key does not dispatch again", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "ambiguous-dispatch-calls.ndjson");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: ["--hang-on-new-session", "--call-log", callLog],
+      },
+    });
+    const service = createAcpxSessionService({ cwd, adapterOperationTimeoutMs: 500 });
+    const input = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      idempotencyKey: "ambiguous-dispatch-first",
+    };
+
+    try {
+      await assert.rejects(async () => await service.createSession(input));
+      await assert.rejects(
+        async () =>
+          await service.createSession({
+            ...input,
+            idempotencyKey: "ambiguous-dispatch-second",
+          }),
+        AcpxSessionStartInDoubtError,
+      );
+
+      const calls = (await fs.readFile(callLog, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { method?: string });
+      assert.equal(calls.filter((entry) => entry.method === "session/new:received").length, 1);
+      assert.equal((await listSessions()).length, 0);
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+test("pre-provider spawn failures do not poison fresh-key recovery scope", async () => {
+  await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const callLog = path.join(homeDir, "pre-provider-calls.ndjson");
+    await fs.mkdir(cwd, { recursive: true });
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        command: path.join(homeDir, "missing-adapter-command"),
+        args: ["--supports-resume-session", "--call-log", callLog],
+      },
+    });
+    const service = createAcpxSessionService({ cwd });
+    const input = {
+      agentId: "recoverable",
+      cwd,
+      mode: "plan",
+      idempotencyKey: "pre-provider-first",
+    };
+
+    await assert.rejects(async () => await service.createSession(input));
+    await writeAgentConfig(homeDir, {
+      recoverable: {
+        args: ["--supports-resume-session", "--call-log", callLog],
+      },
+    });
+    const retried = await service.createSession({
+      ...input,
+      idempotencyKey: "pre-provider-second",
+    });
+
+    assert.equal(retried.replayed, false);
+    assert.equal(retried.result.mode, "plan");
+    assert.equal((await listSessions()).length, 1);
+    const calls = (await fs.readFile(callLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { method?: string });
+    assert.equal(calls.filter((entry) => entry.method === "session/new").length, 1);
+    service.dispose();
+  });
+});
+
 test("adoption with a fresh key reconciles a post-adopt mode failure", async () => {
   await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

@@ -263,17 +263,18 @@ function isRecoverableScopeMatch(
 }
 
 // oxlint-disable-next-line eslint/complexity -- Directory scanning distinguishes I/O failure, foreign corruption, and conflicting checkpoints.
-async function findScopedRecovery(
+async function findScopedRecoveries(
   operation: AcpxMutationOperation,
   scopeHash: string,
   currentKey: string,
-): Promise<StoredMutation | undefined> {
+  expectedCheckpoint?: unknown,
+): Promise<StoredMutation[]> {
   let files: string[];
   try {
     files = await fs.readdir(baseDir());
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return undefined;
+      return [];
     }
     throw error;
   }
@@ -299,9 +300,11 @@ async function findScopedRecovery(
     }
   }
   if (candidates.length === 0) {
-    return undefined;
+    return [];
   }
-  const checkpoint = JSON.stringify(canonicalize(candidates[0]?.recovery_result));
+  const checkpoint = JSON.stringify(
+    canonicalize(expectedCheckpoint ?? candidates[0]?.recovery_result),
+  );
   if (
     candidates.some(
       (candidate) => JSON.stringify(canonicalize(candidate.recovery_result)) !== checkpoint,
@@ -309,7 +312,7 @@ async function findScopedRecovery(
   ) {
     throw new AcpxIdempotencyInDoubtError(currentKey, operation);
   }
-  return candidates.toSorted((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+  return candidates.toSorted((left, right) => right.updated_at.localeCompare(left.updated_at));
 }
 
 async function completeRecovery<T>(
@@ -332,6 +335,21 @@ async function completeRecovery<T>(
     replayed: true,
     result,
   };
+}
+
+async function retireScopedRecoveries(
+  candidates: StoredMutation[],
+  result: unknown,
+): Promise<void> {
+  const updatedAt = new Date().toISOString();
+  for (const candidate of candidates) {
+    await writeStored(candidate.idempotency_key, {
+      ...candidate,
+      state: "succeeded",
+      updated_at: updatedAt,
+      result,
+    });
+  }
 }
 
 // oxlint-disable-next-line eslint/complexity -- Durable replay, recovery, ambiguity, and failure are separate terminal states.
@@ -383,12 +401,22 @@ export async function runIdempotentMutation<T>(options: {
       }
       if (stored.recovery_result !== undefined) {
         if (options.recover) {
-          return await completeRecovery(
+          const equivalents = scopeHash
+            ? await findScopedRecoveries(
+                options.operation,
+                scopeHash,
+                options.idempotencyKey,
+                stored.recovery_result,
+              )
+            : [];
+          const receipt = await completeRecovery(
             options.operation,
             options.idempotencyKey,
             options.recover,
             stored,
           );
+          await retireScopedRecoveries(equivalents, receipt.result);
+          return receipt;
         }
         return {
           operation: options.operation,
@@ -401,10 +429,11 @@ export async function runIdempotentMutation<T>(options: {
     }
 
     const now = new Date().toISOString();
-    const prior =
+    const priors =
       scopeHash && options.recover
-        ? await findScopedRecovery(options.operation, scopeHash, options.idempotencyKey)
-        : undefined;
+        ? await findScopedRecoveries(options.operation, scopeHash, options.idempotencyKey)
+        : [];
+    const prior = priors[0];
     const started: StoredMutation = {
       schema: IDEMPOTENCY_SCHEMA,
       idempotency_key: options.idempotencyKey,
@@ -427,12 +456,7 @@ export async function runIdempotentMutation<T>(options: {
           options.recover,
           started,
         );
-        await writeStored(prior.idempotency_key, {
-          ...prior,
-          state: "succeeded",
-          updated_at: new Date().toISOString(),
-          result: receipt.result,
-        });
+        await retireScopedRecoveries(priors, receipt.result);
         return receipt;
       } catch (error) {
         await writeStored(options.idempotencyKey, {

@@ -153,6 +153,59 @@ test("a fresh idempotency key recovers a checkpointed mutation in the same scope
   });
 });
 
+test("successful scoped recovery retires every equivalent started checkpoint", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const recoveryScope = { agentId: "mock", cwd: "/workspace", mode: "plan" };
+    const checkpoint = { recordId: "record-equivalent", phase: "created" };
+    const keys = ["equivalent-first", "equivalent-second"];
+    let recoveries = 0;
+    for (const key of keys) {
+      await assert.rejects(
+        async () =>
+          await runIdempotentMutation({
+            operation: "create_session",
+            idempotencyKey: key,
+            input: { ...recoveryScope, idempotencyKey: key },
+            recoveryScope,
+            recover: async (value) => {
+              assert.deepEqual(value, checkpoint);
+              recoveries += 1;
+              throw new Error("recovery remains unavailable");
+            },
+            run: async (saveCheckpoint) => {
+              await saveCheckpoint(checkpoint);
+              throw new Error("initial side effect failed");
+            },
+          }),
+        /(?:initial side effect failed|recovery remains unavailable)/u,
+      );
+    }
+
+    const recovered = await runIdempotentMutation({
+      operation: "create_session",
+      idempotencyKey: "equivalent-third",
+      input: { ...recoveryScope, idempotencyKey: "equivalent-third" },
+      recoveryScope,
+      recover: async (value) => {
+        assert.deepEqual(value, checkpoint);
+        recoveries += 1;
+        return { id: checkpoint.recordId };
+      },
+      run: async () => ({ id: "duplicate" }),
+    });
+    assert.deepEqual(recovered.result, { id: checkpoint.recordId });
+
+    for (const key of [...keys, "equivalent-third"]) {
+      const stored = JSON.parse(
+        await fs.readFile(idempotencyTestInternals.mutationPath(key), "utf8"),
+      ) as { state?: string; result?: unknown };
+      assert.equal(stored.state, "succeeded");
+      assert.deepEqual(stored.result, { id: checkpoint.recordId });
+    }
+    assert.equal(recoveries, 2);
+  });
+});
+
 test("an ambiguous mutation keeps its recovery result instead of caching failure", async () => {
   await withTempHome("acpx-sessions-idempotency-", async () => {
     let runs = 0;

@@ -218,7 +218,7 @@ export type AcpxSessionsServiceOptions = {
   mcpConfigPath?: string;
   timelinePollMs?: number;
   /** Receives contained invalidation-poll failures; polling continues on the next interval. */
-  onBackgroundError?: (error: unknown) => void;
+  onBackgroundError?: (error: unknown) => void | Promise<void>;
   /** Bound adapter initialization, list, create, adopt, and initial mode application. */
   adapterOperationTimeoutMs?: number;
   /** Default bound for waiting on a queue owner to confirm a pending-request answer. */

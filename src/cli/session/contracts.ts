@@ -82,6 +82,8 @@ export type SessionCreateOptions = {
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
   onModelWarning?: (message: string) => void;
+  /** Awaited immediately before session/new, session/resume, or session/load is dispatched. */
+  onProviderMutationDispatch?: () => void | Promise<void>;
 } & TimedRunOptions;
 
 export type SessionSendOptions = {

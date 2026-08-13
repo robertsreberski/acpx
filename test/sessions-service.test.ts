@@ -12,6 +12,7 @@ import {
 } from "../src/session/pending-requests.js";
 import { resolveSessionRecord } from "../src/session/persistence.js";
 import { appendSessionTimelineLifecycleEvent } from "../src/session/timeline.js";
+import { sessionsServiceTestInternals } from "../src/sessions-service/service.js";
 import { AcpxTurnNotActiveError, createAcpxSessionService } from "../src/sessions.js";
 import {
   cleanupOwnerArtifacts,
@@ -56,6 +57,37 @@ test("session lookup requires an exact acpx record id and returns browser-safe D
     });
     service.dispose();
   });
+});
+
+test("session recovery scopes use canonical agent identity and effective normalized mode", () => {
+  const aliased = sessionsServiceTestInternals.sessionStartRecoveryScope(
+    {
+      agentId: " factory-droid ",
+      cwd: "/workspace/../workspace",
+      idempotencyKey: "alias",
+    },
+    { agentId: "droid" },
+  );
+  const canonical = sessionsServiceTestInternals.sessionStartRecoveryScope(
+    { agentId: "droid", cwd: "/workspace", idempotencyKey: "canonical" },
+    { agentId: "droid" },
+  );
+  assert.deepEqual(aliased, canonical);
+
+  const implicitDefault = sessionsServiceTestInternals.sessionStartRecoveryScope(
+    { agentId: "codex", cwd: "/workspace", idempotencyKey: "implicit" },
+    { agentId: "codex" },
+  );
+  const explicitDefault = sessionsServiceTestInternals.sessionStartRecoveryScope(
+    {
+      agentId: "CODEX",
+      cwd: "/workspace",
+      mode: "  read-only  ",
+      idempotencyKey: "explicit",
+    },
+    { agentId: "codex" },
+  );
+  assert.deepEqual(implicitDefault, explicitDefault);
 });
 
 test("a live owner with a stale heartbeat is unreachable, never starting", async () => {
@@ -620,6 +652,48 @@ test("invalidation polling reports background failures and retries", async () =>
     } finally {
       unsubscribe();
       service.dispose();
+    }
+  });
+});
+
+test("async background error callback rejections are reported without escaping", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    const acpxPath = path.join(homeDir, ".acpx");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.writeFile(acpxPath, "blocks session directory creation", "utf8");
+    const originalWarn = console.warn;
+    const warnings: unknown[][] = [];
+    let resolveWarning: (() => void) | undefined;
+    const warned = new Promise<void>((resolve) => {
+      resolveWarning = resolve;
+    });
+    console.warn = (...values: unknown[]) => {
+      warnings.push(values);
+      resolveWarning?.();
+    };
+    const service = createAcpxSessionService({
+      cwd,
+      onBackgroundError: async () => {
+        await Promise.resolve();
+        throw new Error("async observer failed");
+      },
+    });
+    const unsubscribe = service.subscribe(() => undefined);
+    try {
+      await Promise.race([
+        warned,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("timed out waiting for callback warning")), 2_000),
+        ),
+      ]);
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0]?.[0], "[acpx sessions] background error callback failed");
+      assert.match(String(warnings[0]?.[1]), /async observer failed/u);
+    } finally {
+      unsubscribe();
+      service.dispose();
+      console.warn = originalWarn;
     }
   });
 });

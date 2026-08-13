@@ -854,6 +854,7 @@ class MockAgent implements Agent {
   }
 
   async newSession(): Promise<NewSessionResponse> {
+    this.logCall({ method: "session/new:received" });
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }

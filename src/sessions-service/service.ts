@@ -26,7 +26,7 @@ import { createSessionWithClient, listAgentSessions } from "../cli/session/sessi
 import { PendingRequestOwnerGoneError, SessionNotFoundError } from "../errors.js";
 import { textPrompt } from "../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../runtime/engine/lifecycle.js";
-import { setDesiredModeId } from "../session/mode-preference.js";
+import { normalizeModeId, setDesiredModeId } from "../session/mode-preference.js";
 import {
   listPendingRequests as listStoredPendingRequests,
   readPendingRequest,
@@ -219,15 +219,20 @@ function defaultMode(agentId: string): string | undefined {
   }
 }
 
+function effectiveSessionMode(input: AcpxCreateSessionInput, agentId: string): string | undefined {
+  return normalizeModeId(input.mode) ?? defaultMode(agentId);
+}
+
 function sessionStartRecoveryScope(
   input: AcpxCreateSessionInput,
+  agent: Pick<ResolvedAgent, "agentId">,
   providerSessionId?: string,
 ): Record<string, unknown> {
   return {
-    agentId: normalizeAgentName(input.agentId),
+    agentId: agent.agentId,
     cwd: path.resolve(input.cwd),
     name: input.name,
-    mode: input.mode,
+    mode: effectiveSessionMode(input, agent.agentId),
     model: input.model,
     permissionMode: input.permissionMode,
     permissionPolicy: input.permissionPolicy,
@@ -373,7 +378,7 @@ class SessionService implements AcpxSessionService {
     agent: ResolvedAgent,
     record: SessionRecord,
   ): Promise<SessionRecord> {
-    const mode = input.mode ?? defaultMode(agent.agentId);
+    const mode = effectiveSessionMode(input, agent.agentId);
     if (!mode || record.acpx?.desired_mode_id === mode) {
       return record;
     }
@@ -485,10 +490,6 @@ class SessionService implements AcpxSessionService {
     }
 
     const recordId = randomUUID();
-    // Establish local identity before any provider-side effect. If the process
-    // dies after session/new or session/resume but before the record is written,
-    // recovery fails closed instead of repeating the provider mutation.
-    await checkpoint?.({ recordId, phase: "allocated" });
     let created: Awaited<ReturnType<typeof createSessionWithClient>>;
     try {
       created = await createSessionWithClient({
@@ -507,6 +508,12 @@ class SessionService implements AcpxSessionService {
         authPolicy: this.options.authPolicy ?? agent.config.authPolicy,
         timeoutMs: this.adapterTimeout(agent.config),
         sessionOptions: input.model ? { model: input.model } : undefined,
+        onProviderMutationDispatch: async () => {
+          // Persist the ambiguity boundary immediately before the provider RPC.
+          // Spawn, initialization, and capability failures occur before this
+          // checkpoint and therefore do not poison fresh-key recovery scopes.
+          await checkpoint?.({ recordId, phase: "allocated" });
+        },
       });
     } catch (error) {
       if (providerSessionId) {
@@ -519,7 +526,7 @@ class SessionService implements AcpxSessionService {
       record.acpx = { ...record.acpx, agent_id: agent.agentId };
       await writeSessionRecord(record);
       await checkpoint?.({ recordId: record.acpxRecordId, phase: "created" });
-      const mode = input.mode ?? defaultMode(agent.agentId);
+      const mode = effectiveSessionMode(input, agent.agentId);
       if (mode) {
         await withTimeout(
           client.setSessionMode(record.acpSessionId, mode),
@@ -570,11 +577,12 @@ class SessionService implements AcpxSessionService {
   async createSession(
     input: AcpxCreateSessionInput,
   ): Promise<AcpxMutationReceipt<AcpxSessionDetail>> {
+    const agent = await this.resolveAgent(input.agentId, input.cwd);
     const receipt = await runIdempotentMutation({
       operation: "create_session",
       idempotencyKey: input.idempotencyKey,
       input,
-      recoveryScope: sessionStartRecoveryScope(input),
+      recoveryScope: sessionStartRecoveryScope(input, agent),
       recover: async (checkpoint) => await this.recoverStartedSession(input, checkpoint),
       run: async (checkpoint) => await this.startSession(input, undefined, checkpoint),
     });
@@ -585,11 +593,12 @@ class SessionService implements AcpxSessionService {
   async adoptSession(
     input: AcpxAdoptSessionInput,
   ): Promise<AcpxMutationReceipt<AcpxSessionDetail>> {
+    const agent = await this.resolveAgent(input.agentId, input.cwd);
     const receipt = await runIdempotentMutation({
       operation: "adopt_session",
       idempotencyKey: input.idempotencyKey,
       input,
-      recoveryScope: sessionStartRecoveryScope(input, input.providerSessionId),
+      recoveryScope: sessionStartRecoveryScope(input, agent, input.providerSessionId),
       recover: async (checkpoint) =>
         await this.recoverStartedSession(input, checkpoint, input.providerSessionId),
       run: async (checkpoint) =>
@@ -843,12 +852,12 @@ class SessionService implements AcpxSessionService {
   private pollInvalidationsInBackground(): void {
     void this.pollInvalidations().catch((error: unknown) => {
       if (this.options.onBackgroundError) {
-        try {
-          this.options.onBackgroundError(error);
-          return;
-        } catch (callbackError) {
-          console.warn("[acpx sessions] background error callback failed", callbackError);
-        }
+        void Promise.resolve()
+          .then(async () => await this.options.onBackgroundError?.(error))
+          .catch((callbackError: unknown) => {
+            console.warn("[acpx sessions] background error callback failed", callbackError);
+          });
+        return;
       }
       console.warn("[acpx sessions] invalidation polling failed", error);
     });
@@ -924,4 +933,5 @@ export const sessionsServiceTestInternals = {
   mergePending,
   providerSessionProjection,
   registeredAgent,
+  sessionStartRecoveryScope,
 };

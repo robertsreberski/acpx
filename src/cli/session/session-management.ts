@@ -41,6 +41,12 @@ type CreatedSessionState = {
   requestedModelResponse?: Awaited<ReturnType<AcpClient["setSessionModel"]>>;
 };
 
+async function notifyProviderMutationDispatch(
+  callback: SessionCreateOptions["onProviderMutationDispatch"],
+): Promise<void> {
+  await callback?.();
+}
+
 async function createSessionRecordWithClient(
   client: AcpClient,
   options: SessionCreateOptions,
@@ -112,6 +118,7 @@ async function createFreshSessionState(
   options: SessionCreateOptions,
   cwd: string,
 ): Promise<CreatedSessionState> {
+  await notifyProviderMutationDispatch(options.onProviderMutationDispatch);
   const createdSession = await withTimeout(client.createSession(cwd), options.timeoutMs);
   const modelApplication = await applyRequestedModelIfAdvertised({
     client,
@@ -152,6 +159,7 @@ async function resumeSessionRecordWithClient(
   }
 
   try {
+    await notifyProviderMutationDispatch(options.onProviderMutationDispatch);
     const resumedSession = await withTimeout(
       resumeMethod === "session/resume"
         ? client.resumeSession(options.resumeSessionId, cwd)
