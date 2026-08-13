@@ -42,6 +42,7 @@ test("a live refresh replaces its window but preserves loaded history and its ol
     epoch: "epoch-1",
     previousCursor: "latest-window-cursor",
     coverage: "complete",
+    legacyImportPending: true,
     gap: { reason: "new gap" },
     writeError: "latest warning",
   };
@@ -51,6 +52,7 @@ test("a live refresh replaces its window but preserves loaded history and its ol
   assert.equal(merged.coverage, "legacy_retained");
   assert.deepEqual(merged.gap, { reason: "oldest retained gap" });
   assert.equal(merged.writeError, "latest warning");
+  assert.equal(merged.legacyImportPending, true);
   assert.deepEqual(
     merged.events.map(({ id, text, sequence, sourceEvents }) => ({
       id,

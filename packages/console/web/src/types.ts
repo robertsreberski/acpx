@@ -94,6 +94,8 @@ export interface TimelinePage {
   readonly epoch: string | null;
   readonly previousCursor?: string;
   readonly coverage: "complete" | "legacy_retained" | "incomplete";
+  /** True while another bounded retained-history import pass is required. */
+  readonly legacyImportPending?: true;
   readonly gap?: {
     readonly reason: "legacy_retained" | "corrupt";
     readonly message: string;

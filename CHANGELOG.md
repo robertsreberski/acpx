@@ -23,6 +23,10 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Sessions/console: hydrate retained pre-ledger transcripts on the first read,
+  including automatic bounded continuation for large histories, without
+  requiring a prompt mutation.
+
 - Runtime/embedding: settle turn results only after lifecycle persistence and client cleanup attempts finish, including unexpected finalization failures.
 
 ## 2026.7.27 (v0.13.0)

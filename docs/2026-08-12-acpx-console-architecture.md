@@ -168,7 +168,11 @@ silently.
 `listSessionTimelinePage(recordId, { cursor, limit })` returns the newest window
 when no cursor is supplied, with events chronological within each page. Its
 `previousCursor` pages backward to older windows. Existing sessions are
-imported from the raw history that ACPX still retains. Their oldest page
+imported from the raw history that ACPX still retains on their first transcript
+read. Import work is bounded per request and checkpoints stable file-identity
+and byte cursors, so large histories resume without duplication or whole-file
+allocation. A page that needs another pass exposes `legacyImportPending`; the
+console keeps reading while that session remains selected. Their oldest page
 carries an `acpx.session_history_gap.v1` item with reason `legacy_retained`, and
 their coverage is also `legacy_retained`. Missing pre-ledger content is never
 synthesized.

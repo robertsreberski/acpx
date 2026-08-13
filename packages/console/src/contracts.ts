@@ -79,6 +79,8 @@ export interface TimelinePage {
   previousCursor?: string;
   hasMore: boolean;
   coverage: "complete" | "legacy_retained" | "incomplete";
+  /** True while the server has more retained compatibility history to import. */
+  legacyImportPending?: true;
   writeError?: string;
 }
 

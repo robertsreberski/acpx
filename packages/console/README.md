@@ -10,6 +10,10 @@ ACPX session records, event timelines, queue owners, and pending requests
 remain authoritative; the browser is a disposable projection over the public
 `acpx/sessions` service.
 
+Selecting a pre-ledger session imports its retained transcript immediately.
+Large imports continue automatically through bounded, resumable reads; sending
+a prompt is never required to reveal existing history.
+
 ## Status
 
 `acpx-console` starts at version `0.1.0` and is independently releasable. The

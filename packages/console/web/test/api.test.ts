@@ -167,11 +167,13 @@ test("projects the core item timeline and explicit legacy gap", async () => {
         previousCursor: "cursor-1",
         hasMore: true,
         coverage: "legacy_retained",
+        legacyImportPending: true,
       }),
     async () => {
       const page = await api.timeline("record-1");
       assert.equal(page.epoch, "epoch-1");
       assert.equal(page.previousCursor, "cursor-1");
+      assert.equal(page.legacyImportPending, true);
       assert.deepEqual(page.gap, {
         reason: "legacy_retained",
         message: "Earlier history retained elsewhere.",

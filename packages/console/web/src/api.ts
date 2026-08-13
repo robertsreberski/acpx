@@ -424,6 +424,7 @@ export class ConsoleApi {
           .map(projectTimelineEvent),
         previousCursor: page.previousCursor,
         coverage: page.coverage,
+        legacyImportPending: page.legacyImportPending === true ? true : undefined,
         gap: gap ? { reason: gap.reason, message: gap.message } : undefined,
         writeError: page.writeError,
       };
@@ -600,6 +601,7 @@ interface WireTimelinePage {
   readonly previousCursor?: string;
   readonly hasMore: boolean;
   readonly coverage: "complete" | "legacy_retained" | "incomplete";
+  readonly legacyImportPending?: true;
   readonly writeError?: string;
 }
 

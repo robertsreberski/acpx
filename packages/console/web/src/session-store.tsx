@@ -16,6 +16,7 @@ import {
   setComposerDraftForSession,
   type ComposerDrafts,
 } from "./composer-drafts";
+import { continueLegacyTimelineImport } from "./legacy-import-continuation";
 import { listenForLiveInvalidations } from "./live-events";
 import {
   expireOptimisticQueuedPrompts,
@@ -206,6 +207,32 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       );
     }
   }, [selectedSessionId, timeline]);
+
+  useEffect(() => {
+    if (!selectedSessionId || timeline?.legacyImportPending !== true) {
+      return undefined;
+    }
+    const sessionId = selectedSessionId;
+    let active = true;
+    void continueLegacyTimelineImport({
+      active: () => active && selectedSessionIdRef.current === sessionId,
+      wait: async () =>
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 16);
+        }),
+      load: async () => await api.timeline(sessionId),
+      apply: (page) => {
+        setTimeline((current) => mergeRefreshedTimelinePage(current, page));
+      },
+    }).catch((error: unknown) => {
+      if (active && selectedSessionIdRef.current === sessionId) {
+        notice(errorMessage(error));
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [notice, selectedSessionId, timeline?.legacyImportPending]);
 
   useEffect(() => {
     const now = performance.now();

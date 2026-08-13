@@ -56,8 +56,11 @@ the browser does not need to load the whole history at once.
 New session events are durably sequenced. Sessions created before this event
 ledger existed import the history ACPX still retained on the first transcript
 read, so selecting the session does not require sending another prompt. The
-import is resumable and idempotent, and the transcript still shows a visible
-legacy-history gap. The console never labels unavailable history as complete.
+import is resumable, idempotent, and bounded per request. For an unusually
+large retained transcript, the browser automatically requests the remaining
+bounded passes while the same session stays selected; no prompt or other user
+action is required. The transcript still shows a visible legacy-history gap.
+The console never labels unavailable history as complete.
 
 ## Session state
 
