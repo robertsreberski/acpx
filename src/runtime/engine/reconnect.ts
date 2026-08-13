@@ -283,6 +283,10 @@ function effortSelectionForBoundSession(params: {
   return { configId: previousEffort.configId, effort: desiredEffort };
 }
 
+function effortConfigId(state: SessionRecord["acpx"]): string | undefined {
+  return effortStateFromConfigOptions(state?.config_options)?.configId;
+}
+
 async function reapplyEffortOnBoundSession(params: {
   client: AcpClient;
   record: SessionRecord;
@@ -324,12 +328,14 @@ function clearEffortAfterUnrefreshedModelReplay(params: {
   response: Awaited<ReturnType<AcpClient["setSessionModel"]>>;
   models: SessionModelState | undefined;
   desiredModelId: string;
+  previousEffortConfigId?: string;
 }): void {
   params.record.acpx = clearDesiredEffortAfterUnrefreshedModelChange({
     state: params.record.acpx,
     modelResponse: params.response,
     previousModelId: params.models?.currentModelId,
     requestedModelId: params.desiredModelId,
+    previousEffortConfigId: params.previousEffortConfigId,
   });
 }
 
@@ -348,6 +354,7 @@ async function replayDesiredModel(params: {
   previousSessionId: string;
   record: SessionRecord;
   models: import("../../acp/client.js").SessionLoadResult["models"] | undefined;
+  previousEffortConfigId?: string;
   force?: boolean;
   timeoutMs?: number;
   verbose?: boolean;
@@ -379,6 +386,7 @@ async function replayDesiredModel(params: {
       response,
       models: replayModels,
       desiredModelId: params.desiredModelId,
+      previousEffortConfigId: params.previousEffortConfigId,
     });
     const models = response
       ? modelStateFromConfigOptions(response.configOptions)
@@ -588,6 +596,7 @@ export async function connectAndLoadSession(
       previousSessionId: originalSessionId,
       record,
       models: modelsForBoundReplay(loadState, record),
+      previousEffortConfigId: effortConfigId(originalAcpx),
       force: reconnectMetadataIsSparse(loadState),
       timeoutMs: options.timeoutMs,
       verbose: options.verbose,
@@ -756,6 +765,7 @@ async function replayFreshSessionPreferences(params: {
       previousSessionId: params.originalSessionId,
       record: params.record,
       models: params.sessionModels,
+      previousEffortConfigId: effortConfigId(params.originalAcpx),
       timeoutMs: params.timeoutMs,
       verbose: params.verbose,
       suppressWarnings: params.suppressWarnings,

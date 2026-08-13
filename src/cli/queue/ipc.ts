@@ -72,6 +72,7 @@ export {
 export type { QueueOwnerLease } from "./lease-store.js";
 
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
+  "QUEUE_OWNER_PROTOCOL_MISMATCH",
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
@@ -82,7 +83,10 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   error: unknown;
   verbose?: boolean;
 }): Promise<boolean> {
-  if (!(params.error instanceof QueueProtocolError)) {
+  if (
+    !(params.error instanceof QueueProtocolError) &&
+    !(params.error instanceof QueueConnectionError)
+  ) {
     return false;
   }
 
@@ -98,7 +102,7 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 
   if (params.verbose) {
     process.stderr.write(
-      `[acpx] dropped stale queue owner metadata after protocol mismatch for session ${params.sessionId} (${detailCode})\n`,
+      `[acpx] dropped stale queue owner pid ${params.owner.pid} after protocol mismatch for session ${params.sessionId} (${detailCode})\n`,
     );
   }
 
@@ -1372,14 +1376,27 @@ export async function tryApplySessionPreferencesOnRunningOwner(options: {
   if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
     return undefined;
   }
-  assertQueueOwnerUnderstandsEffort(owner);
-
-  const response = await submitApplySessionPreferencesToQueueOwner(
-    owner,
-    options.modelId,
-    options.effort,
-    options.timeoutMs,
-  );
+  let response: QueueOwnerApplySessionPreferencesResultMessage | undefined;
+  try {
+    assertQueueOwnerUnderstandsEffort(owner);
+    response = await submitApplySessionPreferencesToQueueOwner(
+      owner,
+      options.modelId,
+      options.effort,
+      options.timeoutMs,
+    );
+  } catch (error) {
+    const recovered = await maybeRecoverStaleOwnerAfterProtocolMismatch({
+      sessionId: options.sessionId,
+      owner,
+      error,
+      verbose: options.verbose,
+    });
+    if (recovered) {
+      return undefined;
+    }
+    throw error;
+  }
   if (response) {
     if (options.verbose) {
       process.stderr.write(

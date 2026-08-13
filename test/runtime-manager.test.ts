@@ -1373,6 +1373,102 @@ test("AcpRuntimeManager routes controls through the active controller while a tu
   assert.equal(handlers.onSessionUpdate, undefined);
 });
 
+test("AcpRuntimeManager times out effort replay after an active model config change", async () => {
+  const configOptions = (model: string, effort: string) => [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select" as const,
+      currentValue: model,
+      options: [
+        { value: "default-model", name: "Default" },
+        { value: "smart-model", name: "Smart" },
+      ],
+    },
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select" as const,
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  const record = makeSessionRecord({
+    acpxRecordId: "active-model-effort-timeout",
+    acpSessionId: "active-model-effort-timeout-session",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: { model: "default-model", effort: "high" },
+      desired_config_options: { reasoning_effort: "high" },
+      config_options: configOptions("default-model", "high"),
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  let resolvePromptStart!: () => void;
+  let resolvePrompt!: (value: { stopReason: string }) => void;
+  const promptStarted = new Promise<void>((resolve) => {
+    resolvePromptStart = resolve;
+  });
+  const promptResult = new Promise<{ stopReason: string }>((resolve) => {
+    resolvePrompt = resolve;
+  });
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store, timeoutMs: 20 }),
+    {
+      clientFactory: () =>
+        ({
+          start: async () => {},
+          close: async () => {},
+          hasReusableSession: () => true,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            resolvePromptStart();
+            return await promptResult;
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => true,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string) => {
+            if (configId === "model") {
+              return { configOptions: configOptions("smart-model", "medium") };
+            }
+            return await new Promise<SetSessionConfigOptionResponse>(() => {});
+          },
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+  const handle = createHandle(record.acpxRecordId);
+  const turn = manager.startTurn({
+    handle,
+    text: "wait",
+    mode: "prompt",
+    sessionMode: "persistent",
+    requestId: "active-model-effort-timeout-request",
+    timeoutMs: 5_000,
+  });
+  const eventsPromise = collectEvents(turn.events);
+  await promptStarted;
+
+  await assert.rejects(
+    async () => await manager.setConfigOption(handle, "model", "smart-model"),
+    /Timed out after 20ms/,
+  );
+
+  resolvePrompt({ stopReason: "end_turn" });
+  assert.deepEqual(await turn.result, { status: "completed", stopReason: "end_turn" });
+  assert.deepEqual(await eventsPromise, []);
+});
+
 test("AcpRuntimeManager rejects unsupported advertised config option keys after refresh", async () => {
   const record = makeSessionRecord({
     acpxRecordId: "config-key-session",

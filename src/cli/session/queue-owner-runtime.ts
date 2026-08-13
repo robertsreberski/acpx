@@ -614,7 +614,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   };
 
   const runPromptTurn = async <T>(run: () => Promise<T>): Promise<T> => {
-    turnController.beginTurn();
+    await turnController.beginTurn();
     try {
       return await run();
     } finally {

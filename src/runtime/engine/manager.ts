@@ -1122,6 +1122,7 @@ export class AcpRuntimeManager {
           sessionId: turn.activeSessionId,
           previousState,
           nextState: turn.acpxState,
+          timeoutMs: this.options.timeoutMs,
         });
         turn.acpxState = effort.state;
         return effort.response ?? response;
@@ -1195,6 +1196,7 @@ export class AcpRuntimeManager {
       sessionId: turn.activeSessionId,
       previousState,
       nextState: turn.acpxState,
+      timeoutMs: this.options.timeoutMs,
     });
     turn.acpxState = effort.state;
     return { configId: resolvedConfigId, response: effort.response ?? response };

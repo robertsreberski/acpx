@@ -10,7 +10,7 @@ test("QueueOwnerTurnController tracks explicit lifecycle states", async () => {
   const controller = createQueueOwnerTurnController();
   assert.equal(controller.lifecycleState, "idle");
 
-  controller.beginTurn();
+  await controller.beginTurn();
   assert.equal(controller.lifecycleState, "starting");
 
   controller.markPromptActive();
@@ -29,7 +29,7 @@ test("QueueOwnerTurnController cancels immediately for active prompts", async ()
   const controller = createQueueOwnerTurnController();
   let cancelCalls = 0;
 
-  controller.beginTurn();
+  await controller.beginTurn();
   controller.setActiveController(
     makeActiveController({
       hasActivePrompt: () => true,
@@ -52,7 +52,7 @@ test("QueueOwnerTurnController defers cancel while turn is starting", async () =
   let promptActive = false;
   let cancelCalls = 0;
 
-  controller.beginTurn();
+  await controller.beginTurn();
   controller.setActiveController(
     makeActiveController({
       hasActivePrompt: () => promptActive,
@@ -231,7 +231,7 @@ test("QueueOwnerTurnController waits for a starting turn before applying prefere
     },
   });
 
-  controller.beginTurn();
+  await controller.beginTurn();
   const resultPromise = controller.applySessionPreferences("smart-model", "high", 1_000);
   await Promise.resolve();
   assert.equal(activeCalls, 0);
@@ -253,6 +253,42 @@ test("QueueOwnerTurnController waits for a starting turn before applying prefere
   assert.equal(result.effortConfigId, "reasoning_effort");
   assert.equal(activeCalls, 1);
   assert.equal(fallbackCalls, 0);
+});
+
+test("QueueOwnerTurnController finishes idle preference updates before starting a turn", async () => {
+  let releaseFallback!: () => void;
+  const fallbackGate = new Promise<void>((resolve) => {
+    releaseFallback = resolve;
+  });
+  let fallbackCalls = 0;
+  const controller = createQueueOwnerTurnController({
+    applySessionPreferencesFallback: async () => {
+      fallbackCalls += 1;
+      await fallbackGate;
+      return {
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      };
+    },
+  });
+
+  const preference = controller.applySessionPreferences("smart-model", "high", 1_000);
+  await Promise.resolve();
+  assert.equal(fallbackCalls, 1);
+
+  let turnStarted = false;
+  const beginTurn = controller.beginTurn().then(() => {
+    turnStarted = true;
+  });
+  await Promise.resolve();
+  assert.equal(turnStarted, false);
+  assert.equal(controller.lifecycleState, "idle");
+
+  releaseFallback();
+  await preference;
+  await beginTurn;
+  assert.equal(turnStarted, true);
+  assert.equal(controller.lifecycleState, "starting");
 });
 
 test("QueueOwnerTurnController rejects control requests while closing", async () => {

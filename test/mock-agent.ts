@@ -973,7 +973,7 @@ class MockAgent implements Agent {
         buildConfigOptions(
           this.sessions.get(sessionId) ?? createSessionState(false),
           this.options.modelConfigId,
-          undefined,
+          this.options.omitReconnectModelId,
           undefined,
           this.options.modelDependentEfforts,
         ),

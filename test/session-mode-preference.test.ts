@@ -136,6 +136,26 @@ test("model changes retain and rebase a compatible saved effort", () => {
   assert.equal(result.state.session_options?.effort, "xhigh");
 });
 
+test("model changes migrate effort saved only under the previous config id", () => {
+  const previousState = {
+    session_options: { model: "old-model" },
+    desired_config_options: { old_effort: "high" },
+    config_options: [effortOption("old_effort", "medium", ["medium", "high"])],
+  };
+  const nextState = {
+    ...previousState,
+    session_options: { model: "new-model" },
+    config_options: [effortOption("new_effort", "medium", ["medium", "high"])],
+  };
+
+  assert.equal(getDesiredEffort(previousState), "high");
+  const result = reconcileDesiredEffortForModelChange(previousState, nextState);
+
+  assert.deepEqual(result.selection, { configId: "new_effort", effort: "high" });
+  assert.deepEqual(result.state.desired_config_options, { new_effort: "high" });
+  assert.equal(result.state.session_options?.effort, "high");
+});
+
 function effortOption(id: string, currentValue: string, values: string[]) {
   return {
     id,

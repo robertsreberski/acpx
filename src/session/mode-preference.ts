@@ -124,8 +124,19 @@ export function getDesiredModelId(state: SessionAcpxState | undefined): string |
   return normalizeModelId(state?.session_options?.model);
 }
 
+function legacyDesiredEffort(state: SessionAcpxState | undefined): string | undefined {
+  if (!state) {
+    return undefined;
+  }
+  const previousConfigId = effortStateFromConfigOptions(state.config_options)?.configId;
+  if (!previousConfigId) {
+    return undefined;
+  }
+  return normalizeModeId(state.desired_config_options?.[previousConfigId]);
+}
+
 export function getDesiredEffort(state: SessionAcpxState | undefined): string | undefined {
-  return normalizeModeId(state?.session_options?.effort);
+  return normalizeModeId(state?.session_options?.effort) ?? legacyDesiredEffort(state);
 }
 
 function hasStoredSessionOptions(

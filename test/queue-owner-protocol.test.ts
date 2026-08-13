@@ -236,23 +236,21 @@ test("a pre-effort queue owner refuses effort-bearing prompts", async () => {
   });
 });
 
-test("a pre-effort queue owner refuses combined preference controls", async () => {
+test("a pre-effort queue owner is retired so combined preferences can reconnect", async () => {
   await withTempHome(async (homeDir) => {
     await withFakeOwner(
       homeDir,
       "owner-pre-effort-control",
       { queueProtocol: QUEUE_PROTOCOL_EFFORT_VERSION - 1 },
       async () => {
-        await assert.rejects(
-          async () =>
-            await tryApplySessionPreferencesOnRunningOwner({
-              sessionId: "owner-pre-effort-control",
-              modelId: "smart-model",
-              effort: "high",
-            }),
-          (error: unknown) =>
-            (error as QueueConnectionError).detailCode === "QUEUE_OWNER_PROTOCOL_MISMATCH",
-        );
+        const result = await tryApplySessionPreferencesOnRunningOwner({
+          sessionId: "owner-pre-effort-control",
+          modelId: "smart-model",
+          effort: "high",
+        });
+
+        assert.equal(result, undefined);
+        assert.equal(await readQueueOwnerRecord("owner-pre-effort-control"), undefined);
       },
     );
   });

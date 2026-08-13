@@ -914,6 +914,10 @@ function buildQueuedTaskRunOptions(
   options: QueuedTaskRuntimeOptions,
   outputFormatter: OutputFormatter,
 ): RunSessionPromptOptions {
+  const preferences = mergeQueuedTaskSessionPreferences(
+    task.sessionOptions,
+    options.sessionOptions,
+  );
   return {
     sessionRecordId,
     mcpServers: options.mcpServers,
@@ -930,14 +934,24 @@ function buildQueuedTaskRunOptions(
     suppressSdkConsoleErrors: task.suppressSdkConsoleErrors ?? options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
-    sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
-    requestedEffort: task.sessionOptions?.effort,
+    ...preferences,
     onClientAvailable: options.onClientAvailable,
     onClientClosed: options.onClientClosed,
     onPromptActive: options.onPromptActive,
     onPendingRequestSink: options.onPendingRequestSink,
     handleProcessInterrupts: options.handleProcessInterrupts,
     client: options.sharedClient,
+  };
+}
+
+function mergeQueuedTaskSessionPreferences(
+  taskOptions: SessionAgentOptions | undefined,
+  ownerOptions: SessionAgentOptions | undefined,
+): Pick<RunSessionPromptOptions, "sessionOptions" | "requestedEffort"> {
+  const sessionOptions = mergeSessionOptions(taskOptions, ownerOptions);
+  return {
+    sessionOptions,
+    requestedEffort: sessionOptions?.effort,
   };
 }
 
@@ -1637,4 +1651,5 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
 export const sessionRuntimeTestInternals = {
   shouldRetryRuntimePrompt,
   createPendingRequestSink,
+  mergeQueuedTaskSessionPreferences,
 };
