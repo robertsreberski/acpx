@@ -6,6 +6,7 @@ import {
   releaseQueueOwnerLease,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/ipc.js";
+import { QUEUE_PROMPT_PREVIEW_MAX_BYTES } from "../src/cli/queue/messages.js";
 import { PendingRequestNotAnswerableError } from "../src/errors.js";
 import { PENDING_REQUEST_SCHEMA, type PendingRequest } from "../src/session/pending-requests.js";
 import {
@@ -446,6 +447,12 @@ test("SessionQueueOwner snapshots mixed prompt sources exactly and a new owner s
     try {
       await enqueuePrompt(firstLease.socketPath, "turn-cli", false, "ordinary CLI prompt");
       await enqueuePrompt(firstLease.socketPath, "turn-service", false, "service prompt");
+      await enqueuePrompt(
+        firstLease.socketPath,
+        "turn-large",
+        false,
+        `large-${"🙂".repeat(QUEUE_PROMPT_PREVIEW_MAX_BYTES)}`,
+      );
       const snapshot = (await sendQueueRequest(firstLease.socketPath, {
         type: "list_prompt_queue",
         requestId: "list-mixed",
@@ -453,16 +460,32 @@ test("SessionQueueOwner snapshots mixed prompt sources exactly and a new owner s
       })) as {
         type: string;
         ownerGeneration?: number;
-        prompts: Array<{ turnId: string; submittedAt: string; promptText: string }>;
+        queueDepth: number;
+        omittedCount: number;
+        prompts: Array<{
+          turnId: string;
+          submittedAt: string;
+          promptText: string;
+          promptTruncated?: true;
+        }>;
       };
       assert.equal(snapshot.type, "list_prompt_queue_result");
       assert.equal(snapshot.ownerGeneration, firstLease.ownerGeneration);
+      assert.equal(snapshot.queueDepth, 3);
+      assert.equal(snapshot.omittedCount, 0);
       assert.deepEqual(
-        snapshot.prompts.map(({ turnId, promptText }) => ({ turnId, promptText })),
+        snapshot.prompts.slice(0, 2).map(({ turnId, promptText }) => ({ turnId, promptText })),
         [
           { turnId: "turn-cli", promptText: "ordinary CLI prompt" },
           { turnId: "turn-service", promptText: "service prompt" },
         ],
+      );
+      assert.equal(snapshot.prompts[2]?.turnId, "turn-large");
+      assert.equal(snapshot.prompts[2]?.promptTruncated, true);
+      assert.equal(snapshot.prompts[2]?.promptText.endsWith("…"), true);
+      assert.ok(
+        Buffer.byteLength(snapshot.prompts[2]?.promptText ?? "", "utf8") <=
+          QUEUE_PROMPT_PREVIEW_MAX_BYTES,
       );
       assert.equal(
         snapshot.prompts.every(({ submittedAt }) => !Number.isNaN(Date.parse(submittedAt))),
@@ -482,8 +505,10 @@ test("SessionQueueOwner snapshots mixed prompt sources exactly and a new owner s
         type: "list_prompt_queue",
         requestId: "list-restarted",
         ownerGeneration: secondLease.ownerGeneration,
-      })) as { type: string; prompts: unknown[] };
+      })) as { type: string; queueDepth: number; omittedCount: number; prompts: unknown[] };
       assert.equal(restarted.type, "list_prompt_queue_result");
+      assert.equal(restarted.queueDepth, 0);
+      assert.equal(restarted.omittedCount, 0);
       assert.deepEqual(restarted.prompts, []);
     } finally {
       await secondOwner.close();

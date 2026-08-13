@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseQueueOwnerMessage, parseQueueRequest } from "../src/cli/queue/messages.js";
+import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
+import {
+  boundQueuePromptSnapshot,
+  parseQueueOwnerMessage,
+  parseQueueRequest,
+  QUEUE_PROMPT_PREVIEW_MAX_BYTES,
+  QUEUE_PROMPT_SNAPSHOT_MAX_BYTES,
+} from "../src/cli/queue/messages.js";
 
 test("parseQueueRequest accepts submit_prompt with nonInteractivePermissions", () => {
   const parsed = parseQueueRequest({
@@ -750,6 +757,8 @@ test("parseQueueOwnerMessage validates exact queued prompt snapshots", () => {
       type: "list_prompt_queue_result",
       requestId: "req-list-queue",
       ownerGeneration: 7,
+      queueDepth: 2,
+      omittedCount: 0,
       prompts,
     },
   );
@@ -765,6 +774,108 @@ test("parseQueueOwnerMessage validates exact queued prompt snapshots", () => {
         type: "list_prompt_queue_result",
         requestId: "req-list-queue",
         prompts: invalid,
+      }),
+      null,
+    );
+  }
+});
+
+test("prompt queue snapshots truncate UTF-8 previews and cap aggregate JSON size", () => {
+  const submittedAt = "2026-08-13T10:00:00.000Z";
+  const oversized = `start-${"🙂".repeat(QUEUE_PROMPT_PREVIEW_MAX_BYTES)}-end`;
+  const bounded = boundQueuePromptSnapshot(
+    [
+      { turnId: "turn-unicode", submittedAt, promptText: oversized },
+      ...Array.from({ length: 300 }, (_, index) => ({
+        turnId: `turn-${index}`,
+        submittedAt,
+        promptText: "x".repeat(QUEUE_PROMPT_PREVIEW_MAX_BYTES * 2),
+      })),
+    ],
+    302,
+  );
+
+  assert.equal(bounded.queueDepth, 302);
+  assert.ok(bounded.prompts.length < 301);
+  assert.equal(bounded.omittedCount, bounded.queueDepth - bounded.prompts.length);
+  assert.equal(bounded.prompts[0]?.turnId, "turn-unicode");
+  assert.equal(bounded.prompts[0]?.promptTruncated, true);
+  assert.equal(bounded.prompts[0]?.promptText.endsWith("…"), true);
+  assert.equal(bounded.prompts[0]?.promptText.includes("�"), false);
+  assert.ok(
+    Buffer.byteLength(bounded.prompts[0]?.promptText ?? "", "utf8") <=
+      QUEUE_PROMPT_PREVIEW_MAX_BYTES,
+  );
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(bounded.prompts), "utf8") <= QUEUE_PROMPT_SNAPSHOT_MAX_BYTES,
+  );
+  assert.ok(
+    Buffer.byteLength(
+      JSON.stringify({
+        type: "list_prompt_queue_result",
+        requestId: "req-bounded",
+        ownerGeneration: 7,
+        ...bounded,
+      }),
+      "utf8",
+    ) < MAX_MESSAGE_BUFFER_SIZE,
+  );
+  assert.deepEqual(
+    bounded.prompts.map(({ turnId }) => turnId),
+    ["turn-unicode", ...Array.from({ length: bounded.prompts.length - 1 }, (_, i) => `turn-${i}`)],
+  );
+  assert.deepEqual(
+    parseQueueOwnerMessage({
+      type: "list_prompt_queue_result",
+      requestId: "req-bounded",
+      ownerGeneration: 7,
+      ...bounded,
+    }),
+    {
+      type: "list_prompt_queue_result",
+      requestId: "req-bounded",
+      ownerGeneration: 7,
+      ...bounded,
+    },
+  );
+});
+
+test("prompt queue snapshots reject inconsistent depth and oversized previews", () => {
+  const prompt = {
+    turnId: "turn-1",
+    submittedAt: "2026-08-13T10:00:00.000Z",
+    promptText: "short",
+  };
+  const aggregateOverflow = Array.from(
+    { length: Math.ceil(QUEUE_PROMPT_SNAPSHOT_MAX_BYTES / QUEUE_PROMPT_PREVIEW_MAX_BYTES) + 8 },
+    (_, index) => ({
+      ...prompt,
+      turnId: `turn-overflow-${index}`,
+      promptText: "x".repeat(QUEUE_PROMPT_PREVIEW_MAX_BYTES),
+    }),
+  );
+  for (const fields of [
+    { queueDepth: 0, omittedCount: 0, prompts: [prompt] },
+    { queueDepth: 2, omittedCount: 0, prompts: [prompt] },
+    { queueDepth: 2.5, omittedCount: 1.5, prompts: [prompt] },
+    { queueDepth: 2, omittedCount: -1, prompts: [prompt] },
+    { queueDepth: 2, prompts: [prompt] },
+    {
+      queueDepth: 1,
+      omittedCount: 0,
+      prompts: [{ ...prompt, promptText: "x".repeat(QUEUE_PROMPT_PREVIEW_MAX_BYTES + 1) }],
+    },
+    {
+      queueDepth: aggregateOverflow.length,
+      omittedCount: 0,
+      prompts: aggregateOverflow,
+    },
+  ]) {
+    assert.equal(
+      parseQueueOwnerMessage({
+        type: "list_prompt_queue_result",
+        requestId: "req-invalid-bounds",
+        ...fields,
       }),
       null,
     );

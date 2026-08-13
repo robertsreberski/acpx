@@ -1235,7 +1235,15 @@ export async function tryListPromptQueueOnRunningOwner(options: {
   sessionId: string;
   responseTimeoutMs?: number;
   verbose?: boolean;
-}): Promise<{ ownerGeneration: number; prompts: QueuePromptSnapshot[] } | undefined> {
+}): Promise<
+  | {
+      ownerGeneration: number;
+      queueDepth: number;
+      omittedCount: number;
+      prompts: QueuePromptSnapshot[];
+    }
+  | undefined
+> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner || queueOwnerProtocolVersion(owner) < QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION) {
     return undefined;
@@ -1255,7 +1263,8 @@ export async function tryListPromptQueueOnRunningOwner(options: {
   );
   if (options.verbose && response) {
     process.stderr.write(
-      `[acpx] listed ${response.prompts.length} queued prompt(s) on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+      `[acpx] listed ${response.prompts.length}/${response.queueDepth} queued prompt control(s) ` +
+        `on owner pid ${owner.pid} for session ${options.sessionId}\n`,
     );
   }
   const accepted = await requireAcceptingOwner(options.sessionId, response, "list_prompt_queue");
@@ -1269,7 +1278,12 @@ export async function tryListPromptQueueOnRunningOwner(options: {
       retryable: true,
     });
   }
-  return { ownerGeneration: accepted.ownerGeneration, prompts: accepted.prompts };
+  return {
+    ownerGeneration: accepted.ownerGeneration,
+    queueDepth: accepted.queueDepth,
+    omittedCount: accepted.omittedCount,
+    prompts: accepted.prompts,
+  };
 }
 
 /**

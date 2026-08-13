@@ -617,6 +617,79 @@ test("a wedged exact-queue snapshot degrades within its read bound without retir
   });
 });
 
+test("a current FIFO snapshot raises queue depth above a stale lease heartbeat", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-stale-lease-depth",
+      acpSessionId: "provider-stale-lease-depth",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      ownerGeneration: 90,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 1,
+    });
+    const prompts = [
+      {
+        turnId: "turn-new-1",
+        submittedAt: "2026-08-13T10:00:00.000Z",
+        promptText: "First newly queued prompt",
+      },
+      {
+        turnId: "turn-new-2",
+        submittedAt: "2026-08-13T10:00:01.000Z",
+        promptText: "Second newly queued prompt",
+      },
+    ];
+    const server = createSingleRequestServer((socket, request) => {
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      if (request.type === "list_requests") {
+        socket.write(
+          `${JSON.stringify({
+            type: "list_requests_result",
+            requestId: request.requestId,
+            ownerGeneration: 90,
+            requests: [],
+          })}\n`,
+        );
+        return;
+      }
+      assert.equal(request.type, "list_prompt_queue");
+      socket.write(
+        `${JSON.stringify({
+          type: "list_prompt_queue_result",
+          requestId: request.requestId,
+          ownerGeneration: 90,
+          queueDepth: prompts.length,
+          omittedCount: 0,
+          prompts,
+        })}\n`,
+      );
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const detail = await service.getSession({ acpxRecordId: record.acpxRecordId });
+      assert.equal(detail?.queue.depth, 2);
+      assert.deepEqual(detail?.queue.turns, prompts);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("ambiguous queue transport loss is replayed without a duplicate turn or false failure", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1067,6 +1140,8 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
             type: "list_prompt_queue_result",
             requestId: request.requestId,
             ownerGeneration: 80,
+            queueDepth: 2,
+            omittedCount: 1,
             prompts: [
               {
                 turnId: "turn-queued",

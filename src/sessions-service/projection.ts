@@ -212,15 +212,28 @@ export async function projectSession(
   const waiting = pendingTurnState(pending);
   const lifecycleState = lifecycleTurnState(lifecycle);
   const projectedOwnerState = ownerState(health);
-  const queuedTurns =
+  const currentQueue =
     authoritativeQueue !== undefined &&
     authoritativeQueue.ownerGeneration === health.ownerGeneration
-      ? authoritativeQueue.prompts
-      : [];
+      ? authoritativeQueue
+      : undefined;
+  const queuedTurns = (currentQueue?.prompts ?? []).map(({ turnId, submittedAt, promptText }) => ({
+    turnId,
+    submittedAt,
+    promptText,
+  }));
   // The lease depth remains useful when an owner is old or unreachable. Exact
   // cancellation targets never come from it (or from timeline guesses); only
   // a current generation's read-only FIFO snapshot can expose those controls.
-  const queueDepth = health.queueDepth ?? authoritativeQueue?.prompts.length ?? 0;
+  // A lease heartbeat can lag a just-enqueued FIFO snapshot, while a bounded
+  // snapshot can deliberately omit controls, so depth is the maximum of every
+  // current-generation authority rather than whichever one happened to arrive
+  // first.
+  const queueDepth = Math.max(
+    health.queueDepth ?? 0,
+    currentQueue?.queueDepth ?? 0,
+    queuedTurns.length,
+  );
   const projectedLifecycleState =
     activeTurn && !health.healthy ? "unknown" : activeTurn ? "running" : lifecycleState;
   const summary: AcpxSessionSummary = {

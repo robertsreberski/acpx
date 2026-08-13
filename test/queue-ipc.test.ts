@@ -180,6 +180,8 @@ test("tryListPromptQueueOnRunningOwner returns only the owner's exact FIFO snaps
           type: "list_prompt_queue_result",
           requestId: request.requestId,
           ownerGeneration: 78,
+          queueDepth: 3,
+          omittedCount: 1,
           prompts,
         })}\n`,
       );
@@ -189,6 +191,8 @@ test("tryListPromptQueueOnRunningOwner returns only the owner's exact FIFO snaps
     try {
       assert.deepEqual(await tryListPromptQueueOnRunningOwner({ sessionId }), {
         ownerGeneration: 78,
+        queueDepth: 3,
+        omittedCount: 1,
         prompts,
       });
     } finally {

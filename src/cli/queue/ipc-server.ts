@@ -12,12 +12,13 @@ import type {
   SessionResumePolicy,
 } from "../../types.js";
 import {
+  boundQueuePromptSnapshot,
   parseQueueRequest,
   toQueueOwnerWireMessage,
+  type BoundedQueuePromptSnapshot,
   type QueueCancelOutcome,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
-  type QueuePromptSnapshot,
   type QueueRequest,
 } from "./messages.js";
 
@@ -355,13 +356,16 @@ export class SessionQueueOwner {
     return (await this.controlHandlers.cancelPrompt(targetTurnId)) ? "active" : "not_found";
   }
 
-  private async promptQueueSnapshot(): Promise<QueuePromptSnapshot[]> {
+  private async promptQueueSnapshot(): Promise<BoundedQueuePromptSnapshot> {
     return await this.runPendingMutation(async () =>
-      this.pending.map((task) => ({
-        turnId: task.requestId,
-        submittedAt: new Date(task.enqueuedAt).toISOString(),
-        promptText: task.message,
-      })),
+      boundQueuePromptSnapshot(
+        this.pending.map((task) => ({
+          turnId: task.requestId,
+          submittedAt: new Date(task.enqueuedAt).toISOString(),
+          promptText: task.message,
+        })),
+        this.queueDepth(),
+      ),
     );
   }
 
@@ -546,11 +550,14 @@ export class SessionQueueOwner {
       this.handleControlRequest({
         socket,
         requestId: request.requestId,
-        run: async () => ({
-          type: "list_prompt_queue_result",
-          requestId: request.requestId,
-          prompts: await this.promptQueueSnapshot(),
-        }),
+        run: async () => {
+          const snapshot = await this.promptQueueSnapshot();
+          return {
+            type: "list_prompt_queue_result",
+            requestId: request.requestId,
+            ...snapshot,
+          };
+        },
       });
       return true;
     }
