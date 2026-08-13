@@ -217,6 +217,7 @@ test("allocated session starts fail closed across keys without repeating the pro
       idempotencyKey: "allocated-start-first",
     };
     const recoveryScope = { agentId: "recoverable", cwd: path.resolve(cwd), mode: "plan" };
+    const recoveryScopeHash = idempotencyTestInternals.fingerprint(recoveryScope);
     const now = new Date().toISOString();
     const ledgerPath = idempotencyTestInternals.mutationPath(firstInput.idempotencyKey);
     await fs.mkdir(path.dirname(ledgerPath), { recursive: true });
@@ -231,8 +232,20 @@ test("allocated session starts fail closed across keys without repeating the pro
         created_at: now,
         updated_at: now,
         pid: process.pid,
-        recovery_scope: idempotencyTestInternals.fingerprint(recoveryScope),
+        recovery_scope: recoveryScopeHash,
         recovery_result: { recordId: "allocated-local-record", phase: "allocated" },
+      })}\n`,
+      "utf8",
+    );
+    const recoveryIndexPath = idempotencyTestInternals.recoveryIndexPath(recoveryScopeHash);
+    await fs.mkdir(path.dirname(recoveryIndexPath), { recursive: true });
+    await fs.writeFile(
+      recoveryIndexPath,
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_recovery.v1",
+        operation: "create_session",
+        scope_hash: recoveryScopeHash,
+        keys: [firstInput.idempotencyKey],
       })}\n`,
       "utf8",
     );

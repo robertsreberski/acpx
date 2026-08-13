@@ -7,6 +7,8 @@ import { QueueConnectionError } from "../src/errors.js";
 import {
   AcpxIdempotencyConflictError,
   AcpxIdempotencyCorruptError,
+  AcpxIdempotencyLedgerFullError,
+  AcpxIdempotencyRetiredError,
   idempotencyTestInternals,
   runIdempotentMutation,
 } from "../src/sessions-service/idempotency.js";
@@ -150,6 +152,299 @@ test("a fresh idempotency key recovers a checkpointed mutation in the same scope
     assert.equal(originalKey.replayed, true);
     assert.equal(runs, 1);
     assert.equal(recoveries, 1);
+  });
+});
+
+test("legacy receipts rebuild recovery and session indexes before accepting a fresh key", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const recoveryScope = { agentId: "mock", cwd: "/legacy" };
+    const scopeHash = idempotencyTestInternals.fingerprint(recoveryScope);
+    const key = "legacy-first";
+    const now = new Date().toISOString();
+    const filePath = idempotencyTestInternals.mutationPath(key);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(
+      filePath,
+      `${JSON.stringify({
+        schema: "acpx.session_mutation.v1",
+        idempotency_key: key,
+        operation: "create_session",
+        fingerprint: idempotencyTestInternals.fingerprint({
+          ...recoveryScope,
+          idempotencyKey: key,
+        }),
+        state: "started",
+        created_at: now,
+        updated_at: now,
+        pid: process.pid,
+        recovery_scope: scopeHash,
+        recovery_result: { recordId: "legacy-record", phase: "created" },
+      })}\n`,
+      "utf8",
+    );
+    let runs = 0;
+    const recovered = await runIdempotentMutation({
+      operation: "create_session",
+      idempotencyKey: "legacy-second",
+      input: { ...recoveryScope, idempotencyKey: "legacy-second" },
+      recoveryScope,
+      recover: async () => ({ acpxRecordId: "legacy-record" }),
+      run: async () => {
+        runs += 1;
+        return { acpxRecordId: "duplicate" };
+      },
+    });
+    assert.equal(recovered.result.acpxRecordId, "legacy-record");
+    assert.equal(recovered.replayed, true);
+    assert.equal(runs, 0);
+    await fs.access(idempotencyTestInternals.migrationMarkerPath());
+    const sessionIndex = JSON.parse(
+      await fs.readFile(idempotencyTestInternals.sessionIndexPath("legacy-record"), "utf8"),
+    ) as { keys: string[] };
+    assert.deepEqual(sessionIndex.keys.toSorted(), ["legacy-first", "legacy-second"]);
+  });
+});
+
+test("a corrupt legacy receipt blocks migration and never runs a mutation", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const filePath = path.join(idempotencyTestInternals.baseDir(), `${"a".repeat(64)}.json`);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, '{"schema":"corrupt"}\n', "utf8");
+    let ran = false;
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "close_session",
+          idempotencyKey: "after-corrupt-legacy",
+          input: {},
+          run: async () => {
+            ran = true;
+            return { closed: true };
+          },
+        }),
+      /Invalid legacy idempotency receipt/u,
+    );
+    assert.equal(ran, false);
+    await assert.rejects(
+      async () => await fs.access(idempotencyTestInternals.migrationMarkerPath()),
+    );
+  });
+});
+
+test("scoped recovery reads its bounded index instead of scanning unrelated receipts", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const recoveryScope = { agentId: "mock", cwd: "/indexed" };
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "create_session",
+          idempotencyKey: "indexed-first",
+          input: { ...recoveryScope, idempotencyKey: "indexed-first" },
+          recoveryScope,
+          recover: async () => ({ acpxRecordId: "indexed-record" }),
+          run: async (checkpoint) => {
+            await checkpoint({ recordId: "indexed-record", phase: "created" });
+            throw new Error("recover me");
+          },
+        }),
+      /recover me/u,
+    );
+
+    // The old implementation scanned every *.json entry and would fail on an
+    // unreadable/non-file entry. Indexed lookup must never touch this path.
+    await fs.mkdir(path.join(idempotencyTestInternals.baseDir(), "unrelated.json"));
+    const recovered = await runIdempotentMutation({
+      operation: "create_session",
+      idempotencyKey: "indexed-second",
+      input: { ...recoveryScope, idempotencyKey: "indexed-second" },
+      recoveryScope,
+      recover: async () => ({ acpxRecordId: "indexed-record" }),
+      run: async () => ({ acpxRecordId: "duplicate" }),
+    });
+    assert.equal(recovered.result.acpxRecordId, "indexed-record");
+    assert.equal(recovered.replayed, true);
+  });
+});
+
+test("a corrupt scoped recovery index fails closed", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const recoveryScope = { agentId: "mock", cwd: "/corrupt-index" };
+    const scopeHash = idempotencyTestInternals.fingerprint(recoveryScope);
+    const indexPath = idempotencyTestInternals.recoveryIndexPath(scopeHash);
+    await fs.mkdir(path.dirname(indexPath), { recursive: true });
+    await fs.writeFile(indexPath, '{"schema":"wrong"}\n', "utf8");
+    let ran = false;
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "create_session",
+          idempotencyKey: "corrupt-index-key",
+          input: { ...recoveryScope, idempotencyKey: "corrupt-index-key" },
+          recoveryScope,
+          recover: async () => ({ acpxRecordId: "never" }),
+          run: async () => {
+            ran = true;
+            return { acpxRecordId: "never" };
+          },
+        }),
+      /Invalid idempotency index/u,
+    );
+    assert.equal(ran, false);
+  });
+});
+
+test("terminal receipts compact to a bounded ledger and retired keys fail closed", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    for (let index = 0; index < 520; index += 1) {
+      await runIdempotentMutation({
+        operation: "close_session",
+        idempotencyKey: `bounded-${index}`,
+        input: { index },
+        run: async () => ({ closed: true }),
+      });
+    }
+    const ledger = JSON.parse(
+      await fs.readFile(idempotencyTestInternals.ledgerIndexPath(), "utf8"),
+    ) as { entries: unknown[] };
+    assert.equal(ledger.entries.length, 512);
+    const rootEntries = await fs.readdir(idempotencyTestInternals.baseDir(), {
+      withFileTypes: true,
+    });
+    assert.equal(
+      rootEntries.filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/u.test(entry.name))
+        .length,
+      512,
+    );
+
+    let reran = false;
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "close_session",
+          idempotencyKey: "bounded-0",
+          input: { index: 0 },
+          run: async () => {
+            reran = true;
+            return { closed: true };
+          },
+        }),
+      AcpxIdempotencyRetiredError,
+    );
+    assert.equal(reran, false);
+  });
+});
+
+test("exact retired keys do not reject neighbors and capacity expires instead of bricking", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const exactHash = idempotencyTestInternals.retiredKeyHash("retired-exact-key");
+    const retiredPath = idempotencyTestInternals.retiredKeysPath(exactHash.slice(0, 2));
+    await fs.mkdir(path.dirname(retiredPath), { recursive: true });
+    const future = "2099-01-01T00:00:00.000Z";
+    await fs.writeFile(
+      retiredPath,
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_retired.v1",
+        prefix: exactHash.slice(0, 2),
+        entries: [
+          {
+            key_hash: exactHash,
+            expires_at: future,
+          },
+        ],
+      })}\n`,
+      "utf8",
+    );
+    let ran = false;
+    const neighbor = await runIdempotentMutation({
+      operation: "close_session",
+      idempotencyKey: "retired-exact-key-neighbor",
+      input: {},
+      run: async () => {
+        ran = true;
+        return { closed: true };
+      },
+    });
+    assert.equal(neighbor.replayed, false);
+    assert.equal(ran, true);
+    ran = false;
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "close_session",
+          idempotencyKey: "retired-exact-key",
+          input: {},
+          run: async () => {
+            ran = true;
+            return { closed: true };
+          },
+        }),
+      AcpxIdempotencyRetiredError,
+    );
+    assert.equal(ran, false);
+
+    const capacityEntries = Array.from({ length: 1_024 }, (_, index) => ({
+      key_hash: `00${index.toString(16).padStart(62, "0")}`,
+      expires_at: future,
+    }));
+    await fs.writeFile(
+      idempotencyTestInternals.retiredKeysPath("00"),
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_retired.v1",
+        prefix: "00",
+        entries: capacityEntries,
+      })}\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      idempotencyTestInternals.ledgerIndexPath(),
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_ledger.v1",
+        entries: Array.from({ length: 512 }, (_, index) => ({
+          key: `terminal-${index}`,
+          state: "succeeded",
+          updated_at: "2026-01-01T00:00:00.000Z",
+        })),
+      })}\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      async () =>
+        await runIdempotentMutation({
+          operation: "close_session",
+          idempotencyKey: "capacity-new-key",
+          input: {},
+          run: async () => {
+            ran = true;
+            return { closed: true };
+          },
+        }),
+      AcpxIdempotencyLedgerFullError,
+    );
+    assert.equal(ran, false);
+
+    await fs.writeFile(
+      idempotencyTestInternals.retiredKeysPath("00"),
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_retired.v1",
+        prefix: "00",
+        entries: capacityEntries.map((entry) => ({
+          key_hash: entry.key_hash,
+          expires_at: "2000-01-01T00:00:00.000Z",
+        })),
+      })}\n`,
+      "utf8",
+    );
+    const afterExpiry = await runIdempotentMutation({
+      operation: "close_session",
+      idempotencyKey: "capacity-new-key",
+      input: {},
+      run: async () => {
+        ran = true;
+        return { closed: true };
+      },
+    });
+    assert.equal(afterExpiry.replayed, false);
+    assert.equal(ran, true);
   });
 });
 
@@ -299,6 +594,7 @@ test("a schema-invalid mutation record fails closed instead of repeating the mut
       `${JSON.stringify({ schema: "acpx.session_mutation.v999", idempotency_key: key })}\n`,
       "utf8",
     );
+    await fs.writeFile(idempotencyTestInternals.migrationMarkerPath(), "v1\n", "utf8");
     let ran = false;
 
     await assert.rejects(

@@ -90,6 +90,13 @@ exactly-once execution by an external agent. If an owner dies after dispatch,
 the turn becomes `interrupted` or `unknown` and is never replayed
 automatically.
 
+Replayable mutation results are retained for seven days and at least the latest
+512 terminal actions. Compacted key hashes remain exact (not probabilistic)
+tombstones for 30 more days, so reusing a compacted key fails closed instead of
+repeating the action. Session pruning retires every receipt tied to that record
+before deleting it; an old create or adopt key can never return a phantom
+pruned session.
+
 **Cancel turn** cooperatively cancels only the targeted active or queued turn.
 **Close session** is a separate action and does not masquerade as cancel or
 deletion. Local close always completes durably; its result separately reports

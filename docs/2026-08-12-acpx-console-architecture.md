@@ -57,7 +57,12 @@ The public capability groups are:
 Every mutation takes an idempotency key. Reusing the key for the same
 operation and input returns the stored result. Reusing it for a different
 operation or input is a conflict. Idempotency receipts are durable across
-console and queue-owner restarts.
+console and queue-owner restarts. Replayable results remain for seven days and
+at least the latest 512 terminal actions. Compacted SHA-256 key tombstones are
+kept exactly for another 30 days; they have no false positives, and their
+sharded bounded indexes expire automatically. Session pruning retires every
+receipt tied to the record before deleting it, so an old create or adopt key
+cannot replay a phantom pruned session.
 
 Creation performs `session/new` only. Adoption performs strict
 `session/resume` or `session/load`; it must not replace a missing provider
