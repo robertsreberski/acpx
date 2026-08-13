@@ -1,6 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ConsoleApi, MutationTransportUnknownError } from "../src/api";
+import { ConsoleApi, MutationRetryStateError, MutationTransportUnknownError } from "../src/api";
+
+class MemoryStorage {
+  readonly #items = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.#items.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.#items.set(key, value);
+  }
+
+  removeItem(key: string): void {
+    this.#items.delete(key);
+  }
+
+  values(): readonly string[] {
+    return [...this.#items.values()];
+  }
+}
+
+const client = (storage = new MemoryStorage(), now?: () => number): ConsoleApi =>
+  new ConsoleApi({ storage, now });
 
 const response = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -47,7 +70,7 @@ const requestUrl = (input: RequestInfo | URL): string =>
   typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 
 test("unwraps session and pending routes while preserving exact record identity", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   await withFetch(
     async (input) => {
       const url = requestUrl(input);
@@ -67,7 +90,7 @@ test("unwraps session and pending routes while preserving exact record identity"
         : response({ session: SESSION });
     },
     async () => {
-      const session = await client.session("record-1");
+      const session = await api.session("record-1");
       assert.equal(session.id, "record-1");
       assert.equal(session.queuedCount, 2);
       assert.deepEqual(session.queuedTurns, [
@@ -77,14 +100,14 @@ test("unwraps session and pending routes while preserving exact record identity"
           text: "Run the focused tests",
         },
       ]);
-      const pending = await client.pending("record-1");
+      const pending = await api.pending("record-1");
       assert.deepEqual(pending[0]?.options, [{ id: "allow", label: "Allow", kind: "allow_once" }]);
     },
   );
 });
 
 test("preserves a degraded provider-close result instead of reporting full success", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   await withFetch(
     async () =>
       response({
@@ -95,7 +118,7 @@ test("preserves a degraded provider-close result instead of reporting full succe
         },
       }),
     async () => {
-      const closed = await client.closeSession("record-1");
+      const closed = await api.closeSession("record-1");
       assert.equal(closed.session.id, "record-1");
       assert.equal(closed.session.sessionState, "closed");
       assert.deepEqual(closed.providerClose, {
@@ -107,7 +130,7 @@ test("preserves a degraded provider-close result instead of reporting full succe
 });
 
 test("projects the core item timeline and explicit legacy gap", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   await withFetch(
     async () =>
       response({
@@ -137,7 +160,7 @@ test("projects the core item timeline and explicit legacy gap", async () => {
         coverage: "legacy_retained",
       }),
     async () => {
-      const page = await client.timeline("record-1");
+      const page = await api.timeline("record-1");
       assert.equal(page.previousCursor, "cursor-1");
       assert.deepEqual(page.gap, {
         reason: "legacy_retained",
@@ -165,7 +188,7 @@ test("projects the core item timeline and explicit legacy gap", async () => {
 });
 
 test("projects corrupt timeline coverage without claiming complete history", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   await withFetch(
     async () =>
       response({
@@ -181,7 +204,7 @@ test("projects corrupt timeline coverage without claiming complete history", asy
         coverage: "incomplete",
       }),
     async () => {
-      const page = await client.timeline("record-1");
+      const page = await api.timeline("record-1");
       assert.equal(page.coverage, "incomplete");
       assert.deepEqual(page.gap, {
         reason: "corrupt",
@@ -192,8 +215,8 @@ test("projects corrupt timeline coverage without claiming complete history", asy
 });
 
 test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", async () => {
-  const client = new ConsoleApi();
-  client.setCsrfToken("csrf-1");
+  const api = client();
+  api.setCsrfToken("csrf-1");
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   await withFetch(
     async (input, init) => {
@@ -204,8 +227,8 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
       return response({ pending: {} });
     },
     async () => {
-      await client.providerSessions("codex", "/work/checkout");
-      await client.answerInteraction("record-1", "request-1", { type: "cancel" });
+      await api.providerSessions("codex", "/work/checkout");
+      await api.answerInteraction("record-1", "request-1", { type: "cancel" });
     },
   );
   assert.match(requests[0].url, /cwd=%2Fwork%2Fcheckout/u);
@@ -218,7 +241,7 @@ test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", a
 });
 
 test("sends an explicit custom-agent mode for both session creation paths", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   const bodies: unknown[] = [];
   await withFetch(
     async (_input, init) => {
@@ -227,13 +250,13 @@ test("sends an explicit custom-agent mode for both session creation paths", asyn
       return response({ session: { ...SESSION, agentId: "mock", mode: "review" } });
     },
     async () => {
-      await client.createSession({
+      await api.createSession({
         agentId: "mock",
         cwd: "/work/checkout",
         mode: "review",
         permissionPolicy: "defer-risky",
       });
-      await client.adoptSession({
+      await api.adoptSession({
         agentId: "mock",
         providerSessionId: "provider-mock",
         cwd: "/work/checkout",
@@ -258,7 +281,7 @@ test("sends an explicit custom-agent mode for both session creation paths", asyn
 });
 
 test("a network retry reuses the same idempotency key", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   const keys: string[] = [];
   let attempts = 0;
   await withFetch(
@@ -271,7 +294,7 @@ test("a network retry reuses the same idempotency key", async () => {
       return response({ pending: {} });
     },
     async () => {
-      await client.answerInteraction("record-1", "request-1", { type: "cancel" });
+      await api.answerInteraction("record-1", "request-1", { type: "cancel" });
     },
   );
   assert.equal(attempts, 2);
@@ -280,7 +303,7 @@ test("a network retry reuses the same idempotency key", async () => {
 });
 
 test("an explicit retry after two lost responses retains the original idempotency key", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   const keys: string[] = [];
   let attempts = 0;
   await withFetch(
@@ -294,10 +317,10 @@ test("an explicit retry after two lost responses retains the original idempotenc
     },
     async () => {
       await assert.rejects(
-        async () => await client.sendPrompt("record-1", "hello"),
+        async () => await api.sendPrompt("record-1", "hello"),
         MutationTransportUnknownError,
       );
-      assert.deepEqual(await client.sendPrompt("record-1", "hello"), {
+      assert.deepEqual(await api.sendPrompt("record-1", "hello"), {
         accepted: true,
         sessionId: "record-1",
         turnId: "turn-1",
@@ -310,8 +333,172 @@ test("an explicit retry after two lost responses retains the original idempotenc
   assert.deepEqual(keys, [keys[0], keys[0], keys[0]]);
 });
 
+test("a malformed successful response retains the mutation idempotency key", async () => {
+  const api = client();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      return attempts === 1
+        ? new Response('{"turnId":', {
+            status: 202,
+            headers: { "Content-Type": "application/json" },
+          })
+        : response({ turnId: "turn-1", admission: "started" }, 202);
+    },
+    async () => {
+      await assert.rejects(
+        async () => await api.sendPrompt("record-1", "malformed response"),
+        MutationTransportUnknownError,
+      );
+      await api.sendPrompt("record-1", "malformed response");
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.ok(keys[0]);
+  assert.equal(keys[1], keys[0]);
+});
+
+test("an ambiguous mutation keeps its exact key across a page reload", async () => {
+  const storage = new MemoryStorage();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (attempts <= 2) {
+        throw new TypeError("response lost");
+      }
+      return response({ turnId: "turn-reloaded", admission: "started" }, 202);
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client(storage).sendPrompt("record-1", "sensitive prompt body"),
+        MutationTransportUnknownError,
+      );
+      await client(storage).sendPrompt("record-1", "sensitive prompt body");
+    },
+  );
+  assert.equal(attempts, 3);
+  assert.deepEqual(keys, [keys[0], keys[0], keys[0]]);
+  assert.equal(storage.values().length, 0);
+});
+
+test("the durable retry ledger stores only fingerprints, keys, and timestamps", async () => {
+  const storage = new MemoryStorage();
+  await withFetch(
+    async () => {
+      throw new TypeError("response lost");
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client(storage).sendPrompt("record-1", "super-secret-prompt"),
+        MutationTransportUnknownError,
+      );
+    },
+  );
+  const serialized = storage.values()[0];
+  assert.ok(serialized);
+  assert.equal(serialized.includes("super-secret-prompt"), false);
+  const state = JSON.parse(serialized) as {
+    readonly entries: readonly Record<string, unknown>[];
+  };
+  assert.deepEqual(Object.keys(state.entries[0] ?? {}).toSorted(), [
+    "created_at",
+    "expires_at",
+    "fingerprint",
+    "key",
+  ]);
+});
+
+test("a full retry ledger fails closed without dispatching or evicting", async () => {
+  const storage = new MemoryStorage();
+  const api = client(storage);
+  let requests = 0;
+  const keys: string[] = [];
+  await withFetch(
+    async (_input, init) => {
+      requests += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      throw new TypeError("response lost");
+    },
+    async () => {
+      for (let index = 0; index < 64; index += 1) {
+        await assert.rejects(
+          async () => await api.sendPrompt("record-1", `ambiguous-${index}`),
+          MutationTransportUnknownError,
+        );
+      }
+      const persistedBefore = storage.values()[0];
+      const requestsBefore = requests;
+      await assert.rejects(
+        async () => await api.sendPrompt("record-1", "must-not-dispatch"),
+        (error: unknown) =>
+          error instanceof MutationRetryStateError && error.code === "CAPACITY_REACHED",
+      );
+      assert.equal(requests, requestsBefore);
+      assert.equal(storage.values()[0], persistedBefore);
+      await assert.rejects(
+        async () => await api.sendPrompt("record-1", "ambiguous-0"),
+        MutationTransportUnknownError,
+      );
+      assert.equal(keys.at(-1), keys[0]);
+      assert.equal(storage.values()[0], persistedBefore);
+    },
+  );
+  assert.equal(requests, 130);
+});
+
+test("expired retry keys are removed and no longer consume capacity", async () => {
+  const storage = new MemoryStorage();
+  let now = 1_000;
+  const keys: string[] = [];
+  await withFetch(
+    async (_input, init) => {
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      throw new TypeError("response lost");
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client(storage, () => now).sendPrompt("record-1", "expires"),
+        MutationTransportUnknownError,
+      );
+    },
+  );
+  const serialized = storage.values()[0];
+  assert.ok(serialized);
+  const state = JSON.parse(serialized) as {
+    readonly entries: readonly { readonly expires_at: number }[];
+  };
+  now = state.entries[0]?.expires_at ?? Number.MAX_SAFE_INTEGER;
+  client(storage, () => now);
+  assert.equal(storage.values().length, 0);
+});
+
+test("unavailable session storage blocks mutations before dispatch", async () => {
+  const api = new ConsoleApi({ storage: null });
+  let requests = 0;
+  await withFetch(
+    async () => {
+      requests += 1;
+      return response({ turnId: "unsafe", admission: "started" }, 202);
+    },
+    async () => {
+      await assert.rejects(
+        async () => await api.sendPrompt("record-1", "must-not-dispatch"),
+        (error: unknown) =>
+          error instanceof MutationRetryStateError && error.code === "STORAGE_UNAVAILABLE",
+      );
+    },
+  );
+  assert.equal(requests, 0);
+});
+
 test("changing an ambiguously completed mutation creates a distinct action identity", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   const keys: string[] = [];
   let attempts = 0;
   await withFetch(
@@ -325,10 +512,10 @@ test("changing an ambiguously completed mutation creates a distinct action ident
     },
     async () => {
       await assert.rejects(
-        async () => await client.sendPrompt("record-1", "first"),
+        async () => await api.sendPrompt("record-1", "first"),
         MutationTransportUnknownError,
       );
-      await client.sendPrompt("record-1", "second");
+      await api.sendPrompt("record-1", "second");
     },
   );
   assert.equal(attempts, 3);
@@ -337,7 +524,7 @@ test("changing an ambiguously completed mutation creates a distinct action ident
 });
 
 test("an HTTP failure is not retried", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   let attempts = 0;
   await assert.rejects(
     async () =>
@@ -347,7 +534,7 @@ test("an HTTP failure is not retried", async () => {
           return response({ error: { code: "TURN_CONFLICT", message: "Turn is busy" } }, 409);
         },
         async () => {
-          await client.sendPrompt("record-1", "hello");
+          await api.sendPrompt("record-1", "hello");
         },
       ),
     (error: unknown) => error instanceof Error && error.message === "Turn is busy",
@@ -356,8 +543,8 @@ test("an HTTP failure is not retried", async () => {
 });
 
 test("a stale CSRF 403 refreshes bootstrap once and preserves idempotency", async () => {
-  const client = new ConsoleApi();
-  client.setCsrfToken("csrf-old");
+  const api = client();
+  api.setCsrfToken("csrf-old");
   const mutations: Headers[] = [];
   await withFetch(
     async (input, init) => {
@@ -377,7 +564,7 @@ test("a stale CSRF 403 refreshes bootstrap once and preserves idempotency", asyn
         : response({ pending: {} });
     },
     async () => {
-      await client.answerInteraction("record-1", "request-1", { type: "cancel" });
+      await api.answerInteraction("record-1", "request-1", { type: "cancel" });
     },
   );
   assert.equal(mutations.length, 2);
@@ -387,11 +574,11 @@ test("a stale CSRF 403 refreshes bootstrap once and preserves idempotency", asyn
 });
 
 test("preserves an unknown prompt admission for reconciliation", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   await withFetch(
     async () => response({ turnId: "turn-unknown", admission: "unknown" }),
     async () => {
-      const receipt = await client.sendPrompt("record-1", "hello");
+      const receipt = await api.sendPrompt("record-1", "hello");
       assert.deepEqual(receipt, {
         accepted: true,
         sessionId: "record-1",
@@ -403,7 +590,7 @@ test("preserves an unknown prompt admission for reconciliation", async () => {
 });
 
 test("targets cancellation to the exact queued turn receipt", async () => {
-  const client = new ConsoleApi();
+  const api = client();
   let captured: { url: string; init?: RequestInit } | undefined;
   await withFetch(
     async (input, init) => {
@@ -411,7 +598,7 @@ test("targets cancellation to the exact queued turn receipt", async () => {
       return response({ turnId: "turn/queued", state: "cancelled" }, 202);
     },
     async () => {
-      await client.cancelTurn("record/one", "turn/queued");
+      await api.cancelTurn("record/one", "turn/queued");
     },
   );
   assert.equal(captured?.url, "/api/v1/sessions/record%2Fone/turns/turn%2Fqueued/cancel");

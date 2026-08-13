@@ -38,8 +38,31 @@ export class MutationTransportUnknownError extends Error {
   }
 }
 
+export class MutationRetryStateError extends Error {
+  readonly code: "CAPACITY_REACHED" | "STORAGE_UNAVAILABLE";
+
+  constructor(code: "CAPACITY_REACHED" | "STORAGE_UNAVAILABLE", cause?: unknown) {
+    super(
+      code === "CAPACITY_REACHED"
+        ? "Too many mutations still have an unknown outcome. Retry or reconcile those actions before starting a different one."
+        : "Safe mutation retries are unavailable because this tab's session storage cannot be used. Enable session storage and reload before trying the action again.",
+      cause === undefined ? undefined : { cause },
+    );
+    this.name = "MutationRetryStateError";
+    this.code = code;
+  }
+}
+
 const json = async <T>(response: Response): Promise<T> => {
-  const body = (await response.json().catch(() => undefined)) as
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    if (response.ok) {
+      throw error;
+    }
+  }
+  const typedBody = body as
     | {
         readonly error?: { readonly message?: string; readonly code?: string };
         readonly message?: string;
@@ -47,7 +70,7 @@ const json = async <T>(response: Response): Promise<T> => {
     | T
     | undefined;
   if (!response.ok) {
-    const errorBody = body as
+    const errorBody = typedBody as
       | {
           readonly error?: { readonly message?: string; readonly code?: string };
           readonly message?: string;
@@ -59,18 +82,212 @@ const json = async <T>(response: Response): Promise<T> => {
       errorBody?.error?.code,
     );
   }
-  return body as T;
+  return typedBody as T;
 };
 
 const idempotencyKey = (): string => crypto.randomUUID();
 const MAX_AMBIGUOUS_MUTATIONS = 64;
+const AMBIGUOUS_MUTATION_TTL_MS = 24 * 60 * 60 * 1_000;
+const AMBIGUOUS_MUTATION_STORAGE_KEY = "acpx.console.ambiguous_mutations.v1";
+const AMBIGUOUS_MUTATION_SCHEMA = "acpx.console_ambiguous_mutations.v1";
+
+interface MutationRetryStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+interface PersistedMutationKey {
+  readonly fingerprint: string;
+  readonly key: string;
+  readonly created_at: number;
+  readonly expires_at: number;
+}
+
+interface ConsoleApiOptions {
+  readonly storage?: MutationRetryStorage | null;
+  readonly now?: () => number;
+}
+
+const mutationFingerprint = async (
+  method: "DELETE" | "PATCH" | "POST" | "PUT",
+  path: string,
+  serializedBody: string | undefined,
+): Promise<string> => {
+  const bytes = new TextEncoder().encode(`${method}\n${path}\n${serializedBody ?? ""}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
+const sessionMutationStorage = (): MutationRetryStorage | undefined => {
+  try {
+    return globalThis.sessionStorage;
+  } catch {
+    return undefined;
+  }
+};
+
+const persistedMutationKey = (value: unknown): PersistedMutationKey => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Mutation retry entry is not an object.");
+  }
+  const entry = value as Record<string, unknown>;
+  if (
+    typeof entry.fingerprint !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(entry.fingerprint) ||
+    typeof entry.key !== "string" ||
+    entry.key.length === 0 ||
+    entry.key.length > 128 ||
+    typeof entry.created_at !== "number" ||
+    !Number.isSafeInteger(entry.created_at) ||
+    entry.created_at < 0 ||
+    typeof entry.expires_at !== "number" ||
+    !Number.isSafeInteger(entry.expires_at) ||
+    entry.expires_at - entry.created_at !== AMBIGUOUS_MUTATION_TTL_MS
+  ) {
+    throw new Error("Mutation retry entry is invalid.");
+  }
+  return {
+    fingerprint: entry.fingerprint,
+    key: entry.key,
+    created_at: entry.created_at,
+    expires_at: entry.expires_at,
+  };
+};
 
 const isAbortError = (error: unknown): boolean =>
   error instanceof DOMException && error.name === "AbortError";
 
 export class ConsoleApi {
   #csrfToken: string | undefined;
-  readonly #ambiguousMutationKeys = new Map<string, string>();
+  readonly #ambiguousMutationKeys = new Map<string, PersistedMutationKey>();
+  readonly #storage: MutationRetryStorage | undefined;
+  readonly #now: () => number;
+  #retryStateError: MutationRetryStateError | undefined;
+
+  constructor(options: ConsoleApiOptions = {}) {
+    this.#storage =
+      options.storage === undefined ? sessionMutationStorage() : (options.storage ?? undefined);
+    this.#now = options.now ?? Date.now;
+    this.#loadMutationKeys();
+  }
+
+  #loadMutationKeys(): void {
+    if (!this.#storage) {
+      this.#retryStateError = new MutationRetryStateError("STORAGE_UNAVAILABLE");
+      return;
+    }
+    try {
+      const serialized = this.#storage.getItem(AMBIGUOUS_MUTATION_STORAGE_KEY);
+      if (serialized === null) {
+        return;
+      }
+      const value = JSON.parse(serialized) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Mutation retry state is not an object.");
+      }
+      const record = value as Record<string, unknown>;
+      if (record.schema !== AMBIGUOUS_MUTATION_SCHEMA || !Array.isArray(record.entries)) {
+        throw new Error("Mutation retry state has an unsupported schema.");
+      }
+      const now = this.#now();
+      const activeEntries = record.entries.map(persistedMutationKey).filter((entry) => {
+        return entry.expires_at > now;
+      });
+      if (activeEntries.length > MAX_AMBIGUOUS_MUTATIONS) {
+        throw new MutationRetryStateError("CAPACITY_REACHED");
+      }
+      for (const entry of activeEntries) {
+        if (this.#ambiguousMutationKeys.has(entry.fingerprint)) {
+          throw new Error("Mutation retry state contains a duplicate fingerprint.");
+        }
+        this.#ambiguousMutationKeys.set(entry.fingerprint, entry);
+      }
+      if (activeEntries.length !== record.entries.length) {
+        this.#persistMutationKeys(this.#ambiguousMutationKeys);
+      }
+    } catch (error) {
+      this.#ambiguousMutationKeys.clear();
+      this.#retryStateError =
+        error instanceof MutationRetryStateError
+          ? error
+          : new MutationRetryStateError("STORAGE_UNAVAILABLE", error);
+    }
+  }
+
+  #persistMutationKeys(entries: ReadonlyMap<string, PersistedMutationKey>): void {
+    if (!this.#storage) {
+      throw new MutationRetryStateError("STORAGE_UNAVAILABLE");
+    }
+    try {
+      if (entries.size === 0) {
+        this.#storage.removeItem(AMBIGUOUS_MUTATION_STORAGE_KEY);
+        return;
+      }
+      this.#storage.setItem(
+        AMBIGUOUS_MUTATION_STORAGE_KEY,
+        JSON.stringify({
+          schema: AMBIGUOUS_MUTATION_SCHEMA,
+          entries: [...entries.values()],
+        }),
+      );
+    } catch (error) {
+      const stateError = new MutationRetryStateError("STORAGE_UNAVAILABLE", error);
+      this.#retryStateError = stateError;
+      throw stateError;
+    }
+  }
+
+  #pruneExpiredMutationKeys(): void {
+    if (this.#retryStateError) {
+      throw this.#retryStateError;
+    }
+    const now = this.#now();
+    const activeEntries = new Map(
+      [...this.#ambiguousMutationKeys].filter(([, entry]) => entry.expires_at > now),
+    );
+    if (activeEntries.size === this.#ambiguousMutationKeys.size) {
+      return;
+    }
+    this.#persistMutationKeys(activeEntries);
+    this.#ambiguousMutationKeys.clear();
+    for (const [fingerprint, entry] of activeEntries) {
+      this.#ambiguousMutationKeys.set(fingerprint, entry);
+    }
+  }
+
+  #reserveMutationKey(fingerprint: string, requestedKey?: string): string {
+    this.#pruneExpiredMutationKeys();
+    const existing = this.#ambiguousMutationKeys.get(fingerprint);
+    if (existing) {
+      return existing.key;
+    }
+    if (this.#ambiguousMutationKeys.size >= MAX_AMBIGUOUS_MUTATIONS) {
+      throw new MutationRetryStateError("CAPACITY_REACHED");
+    }
+    const now = this.#now();
+    const entry: PersistedMutationKey = {
+      fingerprint,
+      key: requestedKey ?? idempotencyKey(),
+      created_at: now,
+      expires_at: now + AMBIGUOUS_MUTATION_TTL_MS,
+    };
+    const nextEntries = new Map(this.#ambiguousMutationKeys).set(fingerprint, entry);
+    this.#persistMutationKeys(nextEntries);
+    this.#ambiguousMutationKeys.set(fingerprint, entry);
+    return entry.key;
+  }
+
+  #releaseMutationKey(fingerprint: string, requestKey: string): void {
+    const existing = this.#ambiguousMutationKeys.get(fingerprint);
+    if (existing?.key !== requestKey) {
+      return;
+    }
+    const nextEntries = new Map(this.#ambiguousMutationKeys);
+    nextEntries.delete(fingerprint);
+    this.#persistMutationKeys(nextEntries);
+    this.#ambiguousMutationKeys.delete(fingerprint);
+  }
 
   setCsrfToken(value: string | undefined): void {
     this.#csrfToken = value;
@@ -88,8 +305,8 @@ export class ConsoleApi {
     allowCsrfRefresh = true,
   ): Promise<T> {
     const serializedBody = JSON.stringify(body);
-    const fingerprint = `${method}\n${path}\n${serializedBody}`;
-    const requestKey = key ?? this.#ambiguousMutationKeys.get(fingerprint) ?? idempotencyKey();
+    const fingerprint = await mutationFingerprint(method, path, serializedBody);
+    const requestKey = this.#reserveMutationKey(fingerprint, key);
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Content-Type": "application/json",
@@ -116,29 +333,33 @@ export class ConsoleApi {
       }
     } catch (error) {
       if (isAbortError(error)) {
+        this.#releaseMutationKey(fingerprint, requestKey);
         throw error;
       }
-      if (!this.#ambiguousMutationKeys.has(fingerprint)) {
-        if (this.#ambiguousMutationKeys.size >= MAX_AMBIGUOUS_MUTATIONS) {
-          const oldest = this.#ambiguousMutationKeys.keys().next().value;
-          if (oldest !== undefined) {
-            this.#ambiguousMutationKeys.delete(oldest);
-          }
-        }
-      }
-      this.#ambiguousMutationKeys.set(fingerprint, requestKey);
       throw new MutationTransportUnknownError(error);
     }
     if (response.status === 403 && allowCsrfRefresh) {
-      const snapshot = await this.bootstrap();
+      let snapshot: BootstrapSnapshot;
+      try {
+        snapshot = await this.bootstrap();
+      } catch (error) {
+        this.#releaseMutationKey(fingerprint, requestKey);
+        throw error;
+      }
       this.setCsrfToken(snapshot.csrfToken);
       return await this.mutate<T>(path, body, method, requestKey, false);
     }
-    const result = await json<T>(response);
-    if (this.#ambiguousMutationKeys.get(fingerprint) === requestKey) {
-      this.#ambiguousMutationKeys.delete(fingerprint);
+    try {
+      const result = await json<T>(response);
+      this.#releaseMutationKey(fingerprint, requestKey);
+      return result;
+    } catch (error) {
+      if (response.ok) {
+        throw new MutationTransportUnknownError(error);
+      }
+      this.#releaseMutationKey(fingerprint, requestKey);
+      throw error;
     }
-    return result;
   }
 
   bootstrap(): Promise<BootstrapSnapshot> {
