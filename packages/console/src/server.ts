@@ -650,7 +650,10 @@ export async function startAcpxConsoleServer(
     try {
       await disposeServiceOnce();
     } catch (disposeError) {
-      logger.error(disposeError);
+      if (disposeError instanceof Error && disposeError.cause === undefined) {
+        disposeError.cause = error;
+      }
+      throw disposeError;
     }
     throw error;
   };
@@ -828,7 +831,12 @@ export async function startAcpxConsoleServer(
       });
     });
   } catch (error) {
-    unsubscribe?.();
+    let cleanupError: unknown;
+    try {
+      unsubscribe?.();
+    } catch (unsubscribeError) {
+      cleanupError = unsubscribeError;
+    }
     for (const socket of sockets) {
       socket.destroy();
     }
@@ -836,7 +844,18 @@ export async function startAcpxConsoleServer(
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    return await disposeAfterStartupFailure(error);
+    try {
+      await disposeServiceOnce();
+    } catch (disposeError) {
+      cleanupError ??= disposeError;
+    }
+    if (cleanupError !== undefined) {
+      if (cleanupError instanceof Error && cleanupError.cause === undefined) {
+        cleanupError.cause = error;
+      }
+      throw cleanupError;
+    }
+    throw error;
   }
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : config.port;

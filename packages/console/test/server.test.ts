@@ -369,6 +369,40 @@ test("a missing startup workspace root disposes the service exactly once", async
   assert.equal(disposed, 1);
 });
 
+test("a startup disposal failure retains the workspace validation error as its cause", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-dispose-failure-"));
+  const missingRoot = join(root, "missing");
+  const service = new MockSessionService();
+  let disposed = 0;
+  service.dispose = () => {
+    disposed += 1;
+    throw new Error("dispose failed");
+  };
+
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [missingRoot],
+        stateDir: join(root, "state"),
+        staticDir: join(root, "web"),
+      },
+      service,
+      logger: { info() {}, warn() {}, error() {} },
+    }),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message === "dispose failed" &&
+      error.cause instanceof Error &&
+      (error.cause as NodeJS.ErrnoException).code === "ENOENT" &&
+      error.cause.message.includes(missingRoot),
+  );
+  assert.equal(disposed, 1);
+});
+
 test("JSON request bodies are bounded before parsing", async () => {
   const { running } = await fixture();
   try {
@@ -858,6 +892,7 @@ test("a failed listen unsubscribes and disposes the service", async () => {
   let disposed = 0;
   service.subscribe = () => () => {
     unsubscribed += 1;
+    throw new Error("unsubscribe failed");
   };
   service.dispose = () => {
     disposed += 1;
@@ -878,7 +913,11 @@ test("a failed listen unsubscribes and disposes the service", async () => {
         service,
         logger: { info() {}, warn() {}, error() {} },
       }),
-      /EADDRINUSE/,
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === "unsubscribe failed" &&
+        error.cause instanceof Error &&
+        (error.cause as NodeJS.ErrnoException).code === "EADDRINUSE",
     );
     assert.equal(unsubscribed, 1);
     assert.equal(disposed, 1);
