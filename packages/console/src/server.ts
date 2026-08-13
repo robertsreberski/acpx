@@ -122,6 +122,18 @@ const SAFE_SERVICE_ERRORS: Readonly<
   IDEMPOTENCY_KEY_CONFLICT: { statusCode: 409, message: "Idempotency key conflicts" },
   IDEMPOTENCY_RESULT_UNKNOWN: { statusCode: 409, message: "Mutation result is unknown" },
   IDEMPOTENCY_RECORD_CORRUPT: { statusCode: 409, message: "Mutation record is unavailable" },
+  IDEMPOTENCY_RECEIPT_RETIRED: {
+    statusCode: 409,
+    message: "Idempotency receipt was retired; reconcile before choosing a new key",
+  },
+  IDEMPOTENCY_SESSION_PRUNED: {
+    statusCode: 410,
+    message: "The session recorded by this mutation was pruned",
+  },
+  IDEMPOTENCY_LEDGER_FULL: {
+    statusCode: 507,
+    message: "The durable mutation ledger is full",
+  },
   IDEMPOTENT_MUTATION_FAILED: { statusCode: 409, message: "Mutation previously failed" },
   TURN_CONFLICT: { statusCode: 409, message: "Session cannot accept this turn" },
   TURN_NOT_ACTIVE: { statusCode: 409, message: "Turn is not active" },

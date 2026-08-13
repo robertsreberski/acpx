@@ -668,6 +668,48 @@ test("unknown session-start results require reconciliation instead of reporting 
   }
 });
 
+test("durable idempotency retention failures preserve their typed HTTP contract", async () => {
+  const { running, service, workspace } = await fixture();
+  const cases = [
+    {
+      code: "IDEMPOTENCY_RECEIPT_RETIRED",
+      status: 409,
+      message: "Idempotency receipt was retired; reconcile before choosing a new key",
+    },
+    {
+      code: "IDEMPOTENCY_SESSION_PRUNED",
+      status: 410,
+      message: "The session recorded by this mutation was pruned",
+    },
+    {
+      code: "IDEMPOTENCY_LEDGER_FULL",
+      status: 507,
+      message: "The durable mutation ledger is full",
+    },
+  ] as const;
+  try {
+    const auth = await bootstrap(running.origin);
+    for (const current of cases) {
+      service.createSession = async () => {
+        throw Object.assign(new Error("receipt SECRET from /Users/operator/private.json"), {
+          code: current.code,
+        });
+      };
+      const response = await fetch(`${running.origin}/api/v1/sessions`, {
+        method: "POST",
+        headers: mutationHeaders(auth, `retention-${current.code.toLowerCase()}`),
+        body: JSON.stringify({ agentId: "codex", cwd: workspace }),
+      });
+      assert.equal(response.status, current.status);
+      assert.deepEqual(await response.json(), {
+        error: { code: current.code, message: current.message },
+      });
+    }
+  } finally {
+    await running.close();
+  }
+});
+
 test("invalid pending answers and inaccessible workspaces are typed client errors", async () => {
   const { root, running } = await fixture();
   try {
