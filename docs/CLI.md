@@ -31,8 +31,8 @@ acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
 acpx [global_options] requests [list] [--all] [--json] [-s <name>]
-acpx [global_options] respond <request-id> (--option <optionId> | --decline | --cancel) [--json] [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] respond <request-id> (--option <optionId> | --accept | --field <key=value>... | --text <answer> | --decline | --cancel) [--json] [-s <name>]
+acpx [global_options] sessions [list | new [-s|--name <name>] [--resume-session <id>] | ensure [-s|--name <name>] [--resume-session <id>] | close [name] | show [name] | history [name] [--limit <count>] | read [name] [--tail <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
@@ -43,8 +43,8 @@ acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
 acpx [global_options] <agent> requests [list] [--all] [--json] [-s <name>]
-acpx [global_options] <agent> respond <request-id> (--option <optionId> | --decline | --cancel) [--json] [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
+acpx [global_options] <agent> respond <request-id> (--option <optionId> | --accept | --field <key=value>... | --text <answer> | --decline | --cancel) [--json] [-s <name>]
+acpx [global_options] <agent> sessions [list | new [-s|--name <name>] [--resume-session <id>] | ensure [-s|--name <name>] [--resume-session <id>] | close [name] | show [name] | history [name] [--limit <count>] | read [name] [--tail <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 ```
 
 The global `--mcp-config <path>` option loads an external JSON file's `mcpServers` array for the

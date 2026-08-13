@@ -28,8 +28,10 @@ Core capabilities:
 - Agent reconnect/resume after dead subprocess detection
 - Prompt input via stdin or `--file`
 - Config files with global+project merge and `config show|init`
-- Session metadata/history inspection (`sessions show`, `sessions history`)
+- Session metadata/history inspection (`sessions show`, `sessions history`, `sessions read`)
 - Local agent process checks via `status`
+- Deferred permission requests and form elicitations (`--defer`, `requests`, `respond`) for answering an agent out of band
+- MCP servers passed to agent sessions via the `mcpServers` config key or `--mcp-config`
 - Stable ACP client methods for filesystem and terminal requests
 - Stable ACP `authenticate` handshake via env/config credentials
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
@@ -61,7 +63,9 @@ acpx [global_options] cancel [-s <name>]
 acpx [global_options] set-mode <mode> [-s <name>]
 acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name>]
-acpx [global_options] sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] requests [list] [--all] [--json] [-s <name>]
+acpx [global_options] respond <request-id> (--option <id> | --accept | --field <key=value>... | --text <answer> | --decline | --cancel) [--json] [-s <name>]
+acpx [global_options] sessions [list | new [-s|--name <name>] [--resume-session <id>] | ensure [-s|--name <name>] [--resume-session <id>] | close [name] | show [name] | history [name] [--limit <count>] | read [name] [--tail <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 acpx [global_options] config [show | init]
 acpx [global_options] flow run <file> [--input-json '<json>' | --input-file <path>] [--default-agent <name>]
 
@@ -72,7 +76,9 @@ acpx [global_options] <agent> cancel [-s <name>]
 acpx [global_options] <agent> set-mode <mode> [-s <name>]
 acpx [global_options] <agent> set <key> <value> [-s <name>]
 acpx [global_options] <agent> status [-s <name>]
-acpx [global_options] <agent> sessions [list | new [--name <name>] | ensure [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
+acpx [global_options] <agent> requests [list] [--all] [--json] [-s <name>]
+acpx [global_options] <agent> respond <request-id> (--option <id> | --accept | --field <key=value>... | --text <answer> | --decline | --cancel) [--json] [-s <name>]
+acpx [global_options] <agent> sessions [list | new [-s|--name <name>] [--resume-session <id>] | ensure [-s|--name <name>] [--resume-session <id>] | close [name] | show [name] | history [name] [--limit <count>] | read [name] [--tail <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>] | prune [--dry-run] [--before <date> | --older-than <days>] [--include-history]]
 ```
 
 If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdin.
@@ -169,6 +175,7 @@ Behavior:
 - `--format text` prints one summary table row per agent
 - `--format json` or `--json` prints `CompareRow[]`
 - `--format quiet` prints `<agent>\t<status>` per row
+- `--json` is a local alias for `--format json`, and `--prompt-file` a local alias for `-f/--file`
 - Does not create saved sessions or separate compare transcript directories
 
 ### Cancel / Mode / Config / Model
@@ -196,7 +203,7 @@ Behavior:
 ### Deferred permission requests
 
 ```bash
-acpx codex set mode read-only   # codex self-approves in its sandbox without this; set it before the first prompt
+acpx codex set-mode read-only   # codex self-approves in its sandbox without this; set it before the first prompt
 acpx --defer --policy '{"defer":["execute"]}' codex prompt --no-wait 'run the repo checks'
 acpx codex requests --json
 acpx codex respond <request-id> --option allow
@@ -208,10 +215,12 @@ acpx codex respond <request-id> --cancel
 
 Behavior:
 
-- **Codex parks nothing until its session is set to `read-only`** (`acpx codex set mode read-only`): its default `agent` preset approves its own tool calls inside its sandbox and never sends a permission request. Set it **before the session's first prompt** — on a session whose queue owner is already warm the change does not reach the session the next prompt uses, and that prompt self-approves with nothing parked; retire the owner first (`sessions close`, or let `--ttl` lapse). Agents that do not self-sandbox, such as `claude`, need nothing extra. Codex also offers no `reject_always` option and sends no tool title, so `--decline` uses `reject_once` and the listing shows the `tool` fallback — read `raw_input` for the command.
+- **Codex parks nothing until its session is set to `read-only`** (`acpx codex set-mode read-only`): its default `agent` preset approves its own tool calls inside its sandbox and never sends a permission request. Set it **before the session's first prompt** — on a session whose queue owner is already warm the change does not reach the session the next prompt uses, and that prompt self-approves with nothing parked; retire the owner first (`sessions close`, or let `--ttl` lapse). Agents that do not self-sandbox, such as `claude`, need nothing extra. Codex also offers no `reject_always` option and sends no tool title, so `--decline` uses `reject_once` and the listing shows the `tool` fallback — read `raw_input` for the command.
+- Two spellings reach that same codex preset, and they are **different ACP calls**: `set-mode read-only` is `session/set_mode`, while `set mode read-only` is `session/set_config_option` against the `mode` option codex advertises (`read-only` / `agent` / `agent-full-access`). `docs/deferred-requests.md` writes it the second way. Prefer `set-mode`: it is the one the session record stores as its mode and re-applies on every rebind, and the one whose failure to re-apply is reported as `SESSION_MODE_NOT_REAPPLIED` — so a mode that quietly stopped being in force is visible rather than silent.
 - `--defer` parks `defer`-matched permission requests instead of denying them for the turn: the turn stays blocked and a durable record is written under `~/.acpx/requests/`.
 - `--defer` and `--defer-max-age <seconds>` are owner-level, fixed when the session's queue owner starts; a submit a warm owner cannot honour is refused, not silently denied.
-- `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session, needs no session in the current directory, and cannot be combined with `-s`.
+- `requests` lists parked requests from the durable store, so it still works when the queue owner is unreachable. `--all` covers every session, needs no session in the current directory, and cannot be combined with `-s`. `requests list` is the same command spelled explicitly.
+- `--json` is a local alias for `--format json` on both `requests` and `respond`.
 - `requests` observes only: it never rewrites request state and never touches the owner process. A request left `pending` by a dead owner is reconciled to `orphaned` by `respond` or by the session's next queue owner.
 - `-s` takes a session **name**; the JSON carries `session_id` and `cwd`. Answer a request listed by `--all` from its `cwd`.
 - `requests --json` prints the persisted store entries verbatim (snake_case, `acpx.pending_request.v1`). Bind scripts to that shape.
@@ -241,8 +250,11 @@ acpx sessions ensure
 acpx sessions ensure --name backend
 acpx sessions close
 acpx sessions close backend
+acpx sessions new --resume-session <acp-session-id>
 acpx sessions show
 acpx sessions history --limit 20
+acpx sessions read
+acpx sessions read backend --tail 100
 acpx sessions export backend --output backend-session.json
 acpx sessions import backend-session.json --name backend-restored
 acpx sessions prune --dry-run --older-than 7
@@ -255,6 +267,7 @@ acpx codex sessions ensure --name backend
 acpx codex sessions close backend
 acpx codex sessions show backend
 acpx codex sessions history backend --limit 20
+acpx codex sessions read backend --tail 100
 acpx codex sessions export backend --output backend-session.json
 acpx codex sessions import backend-session.json --name backend-restored
 acpx codex sessions prune --before 2026-04-01 --include-history
@@ -270,13 +283,15 @@ Behavior:
   `--cursor <cursor>` requests a specific page
 - `sessions list --local` reads saved acpx records instead
 - `new` creates a fresh session for the current `(agentCommand, cwd, optional name)` scope
-- `new --name <name>` targets a named session scope
+- `new --name <name>` targets a named session scope. On `new` and `ensure` only, `-s` is an alias for `--name` — everywhere else `-s` is `--session`.
+- `new --resume-session <id>` and `ensure --resume-session <id>` bind the record to an ACP session id the agent already has, instead of asking for a new one
 - when `new` replaces an existing open session in that scope, the old one is soft-closed
 - `ensure` returns the nearest matching active session for the scope, or creates one when none is open. Idempotent — safe to call before every prompt in scripts.
 - `close` targets current cwd default session
 - `close <name>` targets current cwd named session
 - `show [name]` prints stored metadata for that scoped session
 - `history [name]` prints stored turn history previews (default 20, use `--limit`)
+- `read [name]` prints the whole stored history instead of a capped preview; `--tail <count>` keeps only the last N entries
 - `export [name] --output <path>` writes a portable JSON archive containing session state and event history
 - `import <archive>` creates a fresh local record, reopens the copied session as idle, keeps the provider session id, and clears source-machine process metadata
 - imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation
@@ -290,6 +305,7 @@ Behavior:
 
 - `--agent <command>`: raw ACP agent command (escape hatch)
 - `--cwd <dir>`: working directory for session scope (default: current directory)
+- `--auth-policy <policy>`: what to do when the agent requires ACP `authenticate` — `skip` (default) continues and lets the adapter handle its own auth, `fail` stops rather than proceeding without a matching credential
 - `--approve-all`: auto-approve all permission requests
 - `--approve-reads`: auto-approve reads/searches, prompt for writes (default mode)
 - `--deny-all`: deny all permission requests
@@ -310,6 +326,7 @@ Behavior:
 - `--prompt-retries <count>`: retry failed prompt turns on transient errors (default `0`)
 - `--no-fs`: advertise both ACP filesystem capabilities as disabled so compatible agents use their native file operations
 - `--no-terminal`: do not advertise the ACP terminal capability — useful for review-only or sandboxed agent invocations
+- `--mcp-config <path>`: load MCP servers from a JSON file instead of the project/global `mcpServers` config
 - `--verbose`: verbose ACP/debug logs to stderr
 
 Cursor may advertise bracketed model ids such as `composer-2.5[fast=false]`. A bare Cursor
@@ -370,13 +387,21 @@ Supported keys:
 - `defaultAgent`
 - `defaultPermissions` (`approve-all`, `approve-reads`, `deny-all`)
 - `nonInteractivePermissions` (`deny`, `fail`)
+- `authPolicy` (`skip` default, `fail`) — matches `--auth-policy`
 - `ttl` (seconds)
 - `timeout` (seconds or `null`)
 - `format` (`text`, `json`, `quiet`)
+- `mcpServers` array — MCP servers sent to new _and_ loaded ACP sessions, e.g. `[{ "name": "local-tools", "type": "stdio", "command": "./bin/mcp-server" }]`. Unlike the other keys, a project value **replaces** the global list rather than merging into it.
 - `agents` map (`name -> { argv: [executable, ...args] }`); structured argv is required on Windows, and legacy `{ command, args }` entries migrate automatically
 - `auth` map (`authMethodId -> credential`)
 
 Use `acpx config show` to inspect the resolved config and `acpx config init` to create the global template.
+
+`--mcp-config <path>` points at a JSON file carrying that same top-level `mcpServers` array
+and replaces the project/global value for one invocation — use it when the servers belong to
+an automation job rather than the working tree. Relative paths resolve from `--cwd`. A
+persistent session cannot switch MCP configuration while its queue owner is live: close the
+session first, then run again with the new file.
 
 For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 `ACPX_AUTH_<METHOD_ID>` environment variables such as `ACPX_AUTH_OPENAI_API_KEY`.
