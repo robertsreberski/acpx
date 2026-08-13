@@ -72,11 +72,13 @@ test("a live refresh replaces its window but preserves loaded history and its ol
 
 test("page merging never erases incomplete durable-history coverage", () => {
   const corrupt: TimelinePage = {
+    epoch: "epoch-1",
     events: [],
     coverage: "incomplete",
     gap: { reason: "corrupt", message: "A corrupt epoch was isolated." },
   };
   const refreshed = mergeRefreshedTimelinePage(corrupt, {
+    epoch: "epoch-1",
     events: [],
     coverage: "complete",
   });
@@ -185,5 +187,28 @@ test("an epoch reset does not carry stale durable-history diagnostics into the n
   assert.equal(reset.coverage, "complete");
   assert.equal(reset.gap, undefined);
   assert.equal(reset.writeError, undefined);
+  assert.equal(reset.continuityIssue?.reason, "epoch_changed");
+});
+
+test("an authoritative empty replacement epoch clears stale transcript events", () => {
+  const reset = mergeRefreshedTimelinePage(
+    {
+      epoch: "epoch-old",
+      events: events("epoch-old", 1, 20),
+      previousCursor: "old-cursor",
+      coverage: "complete",
+    },
+    {
+      epoch: "epoch-new",
+      events: [],
+      coverage: "incomplete",
+      gap: { reason: "corrupt", message: "A corrupt epoch was isolated." },
+    },
+  );
+
+  assert.equal(reset.epoch, "epoch-new");
+  assert.equal(reset.previousCursor, undefined);
+  assert.deepEqual(reset.events, []);
+  assert.equal(reset.gap?.reason, "corrupt");
   assert.equal(reset.continuityIssue?.reason, "epoch_changed");
 });

@@ -421,6 +421,23 @@ test("a corrupt timeline tail is disclosed and rotates the epoch before the next
   });
 });
 
+test("an empty timeline page exposes its authoritative epoch", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-empty-epoch", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionTimelineWriter.open(record);
+    await writer.close({ checkpoint: true });
+
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    assert.ok(stored.timeline);
+    const page = await listSessionTimelinePage(record.acpxRecordId);
+    assert.equal(page.epoch, stored.timeline.epoch);
+    assert.deepEqual(page.items, []);
+  });
+});
+
 test("a stale record cannot resurrect an epoch after corruption rotation", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

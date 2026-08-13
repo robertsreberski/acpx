@@ -76,7 +76,7 @@ test("configured roots scope session inventories and every retained-session oper
   const invoked: string[] = [];
   service.getTranscriptPage = async () => {
     invoked.push("timeline");
-    return { items: [], hasMore: false, coverage: "complete" };
+    return { epoch: null, items: [], hasMore: false, coverage: "complete" };
   };
   service.listPendingRequests = async () => {
     invoked.push("pending");

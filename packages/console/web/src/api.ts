@@ -418,6 +418,7 @@ export class ConsoleApi {
     ).then((page) => {
       const gap = page.items.find((item): item is WireTimelineGap => item.kind === "history_gap");
       return {
+        epoch: page.epoch,
         events: page.items
           .filter((item): item is WireTimelineEvent => item.kind !== "history_gap")
           .map(projectTimelineEvent),
@@ -594,6 +595,7 @@ interface WireSession {
 }
 
 interface WireTimelinePage {
+  readonly epoch: string | null;
   readonly items: readonly (WireTimelineEvent | WireTimelineGap)[];
   readonly previousCursor?: string;
   readonly hasMore: boolean;

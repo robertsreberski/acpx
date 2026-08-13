@@ -825,7 +825,12 @@ test("session detail, provider inventory, timeline, pending, cancellation, respo
     assert.equal(service.calls.at(-1)?.method, "listProviderSessions");
 
     const timeline = await fetch(`${running.origin}/api/v1/sessions/record-1/timeline?limit=20`);
-    assert.deepEqual(await timeline.json(), { items: [], hasMore: false, coverage: "complete" });
+    assert.deepEqual(await timeline.json(), {
+      epoch: null,
+      items: [],
+      hasMore: false,
+      coverage: "complete",
+    });
     const pending = await fetch(`${running.origin}/api/v1/sessions/record-1/pending`);
     assert.equal(((await pending.json()) as { pending: unknown[] }).pending.length, 1);
 

@@ -86,6 +86,7 @@ function coreFixture(sessionList: "supported" | "unsupported" | "unknown" = "sup
       },
       async getTranscriptPage(): Promise<TimelinePage> {
         return {
+          epoch: "epoch-1",
           items: [],
           hasMore: false,
           coverage: "complete",
@@ -114,8 +115,10 @@ test("adapter unwraps mutation receipts and projects provider and agent inventor
     (await service.listProviderSessions({ agentId: "codex", cwd: "/workspace" })).sessions,
     [{ providerSessionId: "native-1", title: "Native", cwd: undefined, updatedAt: undefined }],
   );
+  const timeline = await service.getTranscriptPage({ acpxRecordId: "record-1" });
+  assert.equal(timeline.epoch, "epoch-1");
   assert.equal(
-    (await service.getTranscriptPage({ acpxRecordId: "record-1" })).writeError,
+    timeline.writeError,
     "Authoritative timeline persistence failed; recent history may be incomplete.",
   );
   const created = await service.createSession({

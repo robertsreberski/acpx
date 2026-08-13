@@ -309,7 +309,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       }
       if (error instanceof ApiError && error.status === 410) {
         notice(
-          "Earlier transcript pages expired. Reloading from the earliest available event.",
+          "Earlier transcript pages expired. Reloading the latest available transcript.",
           "info",
         );
         await refreshSelection(sessionId, false);

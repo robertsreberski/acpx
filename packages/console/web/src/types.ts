@@ -90,7 +90,8 @@ export interface TranscriptEvent {
 
 export interface TimelinePage {
   readonly events: readonly TranscriptEvent[];
-  readonly epoch?: string;
+  /** Authoritative durable-ledger generation; null means no ledger exists. */
+  readonly epoch: string | null;
   readonly previousCursor?: string;
   readonly coverage: "complete" | "legacy_retained" | "incomplete";
   readonly gap?: {

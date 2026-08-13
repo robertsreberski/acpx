@@ -100,7 +100,7 @@ export class MockSessionService implements AcpxConsoleSessionService {
     };
   }
   async getTranscriptPage(): Promise<TimelinePage> {
-    return { items: [], hasMore: false, coverage: "complete" };
+    return { epoch: null, items: [], hasMore: false, coverage: "complete" };
   }
   subscribe(listener: (event: ServiceInvalidation) => void) {
     this.listener = listener;

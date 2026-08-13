@@ -4,16 +4,6 @@ import type { TimelinePage, TranscriptEvent } from "./types";
 const rawEvents = (events: readonly TranscriptEvent[]): readonly TranscriptEvent[] =>
   events.flatMap((event) => event.sourceEvents ?? [event]);
 
-const pageEpoch = (page: TimelinePage): string | undefined => {
-  if (page.epoch) {
-    return page.epoch;
-  }
-  const epochs = new Set(
-    rawEvents(page.events).flatMap((event) => (event.epoch ? [event.epoch] : [])),
-  );
-  return epochs.size === 1 ? [...epochs][0] : undefined;
-};
-
 const sequenceRange = (
   events: readonly TranscriptEvent[],
 ): { readonly first: number; readonly last: number } | undefined => {
@@ -90,7 +80,6 @@ export const normalizeTimelinePage = (page: TimelinePage): TimelinePage => {
   const events = coalesceTranscriptEvents(page.events);
   return {
     ...page,
-    epoch: pageEpoch(page),
     events,
     continuityIssue: page.continuityIssue ?? refreshGap(events, page.previousCursor !== undefined),
   };
@@ -110,11 +99,7 @@ export const mergeRefreshedTimelinePage = (
   }
   const normalizedCurrent = normalizeTimelinePage(current);
   const normalizedLatest = normalizeTimelinePage(latest);
-  if (
-    normalizedCurrent.epoch &&
-    normalizedLatest.epoch &&
-    normalizedCurrent.epoch !== normalizedLatest.epoch
-  ) {
+  if (normalizedCurrent.epoch !== normalizedLatest.epoch) {
     return {
       ...normalizedLatest,
       continuityIssue: epochChangeIssue(),
@@ -135,7 +120,7 @@ export const mergeRefreshedTimelinePage = (
   ]);
   return {
     ...normalizedLatest,
-    epoch: normalizedLatest.epoch ?? normalizedCurrent.epoch,
+    epoch: normalizedLatest.epoch,
     events,
     previousCursor,
     coverage: mergedCoverage(normalizedCurrent.coverage, normalizedLatest.coverage),
@@ -151,11 +136,7 @@ export const prependEarlierTimelinePage = (
 ): TimelinePage => {
   const normalizedCurrent = normalizeTimelinePage(current);
   const normalizedEarlier = normalizeTimelinePage(earlier);
-  if (
-    normalizedCurrent.epoch &&
-    normalizedEarlier.epoch &&
-    normalizedCurrent.epoch !== normalizedEarlier.epoch
-  ) {
+  if (normalizedCurrent.epoch !== normalizedEarlier.epoch) {
     return {
       ...normalizedCurrent,
       coverage: mergedCoverage(normalizedCurrent.coverage, normalizedEarlier.coverage),
@@ -170,7 +151,7 @@ export const prependEarlierTimelinePage = (
   ]);
   return {
     ...normalizedEarlier,
-    epoch: normalizedCurrent.epoch ?? normalizedEarlier.epoch,
+    epoch: normalizedCurrent.epoch,
     events,
     coverage: mergedCoverage(normalizedCurrent.coverage, normalizedEarlier.coverage),
     gap: normalizedEarlier.gap ?? normalizedCurrent.gap,

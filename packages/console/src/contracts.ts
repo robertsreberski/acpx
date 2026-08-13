@@ -73,6 +73,8 @@ export type TimelineItem =
     };
 
 export interface TimelinePage {
+  /** Authoritative durable-ledger generation; null means no ledger exists. */
+  epoch: string | null;
   items: TimelineItem[];
   previousCursor?: string;
   hasMore: boolean;

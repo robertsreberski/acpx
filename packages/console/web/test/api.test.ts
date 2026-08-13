@@ -142,6 +142,7 @@ test("projects the core item timeline and explicit legacy gap", async () => {
   await withFetch(
     async () =>
       response({
+        epoch: "epoch-1",
         items: [
           {
             schema: "acpx.session_history_gap.v1",
@@ -169,6 +170,7 @@ test("projects the core item timeline and explicit legacy gap", async () => {
       }),
     async () => {
       const page = await api.timeline("record-1");
+      assert.equal(page.epoch, "epoch-1");
       assert.equal(page.previousCursor, "cursor-1");
       assert.deepEqual(page.gap, {
         reason: "legacy_retained",
@@ -200,6 +202,7 @@ test("projects corrupt timeline coverage without claiming complete history", asy
   await withFetch(
     async () =>
       response({
+        epoch: "epoch-corrupt",
         items: [
           {
             schema: "acpx.session_history_gap.v1",
@@ -213,6 +216,7 @@ test("projects corrupt timeline coverage without claiming complete history", asy
       }),
     async () => {
       const page = await api.timeline("record-1");
+      assert.equal(page.epoch, "epoch-corrupt");
       assert.equal(page.coverage, "incomplete");
       assert.deepEqual(page.gap, {
         reason: "corrupt",

@@ -222,6 +222,8 @@ export type AcpxRespondPendingRequestInput = {
 };
 
 export type AcpxTranscriptPage = {
+  /** Authoritative durable-ledger generation; null means no ledger exists. */
+  epoch: string | null;
   items: SessionTimelineItem[];
   previousCursor?: string;
   hasMore: boolean;

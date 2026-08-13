@@ -73,6 +73,8 @@ export type SessionTimelineItem = SessionTimelineHistoryGap | SessionTimelineEve
 export type SessionTimelineCoverage = "complete" | "legacy_retained" | "incomplete";
 
 export type SessionTimelinePage = {
+  /** Authoritative durable-ledger generation; null means no ledger exists. */
+  epoch: string | null;
   items: SessionTimelineItem[];
   /** Pass this cursor to fetch the immediately preceding (older) window. */
   previousCursor?: string;
@@ -887,6 +889,7 @@ function pageWithoutTimeline(
   }
   const gap = legacyGap(record);
   return {
+    epoch: null,
     items: gap,
     hasMore: false,
     coverage: gap.length > 0 ? "legacy_retained" : "complete",
@@ -944,6 +947,7 @@ function pageFromEvents(params: {
   const selected = params.newestFirstEvents.slice(0, params.limit).toReversed();
   const first = selected[0];
   return {
+    epoch: params.metadata.epoch,
     items: timelinePageItems(
       params.record,
       params.metadata,
