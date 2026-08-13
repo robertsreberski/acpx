@@ -48,11 +48,13 @@ interface BufferedEvent {
 }
 
 function startupCleanupFailure(cleanupErrors: unknown[], startupError: unknown): Error {
-  if (cleanupErrors.length === 1 && cleanupErrors[0] instanceof Error) {
+  if (
+    cleanupErrors.length === 1 &&
+    cleanupErrors[0] instanceof Error &&
+    cleanupErrors[0].cause === undefined
+  ) {
     const [cleanupError] = cleanupErrors;
-    if (cleanupError.cause === undefined) {
-      cleanupError.cause = startupError;
-    }
+    cleanupError.cause = startupError;
     return cleanupError;
   }
   return new AggregateError(cleanupErrors, "ACPX Console startup cleanup failed", {
@@ -670,10 +672,7 @@ export async function startAcpxConsoleServer(
     try {
       await disposeServiceOnce();
     } catch (disposeError) {
-      if (disposeError instanceof Error && disposeError.cause === undefined) {
-        disposeError.cause = error;
-      }
-      throw disposeError;
+      throw startupCleanupFailure([disposeError], error);
     }
     throw error;
   };
@@ -858,11 +857,21 @@ export async function startAcpxConsoleServer(
       cleanupErrors.push(unsubscribeError);
     }
     for (const socket of sockets) {
-      socket.destroy();
+      try {
+        socket.destroy();
+      } catch (socketError) {
+        cleanupErrors.push(socketError);
+      }
     }
     sockets.clear();
     if (server.listening) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      try {
+        await new Promise<void>((resolve, reject) =>
+          server.close((closeError) => (closeError ? reject(closeError) : resolve())),
+        );
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      }
     }
     try {
       await disposeServiceOnce();
@@ -892,35 +901,63 @@ export async function startAcpxConsoleServer(
     origin,
     csrfToken,
     close() {
-      closeStarted ??= (async () => {
+      closeStarted ??= Promise.resolve().then(async () => {
         const cleanupErrors: unknown[] = [];
         try {
           unsubscribe?.();
         } catch (error) {
           cleanupErrors.push(error);
         }
-        try {
-          for (const client of clients) {
+        for (const client of clients) {
+          try {
             client.end();
+          } catch (error) {
+            cleanupErrors.push(error);
           }
-          clients.clear();
+        }
+        clients.clear();
+        let resolveClosed!: () => void;
+        let rejectClosed!: (error: unknown) => void;
+        const closed = new Promise<void>((resolve, reject) => {
+          resolveClosed = resolve;
+          rejectClosed = reject;
+        });
+        const onClose = (): void => resolveClosed();
+        const onError = (error: unknown): void => rejectClosed(error);
+        server.once("close", onClose);
+        server.once("error", onError);
+        let closeRequested = false;
+        try {
+          server.close();
+          closeRequested = true;
         } catch (error) {
           cleanupErrors.push(error);
         }
-        const closed = new Promise<void>((resolve, reject) => {
-          server.once("close", resolve);
-          server.once("error", reject);
-        });
         try {
-          server.close();
           server.closeAllConnections();
-          for (const socket of sockets) {
-            socket.destroy();
-          }
-          sockets.clear();
-          await closed;
         } catch (error) {
           cleanupErrors.push(error);
+        }
+        for (const socket of sockets) {
+          try {
+            socket.destroy();
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+        }
+        sockets.clear();
+        if (closeRequested) {
+          try {
+            await closed;
+          } catch (error) {
+            cleanupErrors.push(error);
+          } finally {
+            server.off("close", onClose);
+            server.off("error", onError);
+          }
+        } else {
+          server.off("close", onClose);
+          server.off("error", onError);
         }
         try {
           await disposeServiceOnce();
@@ -930,7 +967,7 @@ export async function startAcpxConsoleServer(
         if (cleanupErrors.length > 0) {
           throw cleanupFailure(cleanupErrors, "ACPX Console shutdown cleanup failed");
         }
-      })();
+      });
       return closeStarted;
     },
   };

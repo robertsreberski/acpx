@@ -403,6 +403,42 @@ test("a startup disposal failure retains the workspace validation error as its c
   assert.equal(disposed, 1);
 });
 
+test("a non-Error startup disposal failure retains the workspace validation error", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-dispose-undefined-"));
+  const missingRoot = join(root, "missing");
+  const service = new MockSessionService();
+  let disposed = 0;
+  service.dispose = () => {
+    disposed += 1;
+    throw undefined;
+  };
+
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [missingRoot],
+        stateDir: join(root, "state"),
+        staticDir: join(root, "web"),
+      },
+      service,
+      logger: { info() {}, warn() {}, error() {} },
+    }),
+    (error: unknown) =>
+      error instanceof AggregateError &&
+      error.message === "ACPX Console startup cleanup failed" &&
+      error.errors.length === 1 &&
+      error.errors[0] === undefined &&
+      error.cause instanceof Error &&
+      (error.cause as NodeJS.ErrnoException).code === "ENOENT" &&
+      error.cause.message.includes(missingRoot),
+  );
+  assert.equal(disposed, 1);
+});
+
 test("JSON request bodies are bounded before parsing", async () => {
   const { running } = await fixture();
   try {
@@ -1041,6 +1077,52 @@ test("a failed service subscription disposes the service before startup returns"
   assert.equal(disposed, 1);
 });
 
+test("subscription cleanup preserves a disposal error's existing cause and startup failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-subscribe-cleanup-"));
+  const web = join(root, "web");
+  await mkdir(web);
+  await writeFile(join(web, "index.html"), "ok");
+  const service = new MockSessionService();
+  const subscriptionError = new Error("subscription failed");
+  const existingCause = new Error("existing disposal cause");
+  const disposeError = new Error("dispose failed", { cause: existingCause });
+  let subscribed = 0;
+  let disposed = 0;
+  service.subscribe = () => {
+    subscribed += 1;
+    throw subscriptionError;
+  };
+  service.dispose = () => {
+    disposed += 1;
+    throw disposeError;
+  };
+
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [root],
+        stateDir: join(root, "state"),
+        staticDir: web,
+      },
+      service,
+      logger: { info() {}, warn() {}, error() {} },
+    }),
+    (error: unknown) =>
+      error instanceof AggregateError &&
+      error.message === "ACPX Console startup cleanup failed" &&
+      error.errors.length === 1 &&
+      error.errors[0] === disposeError &&
+      error.cause === subscriptionError &&
+      disposeError.cause === existingCause,
+  );
+  assert.equal(subscribed, 1);
+  assert.equal(disposed, 1);
+});
+
 test("session detail, provider inventory, timeline, pending, cancellation, response and close routes keep exact ids", async () => {
   const { running, service, workspace } = await fixture();
   try {
@@ -1315,6 +1397,7 @@ test("server close completes every cleanup step and preserves every failure", as
   await Promise.all([mkdir(web), mkdir(workspace)]);
   await writeFile(join(web, "index.html"), "ok");
   const service = new MockSessionService(workspace);
+  const closeConnectionsError = new Error("close all connections failed");
   const disposeError = new Error("dispose failed");
   let unsubscribed = 0;
   let disposed = 0;
@@ -1348,6 +1431,9 @@ test("server close completes every cleanup step and preserves every failure", as
   });
   socket.write(`GET /healthz HTTP/1.1\r\nHost: ${url.hostname}\r\n`);
   const socketClosed = new Promise<void>((resolve) => socket.once("close", resolve));
+  running.server.closeAllConnections = () => {
+    throw closeConnectionsError;
+  };
 
   const firstClose = running.close();
   assert.equal(running.close(), firstClose);
@@ -1359,7 +1445,10 @@ test("server close completes every cleanup step and preserves every failure", as
       return false;
     }
     return (
-      error.errors.length === 2 && error.errors[0] === undefined && error.errors[1] === disposeError
+      error.errors.length === 3 &&
+      error.errors[0] === undefined &&
+      error.errors[1] === closeConnectionsError &&
+      error.errors[2] === disposeError
     );
   });
   await Promise.race([
@@ -1372,4 +1461,46 @@ test("server close completes every cleanup step and preserves every failure", as
   assert.equal(disposed, 1);
   assert.equal(running.server.listening, false);
   assert.equal(socket.destroyed, true);
+});
+
+test("server close is memoized before a reentrant unsubscribe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-close-reentrant-"));
+  const web = join(root, "web");
+  const workspace = join(root, "workspace");
+  await Promise.all([mkdir(web), mkdir(workspace)]);
+  await writeFile(join(web, "index.html"), "ok");
+  const service = new MockSessionService(workspace);
+  let running!: Awaited<ReturnType<typeof startAcpxConsoleServer>>;
+  let reentrantClose: Promise<void> | undefined;
+  let unsubscribed = 0;
+  let disposed = 0;
+  service.subscribe = () => () => {
+    unsubscribed += 1;
+    reentrantClose = running.close();
+  };
+  service.dispose = () => {
+    disposed += 1;
+  };
+
+  running = await startAcpxConsoleServer({
+    config: {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [workspace],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  const firstClose = running.close();
+  await firstClose;
+  assert.equal(reentrantClose, firstClose);
+  assert.equal(running.close(), firstClose);
+  assert.equal(unsubscribed, 1);
+  assert.equal(disposed, 1);
+  assert.equal(running.server.listening, false);
 });
