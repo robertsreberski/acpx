@@ -146,6 +146,20 @@ const projectAcpEnvelope = (
   const method = asString(message.method) ?? "acp_event";
   const params = asRecord(message.params);
 
+  if (Object.hasOwn(message, "error")) {
+    const error = asRecord(message.error);
+    return {
+      ...base,
+      kind: "jsonrpc_error",
+      role: "assistant",
+      title: "ACP request failed",
+      text: asString(error.message) ?? "ACP request failed",
+      status: "failed",
+      input: Object.hasOwn(message, "id") ? { id: message.id } : undefined,
+      output: message.error,
+    };
+  }
+
   if (method === "session/prompt") {
     return {
       ...base,

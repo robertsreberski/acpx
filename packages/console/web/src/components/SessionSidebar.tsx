@@ -1,6 +1,7 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDismissibleLayer } from "../dismissible-layer";
 import { sessionGroup, useSessionStore } from "../session-store";
+import { absoluteSessionTime, relativeSessionTime } from "../session-time";
 import type { SessionSummary } from "../types";
 import { Icon } from "./Icon";
 
@@ -10,23 +11,6 @@ const GROUPS = [
   { id: "open", label: "Open" },
   { id: "history", label: "History" },
 ] as const;
-
-const relativeTime = (value: string): string => {
-  const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1_000);
-  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
-  if (Math.abs(seconds) < 60) {
-    return formatter.format(seconds, "second");
-  }
-  const minutes = Math.round(seconds / 60);
-  if (Math.abs(minutes) < 60) {
-    return formatter.format(minutes, "minute");
-  }
-  const hours = Math.round(minutes / 60);
-  if (Math.abs(hours) < 24) {
-    return formatter.format(hours, "hour");
-  }
-  return formatter.format(Math.round(hours / 24), "day");
-};
 
 const displayRepo = (session: SessionSummary): string =>
   session.repo ?? session.cwd.split("/").findLast(Boolean) ?? session.cwd;
@@ -57,6 +41,11 @@ export function SessionSidebar({
   const sidebarLayerRef = useRef<HTMLDivElement>(null);
   useDismissibleLayer(open, onClose, sidebarLayerRef);
   const [query, setQuery] = useState("");
+  const [relativeTimeNow, setRelativeTimeNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setRelativeTimeNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const groups = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     const filtered = bootstrap.sessions.filter(
@@ -77,6 +66,7 @@ export function SessionSidebar({
   return (
     <div ref={sidebarLayerRef} className="sidebar-layer">
       <aside
+        id="session-sidebar"
         className={`session-sidebar${open ? " is-open" : ""}`}
         role={open ? "dialog" : undefined}
         aria-modal={open ? "true" : undefined}
@@ -154,8 +144,12 @@ export function SessionSidebar({
                           </span>
                           <span className="session-row-meta">
                             <em>{stateLabel(session)}</em>
-                            <time dateTime={session.lastActivityAt}>
-                              {relativeTime(session.lastActivityAt)}
+                            <time
+                              dateTime={session.lastActivityAt}
+                              title={absoluteSessionTime(session.lastActivityAt)}
+                              aria-label={`Last activity: ${absoluteSessionTime(session.lastActivityAt)}`}
+                            >
+                              {relativeSessionTime(session.lastActivityAt, relativeTimeNow)}
                             </time>
                           </span>
                         </span>

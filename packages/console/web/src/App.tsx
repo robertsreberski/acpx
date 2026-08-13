@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Icon } from "./components/Icon";
+import { MobileSessionListButton } from "./components/MobileSessionListButton";
 import { SessionDialog } from "./components/SessionDialog";
 import { SessionFacts } from "./components/SessionFacts";
+import { SessionSelectionFallback } from "./components/SessionSelectionFallback";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { Transcript } from "./components/Transcript";
 import { AcpxRuntimeProvider } from "./runtime";
@@ -75,13 +77,13 @@ export default function App() {
             </button>
             {session ? (
               <>
-                <button
-                  type="button"
-                  className="mobile-back"
-                  onClick={() => store.selectSession(null)}
-                >
-                  <Icon name="back" /> Sessions
-                </button>
+                <MobileSessionListButton
+                  open={sidebarOpen}
+                  onOpen={() => {
+                    setFactsOpen(false);
+                    setSidebarOpen(true);
+                  }}
+                />
                 <div className="workspace-title">
                   <div>
                     <h1>{session.name}</h1>
@@ -119,6 +121,11 @@ export default function App() {
             <AcpxRuntimeProvider>
               <Transcript />
             </AcpxRuntimeProvider>
+          ) : store.selectedSessionId ? (
+            <SessionSelectionFallback
+              onRetry={() => void store.refresh()}
+              onOpenSessions={() => setSidebarOpen(true)}
+            />
           ) : (
             <Welcome onCreate={() => openDialog("create")} onAdopt={() => openDialog("adopt")} />
           )}
