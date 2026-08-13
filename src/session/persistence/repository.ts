@@ -68,9 +68,30 @@ async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return index.entries;
 }
 
-function isWithinWorkspaceRoots(cwd: string, workspaceRoots: readonly string[]): boolean {
-  const candidate = absolutePath(cwd);
-  return workspaceRoots.some((root) => isWithinBoundary(absolutePath(root), candidate));
+async function isWithinWorkspaceRoots(
+  cwd: string,
+  canonicalWorkspaceRoots: readonly string[],
+): Promise<boolean> {
+  let candidate: string;
+  try {
+    candidate = await fs.realpath(absolutePath(cwd));
+  } catch {
+    return false;
+  }
+  return canonicalWorkspaceRoots.some((root) => isWithinBoundary(root, candidate));
+}
+
+async function canonicalWorkspaceRoots(workspaceRoots: readonly string[]): Promise<string[]> {
+  const roots = await Promise.all(
+    workspaceRoots.map(async (root) => {
+      try {
+        return await fs.realpath(absolutePath(root));
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return roots.filter((root): root is string => root !== undefined);
 }
 
 /**
@@ -81,13 +102,19 @@ function isWithinWorkspaceRoots(cwd: string, workspaceRoots: readonly string[]):
 export async function listOpenSessionsForSubscription(
   workspaceRoots?: readonly string[],
 ): Promise<SessionRecord[]> {
-  const entries = (await loadSessionIndexEntries()).filter(
-    (entry) =>
-      !entry.closed &&
-      (!workspaceRoots ||
-        workspaceRoots.length === 0 ||
-        isWithinWorkspaceRoots(entry.cwd, workspaceRoots)),
-  );
+  const openEntries = (await loadSessionIndexEntries()).filter((entry) => !entry.closed);
+  const roots =
+    workspaceRoots && workspaceRoots.length > 0
+      ? await canonicalWorkspaceRoots(workspaceRoots)
+      : undefined;
+  const allowedWorkspaces = roots
+    ? await Promise.all(
+        openEntries.map(async (entry) => await isWithinWorkspaceRoots(entry.cwd, roots)),
+      )
+    : undefined;
+  const entries = !allowedWorkspaces
+    ? openEntries
+    : openEntries.filter((_, index) => allowedWorkspaces[index]);
   const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
   return records
     .filter((entry): entry is SessionRecord => Boolean(entry))

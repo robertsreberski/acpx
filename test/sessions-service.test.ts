@@ -11,7 +11,11 @@ import {
   writePendingRequest,
   type PendingRequest,
 } from "../src/session/pending-requests.js";
-import { resolveSessionRecord } from "../src/session/persistence.js";
+import {
+  listOpenSessionsForSubscription,
+  listSessions as listStoredSessions,
+  resolveSessionRecord,
+} from "../src/session/persistence.js";
 import { appendSessionTimelineLifecycleEvent } from "../src/session/timeline.js";
 import { sessionsServiceTestInternals } from "../src/sessions-service/service.js";
 import { AcpxTurnNotActiveError, createAcpxSessionService } from "../src/sessions.js";
@@ -962,6 +966,8 @@ test("subscription polling skips closed history and sessions outside its workspa
       fs.mkdir(workspace, { recursive: true }),
       fs.mkdir(outside, { recursive: true }),
     ]);
+    const escapedWorkspace = path.join(workspace, "escaped-workspace");
+    await fs.symlink(outside, escapedWorkspace, "dir");
     const active = makeSessionRecord({
       acpxRecordId: "session-subscription-active",
       acpSessionId: "provider-subscription-active",
@@ -974,6 +980,15 @@ test("subscription polling skips closed history and sessions outside its workspa
       agentCommand: AGENT_REGISTRY.codex,
       cwd: outside,
     });
+    const escapedRecord = makeSessionRecord(
+      {
+        acpxRecordId: "session-subscription-symlink-escape",
+        acpSessionId: "provider-subscription-symlink-escape",
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd: escapedWorkspace,
+      },
+      { resolveCwd: false },
+    );
     const closed = Array.from({ length: 64 }, (_, index) =>
       makeSessionRecord({
         acpxRecordId: `session-subscription-closed-${String(index).padStart(2, "0")}`,
@@ -986,9 +1001,16 @@ test("subscription polling skips closed history and sessions outside its workspa
       }),
     );
     await Promise.all(
-      [active, outsideRecord, ...closed].map(
+      [active, outsideRecord, escapedRecord, ...closed].map(
         async (record) => await writeSessionRecordFile(homeDir, record),
       ),
+    );
+    // Prime the inventory generation once; the fast subscription poll must use
+    // the index rather than re-materializing the retained history thereafter.
+    await listStoredSessions();
+    assert.deepEqual(
+      (await listOpenSessionsForSubscription([workspace])).map((record) => record.acpxRecordId),
+      [active.acpxRecordId],
     );
 
     const service = createAcpxSessionService({
@@ -1013,11 +1035,12 @@ test("subscription polling skips closed history and sessions outside its workspa
       await new Promise<void>((resolve) => setTimeout(resolve, 150));
       active.lastUsedAt = "2026-01-02T00:00:00.000Z";
       outsideRecord.lastUsedAt = "2026-01-02T00:00:00.000Z";
+      escapedRecord.lastUsedAt = "2026-01-02T00:00:00.000Z";
       for (const record of closed) {
         record.lastUsedAt = "2026-01-02T00:00:00.000Z";
       }
       await Promise.all(
-        [active, outsideRecord, ...closed].map(
+        [active, outsideRecord, escapedRecord, ...closed].map(
           async (record) => await writeSessionRecordFile(homeDir, record),
         ),
       );
