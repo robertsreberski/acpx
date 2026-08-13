@@ -60,6 +60,13 @@ function startupCleanupFailure(cleanupErrors: unknown[], startupError: unknown):
   });
 }
 
+function cleanupFailure(cleanupErrors: unknown[], message: string): Error {
+  if (cleanupErrors.length === 1 && cleanupErrors[0] instanceof Error) {
+    return cleanupErrors[0];
+  }
+  return new AggregateError(cleanupErrors, message);
+}
+
 export interface AcpxConsoleServerOptions {
   config: ResolvedConsoleConfig;
   service: AcpxConsoleSessionService;
@@ -886,23 +893,43 @@ export async function startAcpxConsoleServer(
     csrfToken,
     close() {
       closeStarted ??= (async () => {
-        unsubscribe?.();
-        for (const client of clients) {
-          client.end();
+        const cleanupErrors: unknown[] = [];
+        try {
+          unsubscribe?.();
+        } catch (error) {
+          cleanupErrors.push(error);
         }
-        clients.clear();
+        try {
+          for (const client of clients) {
+            client.end();
+          }
+          clients.clear();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
         const closed = new Promise<void>((resolve, reject) => {
           server.once("close", resolve);
           server.once("error", reject);
         });
-        server.close();
-        server.closeAllConnections();
-        for (const socket of sockets) {
-          socket.destroy();
+        try {
+          server.close();
+          server.closeAllConnections();
+          for (const socket of sockets) {
+            socket.destroy();
+          }
+          sockets.clear();
+          await closed;
+        } catch (error) {
+          cleanupErrors.push(error);
         }
-        sockets.clear();
-        await closed;
-        await disposeServiceOnce();
+        try {
+          await disposeServiceOnce();
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        if (cleanupErrors.length > 0) {
+          throw cleanupFailure(cleanupErrors, "ACPX Console shutdown cleanup failed");
+        }
       })();
       return closeStarted;
     },

@@ -1307,3 +1307,69 @@ test("server close destroys a lingering partial HTTP connection", async () => {
   ]);
   assert.equal(socket.destroyed, true);
 });
+
+test("server close completes every cleanup step and preserves every failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-close-failure-"));
+  const web = join(root, "web");
+  const workspace = join(root, "workspace");
+  await Promise.all([mkdir(web), mkdir(workspace)]);
+  await writeFile(join(web, "index.html"), "ok");
+  const service = new MockSessionService(workspace);
+  const disposeError = new Error("dispose failed");
+  let unsubscribed = 0;
+  let disposed = 0;
+  service.subscribe = () => () => {
+    unsubscribed += 1;
+    throw undefined;
+  };
+  service.dispose = async () => {
+    disposed += 1;
+    throw disposeError;
+  };
+
+  const running = await startAcpxConsoleServer({
+    config: {
+      host: "127.0.0.1",
+      port: 0,
+      trustNetwork: false,
+      allowedHosts: ["127.0.0.1"],
+      workspaceRoots: [workspace],
+      stateDir: join(root, "state"),
+      staticDir: web,
+    },
+    service,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const url = new URL(running.origin);
+  const socket = createConnection(Number(url.port), url.hostname);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(`GET /healthz HTTP/1.1\r\nHost: ${url.hostname}\r\n`);
+  const socketClosed = new Promise<void>((resolve) => socket.once("close", resolve));
+
+  const firstClose = running.close();
+  assert.equal(running.close(), firstClose);
+  await assert.rejects(firstClose, (error: unknown) => {
+    if (
+      !(error instanceof AggregateError) ||
+      error.message !== "ACPX Console shutdown cleanup failed"
+    ) {
+      return false;
+    }
+    return (
+      error.errors.length === 2 && error.errors[0] === undefined && error.errors[1] === disposeError
+    );
+  });
+  await Promise.race([
+    socketClosed,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("console cleanup left a partial socket open")), 1_000),
+    ),
+  ]);
+  assert.equal(unsubscribed, 1);
+  assert.equal(disposed, 1);
+  assert.equal(running.server.listening, false);
+  assert.equal(socket.destroyed, true);
+});
