@@ -173,7 +173,7 @@ button:disabled {
 }
 .network-warning {
   flex: 0 0 auto;
-  padding: 9px 20px;
+  padding: calc(9px + env(safe-area-inset-top)) 20px 9px;
   color: #fff5dd;
   background: #5c3c13;
   font-size: var(--text-id);
@@ -270,7 +270,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 20px 20px 14px;
+  padding: calc(20px + env(safe-area-inset-top)) 20px 14px;
 }
 .sidebar-header > div:nth-child(2) {
   min-width: 0;
@@ -597,6 +597,9 @@ button:disabled {
 }
 .workspace-header {
   display: flex;
+  /* Installed on iOS the page runs under the status bar and Dynamic Island, so
+     the first row has to clear the top inset or its controls sit beneath them. */
+  padding-top: env(safe-area-inset-top);
   min-height: 76px;
   align-items: center;
   gap: 12px;

@@ -311,3 +311,19 @@ test("an earlier page without a proven generation does not fake a reset", () => 
   assert.equal(prepended.continuityIssue, undefined);
   assert.equal(prepended.events.length, 4);
 });
+
+test("the first real ledger page keeps the cursor that reaches everything before it", () => {
+  // Nothing is loaded yet, so the incoming page holds the only usable cursor.
+  const merged = mergeRefreshedTimelinePage(
+    { epoch: null, events: [], coverage: "complete" },
+    {
+      epoch: "epoch-1",
+      events: events("epoch-1", 21, 100),
+      previousCursor: "before-21",
+      coverage: "complete",
+    },
+  );
+
+  assert.equal(merged.previousCursor, "before-21");
+  assert.equal(merged.continuityIssue, undefined);
+});

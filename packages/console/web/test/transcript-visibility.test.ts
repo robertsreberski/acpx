@@ -71,9 +71,9 @@ const envelope = (kind: string, sequence: number, requestId?: string): Transcrip
   ...(requestId === undefined ? {} : { requestId }),
 });
 
-test("a resume the agent refused is hidden once the fallback opened a session", () => {
+test("a resume the agent refused is hidden once the connection is seen working", () => {
   // The reconnect path: resume is refused because the agent expired its side,
-  // and session/new immediately succeeds.
+  // session/new is sent, and the session then produces real traffic.
   const filtered = conversationEvents([
     envelope("session/resume", 4, "1"),
     envelope("jsonrpc_error", 5, "1"),
@@ -83,6 +83,38 @@ test("a resume the agent refused is hidden once the fallback opened a session", 
   assert.deepEqual(
     filtered.map((event) => event.kind),
     ["message"],
+  );
+});
+
+test("a refused resume stays visible while the fallback has not answered", () => {
+  // The fallback request has been sent but nothing has come back. Absence of a
+  // second error is not evidence of success, and treating it as such would hide
+  // the only explanation the operator has.
+  const filtered = conversationEvents([
+    envelope("session/resume", 4, "1"),
+    envelope("jsonrpc_error", 5, "1"),
+    envelope("session/new", 6, "2"),
+  ]);
+  assert.deepEqual(
+    filtered.map((event) => event.sequence),
+    [5],
+  );
+});
+
+test("one reconnect's failure is not excused by another connection reusing its request id", () => {
+  // JSON-RPC ids restart at zero per connection, so id "1" recurs. The second
+  // reconnect failed and produced nothing after it.
+  const filtered = conversationEvents([
+    envelope("session/resume", 1, "1"),
+    envelope("jsonrpc_error", 2, "1"),
+    envelope("session/new", 3, "2"),
+    envelope("message", 4),
+    envelope("session/resume", 8, "1"),
+    envelope("jsonrpc_error", 9, "1"),
+  ]);
+  assert.deepEqual(
+    filtered.map((event) => event.sequence),
+    [4, 9],
   );
 });
 

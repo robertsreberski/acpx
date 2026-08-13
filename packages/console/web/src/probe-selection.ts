@@ -48,7 +48,7 @@ const FAILURE_REASONS: Readonly<Record<string, string>> = {
  * reporting a failure they cannot act on.
  */
 export const probeHint = (
-  probe: { readonly status: string; readonly code?: string } | undefined,
+  probe: { readonly status: string; readonly code?: string; readonly cleanup?: string } | undefined,
   loading: boolean,
 ): string | undefined => {
   if (loading) {
@@ -63,6 +63,12 @@ export const probeHint = (
   if (probe.status === "failed") {
     const reason = probe.code ? FAILURE_REASONS[probe.code] : undefined;
     return `Options could not be listed${reason ? ` — ${reason}` : ""}. Enter an exact ID.`;
+  }
+  // Discovery opens a provider session and gives it back. When the agent cannot
+  // take it back, say so: repeated probes would otherwise quietly accumulate
+  // sessions on the agent's side with nothing in the console admitting it.
+  if (probe.status === "ready" && probe.cleanup === "failed") {
+    return "Listed, but the temporary session used to read them could not be closed.";
   }
   return undefined;
 };

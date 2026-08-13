@@ -486,8 +486,11 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
           {mode === "create" ? (
             <div className="form-columns">
               <div className="form-field">
-                <span>Mode {!modeRequired && <em>optional</em>}</span>
+                <span id="session-dialog-create-mode">
+                  Mode {!modeRequired && <em>optional</em>}
+                </span>
                 <Combobox
+                  labelledBy="session-dialog-create-mode"
                   value={sessionMode}
                   onChange={setSessionMode}
                   options={modeOptions}
@@ -503,10 +506,11 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
                 </small>
               </div>
               <div className="form-field">
-                <span>
+                <span id="session-dialog-model">
                   Model <em>optional</em>
                 </span>
                 <Combobox
+                  labelledBy="session-dialog-model"
                   value={model}
                   onChange={setModel}
                   options={modelOptions}
@@ -518,8 +522,9 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
             </div>
           ) : (
             <div className="form-field">
-              <span>Mode {!modeRequired && <em>optional</em>}</span>
+              <span id="session-dialog-mode">Mode {!modeRequired && <em>optional</em>}</span>
               <Combobox
+                labelledBy="session-dialog-mode"
                 value={sessionMode}
                 onChange={setSessionMode}
                 options={modeOptions}

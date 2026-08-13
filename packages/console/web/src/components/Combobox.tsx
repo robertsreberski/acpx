@@ -24,6 +24,7 @@ export function Combobox({
   required = false,
   emptyHint,
   inputRef,
+  labelledBy,
 }: {
   readonly value: string;
   readonly onChange: (value: string) => void;
@@ -34,11 +35,22 @@ export function Combobox({
   readonly required?: boolean;
   readonly emptyHint?: ReactNode;
   readonly inputRef?: React.Ref<HTMLInputElement>;
+  /** Id of the visible label, which is a sibling rather than a wrapping element. */
+  readonly labelledBy?: string;
 }) {
   const listId = useId();
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
   const rootRef = useRef<HTMLDivElement>(null);
+  const inputElement = useRef<HTMLInputElement | null>(null);
+  const setInputElement = (node: HTMLInputElement | null) => {
+    inputElement.current = node;
+    if (typeof inputRef === "function") {
+      inputRef(node);
+    } else if (inputRef) {
+      inputRef.current = node;
+    }
+  };
 
   useEffect(() => {
     if (!open) {
@@ -47,6 +59,7 @@ export function Combobox({
     const onPointerDown = (event: MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) {
         setOpen(false);
+        setActive(-1);
       }
     };
     document.addEventListener("mousedown", onPointerDown);
@@ -90,13 +103,33 @@ export function Combobox({
   };
 
   return (
-    <div className="combobox" ref={rootRef}>
+    <div
+      className="combobox"
+      ref={rootRef}
+      // Escape is handled for the whole widget: pressed while an option has
+      // focus it would otherwise reach the dialog and close that instead.
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && open) {
+          event.preventDefault();
+          event.stopPropagation();
+          setOpen(false);
+          setActive(-1);
+          inputElement.current?.focus();
+        }
+      }}
+    >
       <input
-        ref={inputRef}
+        ref={setInputElement}
+        aria-labelledby={labelledBy}
         value={value}
         onChange={(event) => {
           onChange(event.target.value);
           setOpen(true);
+          // Typing invalidates the highlight. Without this, highlighting one
+          // option and then typing a different value commits the highlight on
+          // Enter — which in the Mode field silently replaces a typed
+          // `read-only` with a write-capable mode.
+          setActive(-1);
         }}
         onFocus={() => setOpen(true)}
         onKeyDown={onKeyDown}
@@ -120,6 +153,7 @@ export function Combobox({
               <button
                 type="button"
                 id={`${listId}-${index}`}
+                tabIndex={-1}
                 role="option"
                 aria-selected={option.value === value}
                 className={`combobox-option${index === active ? " is-active" : ""}`}

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ConsoleInputError } from "./config.js";
 
@@ -139,6 +140,7 @@ export const suggestWorkspaces = async (
   prefix: string,
   roots: readonly string[],
   stateDir: string,
+  home: string = homedir(),
 ): Promise<readonly WorkspaceSuggestion[]> => {
   // The leaf is taken from the raw text rather than a resolved path: resolve()
   // collapses a trailing "." or "..", which would make a half-typed hidden
@@ -149,6 +151,16 @@ export const suggestWorkspaces = async (
     lastSeparator <= 0 ? raw.slice(0, lastSeparator + 1) || sep : raw.slice(0, lastSeparator),
   );
   const leaf = raw.slice(lastSeparator + 1).toLocaleLowerCase();
+  /*
+   * Completion is a convenience for reaching a project, not a filesystem
+   * browser. Restricting it to the configured roots and the operator's home
+   * keeps `/etc` and friends from being enumerated before any authorization has
+   * happened. Anywhere else is still reachable — it just has to be typed in
+   * full and authorized, which is the same explicit step it always required.
+   */
+  if (!isInsideRoots(parent, [...roots, home])) {
+    return [];
+  }
   let entries: Dirent[];
   try {
     entries = await readdir(parent, { withFileTypes: true, encoding: "utf8" });

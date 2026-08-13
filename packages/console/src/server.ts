@@ -46,6 +46,8 @@ const TIMELINE_PAGE_LIMIT = 100;
 const MAX_TIMELINE_PAGE_LIMIT = 500;
 const MAX_PROVIDER_ENUMERATIONS = 8;
 const MAX_PROVIDER_ENUMERATIONS_PER_CLIENT = 2;
+/** Each probe spawns an agent process, so discovery is capped independently. */
+const MAX_CONCURRENT_SESSION_OPTION_PROBES = 2;
 
 interface BufferedEvent {
   id: number;
@@ -440,6 +442,7 @@ async function handleApi(
     csrfToken: string;
     mutationRateLimiter: MutationRateLimiter;
     providerEnumerationLimiter: InFlightRequestLimiter;
+    probes: { inFlight: number };
     connectSse(response: ServerResponse, lastEventId?: string): void;
   },
 ): Promise<boolean> {
@@ -495,6 +498,13 @@ async function handleApi(
     return true;
   }
   if (method === "POST" && path === "/api/v1/agents/session-options") {
+    if (context.probes.inFlight >= MAX_CONCURRENT_SESSION_OPTION_PROBES) {
+      throw new HttpError(
+        429,
+        "PROBE_CAPACITY",
+        "Too many agent capability probes are already running",
+      );
+    }
     // A POST because discovery opens a provider session: it has side effects
     // and must carry the CSRF check, and it must never be retried
     // automatically, since each attempt creates another session.
@@ -508,14 +518,19 @@ async function handleApi(
       sendJson(response, 200, { status: "unsupported", reason: "older_acpx" });
       return true;
     }
-    sendJson(
-      response,
-      200,
-      await context.service.probeSessionOptions({
-        agentId: requiredString(body, "agentId"),
-        cwd,
-      }),
-    );
+    context.probes.inFlight += 1;
+    try {
+      sendJson(
+        response,
+        200,
+        await context.service.probeSessionOptions({
+          agentId: requiredString(body, "agentId"),
+          cwd,
+        }),
+      );
+    } finally {
+      context.probes.inFlight -= 1;
+    }
     return true;
   }
   if (method === "GET" && path === "/api/v1/workspaces/suggestions") {
@@ -778,6 +793,7 @@ export async function startAcpxConsoleServer(
     options.providerEnumerationLimit?.global ?? MAX_PROVIDER_ENUMERATIONS,
     options.providerEnumerationLimit?.perClient ?? MAX_PROVIDER_ENUMERATIONS_PER_CLIENT,
   );
+  const probes = { inFlight: 0 };
   const events: BufferedEvent[] = [];
   const clients = new Set<ServerResponse>();
   const sockets = new Set<Socket>();
@@ -879,6 +895,7 @@ export async function startAcpxConsoleServer(
         csrfToken,
         mutationRateLimiter,
         providerEnumerationLimiter,
+        probes,
         connectSse,
       });
       if (!handled) {

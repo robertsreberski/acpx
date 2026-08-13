@@ -73,6 +73,19 @@ bounded passes while the same session stays selected; no prompt or other user
 action is required. The transcript still shows a visible legacy-history gap.
 The console never labels unavailable history as complete.
 
+## Installing it
+
+The console is an installable web app. Browsers only offer installation from a
+secure origin, so `http://127.0.0.1:4174` works on the machine itself while a
+plain `http://` LAN or Tailnet address does not. Serving the console over HTTPS
+— for example `tailscale serve` in front of the loopback port — makes the
+install available from a phone.
+
+The bundled service worker exists only to satisfy that installability
+requirement. It caches nothing: the console is a live view of a local service,
+and a cached shell could show a stale transcript or run an old bundle against a
+newer API.
+
 ## Session state
 
 The console does not compress different failure modes into a single status.

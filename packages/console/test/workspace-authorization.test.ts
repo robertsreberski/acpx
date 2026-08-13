@@ -58,13 +58,13 @@ test("a grant covers the authorized directory only, not its neighbours or parent
 });
 
 test("suggestions offer directories only, and hide dotfiles until they are asked for", async () => {
-  const { roots, outside, stateDir } = await fixture();
-  const plain = await suggestWorkspaces(`${outside}/`, [roots], stateDir);
+  const { base, roots, outside, stateDir } = await fixture();
+  const plain = await suggestWorkspaces(`${outside}/`, [roots], stateDir, base);
   assert.deepEqual(
     plain.map((entry) => entry.label),
     ["elsewhere"],
   );
-  const hidden = await suggestWorkspaces(`${outside}/.`, [roots], stateDir);
+  const hidden = await suggestWorkspaces(`${outside}/.`, [roots], stateDir, base);
   assert.deepEqual(
     hidden.map((entry) => entry.label),
     [".hidden"],
@@ -72,19 +72,19 @@ test("suggestions offer directories only, and hide dotfiles until they are asked
 });
 
 test("suggestions report whether picking one would need authorizing", async () => {
-  const { roots, outside, stateDir } = await fixture();
-  const inside = await suggestWorkspaces(`${roots}/`, [roots], stateDir);
+  const { base, roots, outside, stateDir } = await fixture();
+  const inside = await suggestWorkspaces(`${roots}/`, [roots], stateDir, base);
   assert.deepEqual(
     inside.map((entry) => entry.authorized),
     [true],
   );
-  const before = await suggestWorkspaces(`${outside}/`, [roots], stateDir);
+  const before = await suggestWorkspaces(`${outside}/`, [roots], stateDir, base);
   assert.deepEqual(
     before.map((entry) => entry.authorized),
     [false],
   );
   await writeWorkspaceGrant(stateDir, await realpathOf(join(outside, "elsewhere")));
-  const after = await suggestWorkspaces(`${outside}/`, [roots], stateDir);
+  const after = await suggestWorkspaces(`${outside}/`, [roots], stateDir, base);
   assert.deepEqual(
     after.map((entry) => entry.authorized),
     [true],
@@ -93,3 +93,13 @@ test("suggestions report whether picking one would need authorizing", async () =
 
 const realpathOf = async (path: string): Promise<string> =>
   await (await import("node:fs/promises")).realpath(path);
+
+test("completion does not enumerate outside the roots and the operator's home", () => {
+  return (async () => {
+    const { base, roots, stateDir } = await fixture();
+    // A path the operator could still type in full and authorize, but which
+    // completion will not browse: no pre-authorization directory listing.
+    assert.deepEqual(await suggestWorkspaces("/etc/", [roots], stateDir, base), []);
+    assert.deepEqual(await suggestWorkspaces("/", [roots], stateDir, base), []);
+  })();
+});

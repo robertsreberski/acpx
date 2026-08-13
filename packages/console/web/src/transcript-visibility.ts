@@ -49,39 +49,55 @@ const ESTABLISHMENT_KINDS: ReadonlySet<string> = new Set([
  * like any other, so the transcript opened with "ACP request failed" on almost
  * every start.
  *
- * An establishment error is treated as recovered only when a later
- * establishment attempt actually succeeded. If none did, the session never
- * opened and the error is the only explanation the operator has, so it stays.
+ * Recovery has to be *observed*, never inferred from the absence of a second
+ * error: a fallback whose response has not been paged in yet has no error
+ * either, and treating that as success would hide the very failure the operator
+ * needs. So an establishment error is hidden only when the connection is seen
+ * doing something afterwards that only a live session produces.
+ *
+ * JSON-RPC ids restart at zero on every connection, so an error is paired with
+ * the *nearest preceding* establishment request carrying that id rather than
+ * any request that ever used it. Without that, one reconnect's failure would be
+ * matched against another's request.
  */
 const recoveredEstablishmentErrors = (events: readonly TranscriptEvent[]): ReadonlySet<string> => {
-  const methodByRequest = new Map<string, string>();
-  for (const event of events) {
-    if (event.requestId && ESTABLISHMENT_KINDS.has(event.kind)) {
-      methodByRequest.set(event.requestId, event.kind);
-    }
-  }
-  const failedRequests = new Set(
-    events.flatMap((event) =>
-      event.kind === "jsonrpc_error" && event.requestId ? [event.requestId] : [],
-    ),
-  );
-  // The last attempt that opened a session, in timeline order.
-  const lastSuccessfulAttempt = events.reduce<number | undefined>(
-    (latest, event) =>
-      event.requestId && ESTABLISHMENT_KINDS.has(event.kind) && !failedRequests.has(event.requestId)
-        ? event.sequence
-        : latest,
-    undefined,
-  );
-  if (lastSuccessfulAttempt === undefined) {
-    return new Set();
-  }
+  const ordered = [...events].toSorted((left, right) => left.sequence - right.sequence);
+
+  /** The establishment request this error answered, if it answered one at all. */
+  const answersEstablishment = (error: TranscriptEvent): boolean =>
+    error.requestId !== undefined &&
+    ordered.some(
+      (candidate) =>
+        candidate.requestId === error.requestId &&
+        candidate.sequence < error.sequence &&
+        ESTABLISHMENT_KINDS.has(candidate.kind) &&
+        // Nearest preceding: nothing else reused this id in between.
+        !ordered.some(
+          (between) =>
+            between.requestId === error.requestId &&
+            between.sequence > candidate.sequence &&
+            between.sequence < error.sequence,
+        ),
+    );
+
+  /**
+   * Evidence the connection carried on: anything after the error that is
+   * neither another failure nor merely the next attempt being sent. A request
+   * on its own proves only that acpx tried again.
+   */
+  const connectionContinuedAfter = (sequence: number): boolean =>
+    ordered.some(
+      (event) =>
+        event.sequence > sequence &&
+        event.kind !== "jsonrpc_error" &&
+        !ESTABLISHMENT_KINDS.has(event.kind),
+    );
+
   return new Set(
-    events.flatMap((event) =>
+    ordered.flatMap((event) =>
       event.kind === "jsonrpc_error" &&
-      event.requestId !== undefined &&
-      methodByRequest.has(event.requestId) &&
-      event.sequence < lastSuccessfulAttempt
+      answersEstablishment(event) &&
+      connectionContinuedAfter(event.sequence)
         ? [event.id]
         : [],
     ),

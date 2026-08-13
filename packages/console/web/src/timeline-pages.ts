@@ -131,9 +131,16 @@ export const mergeRefreshedTimelinePage = (
     currentRange !== undefined &&
     latestRange !== undefined &&
     latestRange.first > currentRange.last + 1;
-  const previousCursor = latestStartsAfterCurrent
-    ? normalizedLatest.previousCursor
-    : normalizedCurrent.previousCursor;
+  /*
+   * With nothing loaded yet — a session whose ledger did not exist a moment ago,
+   * which is every session before its first turn — the incoming page holds the
+   * only cursor that can reach anything older. Keeping the current `undefined`
+   * would strand the events before this window until a full reload.
+   */
+  const previousCursor =
+    currentRange === undefined || latestStartsAfterCurrent
+      ? normalizedLatest.previousCursor
+      : normalizedCurrent.previousCursor;
   const events = coalesceTranscriptEvents([
     ...normalizedCurrent.events,
     ...normalizedLatest.events,
