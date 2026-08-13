@@ -83,6 +83,30 @@ export function isQueueAdmissionOutcomeUnknown(error: unknown): boolean {
   }
   return !DEFINITIVE_QUEUE_ADMISSION_FAILURES.has(error.detailCode ?? "");
 }
+
+/**
+ * An explicit owner error is a completed rejection, not an ambiguous transport
+ * result. Keep that provenance in the type instead of trying to infer it later
+ * from an open-ended set of owner-provided detail codes.
+ */
+class QueueOwnerRequestRejectedError extends QueueConnectionError {}
+
+/** Whether an acknowledged pending answer may still be applied by its owner. */
+export function isPendingRequestAnswerOutcomeUnknown(
+  error: unknown,
+  ownerAccepted: boolean,
+): boolean {
+  if (!ownerAccepted) {
+    return false;
+  }
+  if (error instanceof PendingRequestAnswerTimeoutError) {
+    return error.answerOutcome === "unknown";
+  }
+  return (
+    (error instanceof QueueConnectionError || error instanceof QueueProtocolError) &&
+    !(error instanceof QueueOwnerRequestRejectedError)
+  );
+}
 export {
   isProcessAlive,
   releaseQueueOwnerLease,
@@ -618,7 +642,7 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
     onMessage: (message, { state, resolve, reject }) => {
       if (message.type === "error") {
         reject(
-          new QueueConnectionError(message.message, {
+          new QueueOwnerRequestRejectedError(message.message, {
             outputCode: message.code,
             detailCode: message.detailCode,
             origin: message.origin ?? "queue",

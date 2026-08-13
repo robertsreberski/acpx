@@ -11,6 +11,7 @@ import { loadResolvedConfig, type ResolvedAcpxConfig } from "../cli/config.js";
 import { createOutputFormatter } from "../cli/output/output.js";
 import {
   isQueueAdmissionOutcomeUnknown,
+  isPendingRequestAnswerOutcomeUnknown,
   tryListRequestsOnRunningOwner,
   tryRespondOnRunningOwner,
 } from "../cli/queue/ipc.js";
@@ -921,13 +922,13 @@ class SessionService implements AcpxSessionService {
       acpxRecordId: input.acpxRecordId,
       requestId: input.requestId,
     };
+    let ownerAccepted = false;
     const receipt = await runIdempotentMutation({
       operation: "respond_pending_request",
       idempotencyKey: input.idempotencyKey,
       input,
       recoveryScope,
-      outcomeUnknown: (error) =>
-        error instanceof PendingRequestAnswerTimeoutError && error.answerOutcome === "unknown",
+      outcomeUnknown: (error) => isPendingRequestAnswerOutcomeUnknown(error, ownerAccepted),
       recover: async () => {
         const current = await readPendingRequest(input.acpxRecordId, input.requestId);
         if (current && current.state !== "pending") {
@@ -942,7 +943,6 @@ class SessionService implements AcpxSessionService {
       run: async (checkpoint) => {
         await this.requireExactRecord(input.acpxRecordId);
         await this.assertAnswerableByLiveOwner(input.acpxRecordId, input.requestId);
-        let ownerAccepted = false;
         let answered: PendingRequest | undefined;
         try {
           answered = await tryRespondOnRunningOwner({
@@ -958,11 +958,7 @@ class SessionService implements AcpxSessionService {
             },
           });
         } catch (error) {
-          if (
-            ownerAccepted &&
-            error instanceof PendingRequestAnswerTimeoutError &&
-            error.answerOutcome === "unknown"
-          ) {
+          if (isPendingRequestAnswerOutcomeUnknown(error, ownerAccepted)) {
             // Reserve the request scope only after the owner acknowledged the
             // answer and then left its outcome unknown. Pre-delivery failures
             // are safe to retry with a fresh key and must remain terminal.
