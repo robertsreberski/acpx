@@ -648,7 +648,7 @@ async function main() {
     assert.match(persistedText, /slept 1ms/u);
 
     const closed = await api.mutate(`${sessionPath}/close`, {}, 200);
-    assert.equal(closed.session.sessionState, "closed");
+    assert.equal(closed.close.session.sessionState, "closed");
     await waitFor("provider close marker", async () => {
       const marker = await fs.readFile(closeMarker, "utf8").catch(() => "");
       return marker.trim() !== "" ? marker : undefined;
