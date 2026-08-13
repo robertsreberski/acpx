@@ -27,6 +27,10 @@ Repo: https://github.com/openclaw/acpx
   including automatic bounded continuation for large histories, without
   requiring a prompt mutation.
 
+- Console/workspaces: keep retained sessions visible and controllable after an
+  allowlisted workspace leaf is deleted or renamed, without weakening canonical
+  workspace-root and symlink boundaries.
+
 - Runtime/embedding: settle turn results only after lifecycle persistence and client cleanup attempts finish, including unexpected finalization failures.
 
 ## 2026.7.27 (v0.13.0)

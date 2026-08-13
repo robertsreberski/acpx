@@ -1,4 +1,4 @@
-import { realpath, readFile } from "node:fs/promises";
+import { realpath, readFile, stat } from "node:fs/promises";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -216,19 +216,82 @@ export async function assertWorkspaceAllowed(cwd: string, roots: string[]): Prom
     }
     throw error;
   }
+  await assertCanonicalWorkspaceAllowed(candidate, candidate, roots);
+  return candidate;
+}
+
+async function assertCanonicalWorkspaceAllowed(
+  canonicalCandidate: string,
+  reportedCandidate: string,
+  roots: string[],
+): Promise<void> {
   const canonicalRoots = await Promise.all(
     roots.map(async (root) => await realpath(resolve(root))),
   );
   const allowed = canonicalRoots.some((root) => {
-    const pathFromRoot = relative(root, candidate);
+    const pathFromRoot = relative(root, canonicalCandidate);
     return (
       pathFromRoot === "" ||
       (!pathFromRoot.startsWith(`..${sep}`) && pathFromRoot !== ".." && !isAbsolute(pathFromRoot))
     );
   });
   if (!allowed) {
-    throw new ConsoleInputError(`Workspace is outside the configured roots: ${candidate}`);
+    throw new ConsoleInputError(`Workspace is outside the configured roots: ${reportedCandidate}`);
   }
+}
+
+async function nearestExistingDirectory(candidate: string): Promise<string> {
+  let current = candidate;
+  while (true) {
+    try {
+      const canonical = await realpath(current);
+      if (!(await stat(canonical)).isDirectory()) {
+        throw new ConsoleInputError(`Workspace is not accessible: ${candidate}`);
+      }
+      return canonical;
+    } catch (error) {
+      if (error instanceof ConsoleInputError) {
+        throw error;
+      }
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        throw error;
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        throw new ConsoleInputError(`Workspace is not accessible: ${candidate}`);
+      }
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Authorize the cwd stored on an existing session record.
+ *
+ * New sessions still use {@link assertWorkspaceAllowed} and therefore require
+ * an existing directory. A retained session must remain controllable after its
+ * workspace leaf is deleted or renamed, so a missing suffix is accepted only
+ * when its nearest existing directory resolves inside a configured root. This
+ * also resolves any surviving symlink prefix before the boundary check.
+ */
+export async function assertRetainedWorkspaceAllowed(
+  cwd: string,
+  roots: string[],
+): Promise<string> {
+  const candidate = resolve(cwd);
+  let canonicalCandidate: string;
+  try {
+    canonicalCandidate = await realpath(candidate);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      throw error;
+    }
+    canonicalCandidate = await nearestExistingDirectory(candidate);
+  }
+
+  await assertCanonicalWorkspaceAllowed(canonicalCandidate, candidate, roots);
   return candidate;
 }
 

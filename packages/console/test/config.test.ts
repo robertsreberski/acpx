@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { assertWorkspaceAllowed, consoleDisplayHost, resolveConsoleConfig } from "../src/config.js";
+import {
+  assertRetainedWorkspaceAllowed,
+  assertWorkspaceAllowed,
+  consoleDisplayHost,
+  resolveConsoleConfig,
+} from "../src/config.js";
 
 test("console defaults to a loopback bind and the current workspace", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-config-"));
@@ -94,6 +99,26 @@ test("workspace validation resolves symlinks before enforcing roots", async () =
   await writeFile(join(inside, "file"), "ok");
   assert.equal(await assertWorkspaceAllowed(inside, [root]), await realpath(inside));
   await assert.rejects(assertWorkspaceAllowed(outside, [root]), /outside the configured roots/);
+});
+
+test("retained workspace validation allows only missing suffixes under canonical roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-retained-root-"));
+  const project = join(root, "project");
+  const outside = await mkdtemp(join(tmpdir(), "acpx-console-retained-outside-"));
+  const escape = join(root, "escape");
+  await Promise.all([mkdir(project), symlink(outside, escape, "dir")]);
+  await rm(project, { recursive: true });
+
+  assert.equal(await assertRetainedWorkspaceAllowed(project, [root]), project);
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed(join(escape, "missing"), [root]),
+    /outside the configured roots/,
+  );
+  await assert.rejects(
+    assertRetainedWorkspaceAllowed(join(outside, "missing"), [root]),
+    /outside the configured roots/,
+  );
+  await assert.rejects(assertWorkspaceAllowed(project, [root]), /Workspace is not accessible/);
 });
 
 test("invalid persisted configuration fails with the config path instead of coercing values", async () => {

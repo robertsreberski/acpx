@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -47,7 +47,15 @@ async function fixture() {
     service,
     logger: { info() {}, warn() {}, error() {} },
   });
-  return { escape, outside, project: canonicalProject, projectAlias, running, service };
+  return {
+    escape,
+    outside,
+    project: canonicalProject,
+    projectAlias,
+    running,
+    service,
+    workspaceRoot,
+  };
 }
 
 async function auth(origin: string) {
@@ -161,6 +169,59 @@ test("configured roots scope session inventories and every retained-session oper
       assert.equal(response.status, 404, mutation.path);
     }
     assert.deepEqual(invoked, []);
+  } finally {
+    await running.close();
+  }
+});
+
+test("a retained session stays visible and controllable after its workspace leaf disappears", async () => {
+  const { project, running, service, workspaceRoot } = await fixture();
+  service.sessions.push({
+    ...baseSession,
+    acpxRecordId: "missing-symlink-record",
+    cwd: join(workspaceRoot, "escape", "missing"),
+  });
+
+  try {
+    const credentials = await auth(running.origin);
+    await rm(project, { recursive: true });
+
+    const inventory = await fetch(`${running.origin}/api/v1/sessions`);
+    assert.equal(inventory.status, 200);
+    assert.deepEqual(
+      ((await inventory.json()) as { sessions: Array<{ acpxRecordId: string }> }).sessions.map(
+        (session) => session.acpxRecordId,
+      ),
+      ["record-1"],
+    );
+
+    const detail = await fetch(`${running.origin}/api/v1/sessions/record-1`);
+    assert.equal(detail.status, 200);
+    assert.equal(
+      ((await detail.json()) as { session: ConsoleSession }).session.cwd,
+      service.sessions[0]?.cwd,
+    );
+
+    const cancel = await fetch(`${running.origin}/api/v1/sessions/record-1/turns/turn-1/cancel`, {
+      method: "POST",
+      headers: mutationHeaders(credentials, "missing-workspace-cancel"),
+      body: "{}",
+    });
+    assert.equal(cancel.status, 202);
+
+    const close = await fetch(`${running.origin}/api/v1/sessions/record-1/close`, {
+      method: "POST",
+      headers: mutationHeaders(credentials, "missing-workspace-close"),
+      body: "{}",
+    });
+    assert.equal(close.status, 200);
+    assert.deepEqual(
+      service.calls.map((call) => call.method),
+      ["cancelTurn", "closeSession"],
+    );
+
+    const escaped = await fetch(`${running.origin}/api/v1/sessions/missing-symlink-record`);
+    assert.equal(escaped.status, 404);
   } finally {
     await running.close();
   }

@@ -6,6 +6,7 @@ import type { Socket } from "node:net";
 import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import {
+  assertRetainedWorkspaceAllowed,
   assertWorkspaceAllowed,
   consoleDisplayHost,
   ConsoleInputError,
@@ -320,7 +321,7 @@ async function canonicalAllowedWorkspace(
     return undefined;
   }
   try {
-    return await assertWorkspaceAllowed(cwd, roots);
+    return await assertRetainedWorkspaceAllowed(cwd, roots);
   } catch {
     return undefined;
   }
