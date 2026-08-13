@@ -396,11 +396,7 @@ button:disabled {
   transform: rotate(-90deg);
 }
 .session-done ul {
-  display: grid;
-  gap: 8px;
   margin: 8px 0 0;
-  padding: 0;
-  list-style: none;
 }
 .session-groups {
   min-height: 0;
@@ -417,16 +413,25 @@ button:disabled {
   line-height: 1.2;
   text-transform: uppercase;
 }
-.session-group ul {
+/* minmax(0, 1fr) rather than the default `auto`: a long session name or harness
+   line would otherwise size the track past the sidebar and overflow it. */
+.session-group ul,
+.session-done ul {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
+.session-group li,
+.session-done li {
+  min-width: 0;
+}
 .session-row {
   display: flex;
   width: 100%;
+  min-width: 0;
   flex-direction: column;
   gap: 7px;
   border: 0;
@@ -1431,6 +1436,39 @@ fieldset.elicitation-field {
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--text-id);
+}
+.fact-row.is-copyable {
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+}
+.fact-row.is-copyable dd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.fact-row.is-copyable dd > span {
+  min-width: 0;
+  user-select: all;
+}
+.copy-button {
+  display: inline-flex;
+  min-height: var(--tap);
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 8px;
+  color: var(--accent-strong);
+  background: transparent;
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  font-weight: 650;
+}
+.copy-button:hover {
+  background: var(--chip);
 }
 .facts-disclosures {
   display: grid;

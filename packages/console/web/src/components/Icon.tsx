@@ -15,6 +15,13 @@ const paths = {
   send: <path d="m4 4 16 8-16 8 3-8-3-8Zm3 8h13" />,
   chevron: <path d="m9 18 6-6-6-6" />,
   back: <path d="m15 18-6-6 6-6" />,
+  copy: (
+    <>
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+    </>
+  ),
+  check: <path d="m5 13 4 4 10-10" />,
   archive: (
     <>
       <path d="M4 7h16v13H4zM3 4h18v3H3z" />

@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDismissibleLayer } from "../dismissible-layer";
 import { displayRepo, humanizeModeId } from "../session-presentation";
 import { useSessionStore } from "../session-store";
@@ -12,6 +12,44 @@ const Fact = ({ label, value }: { readonly label: string; readonly value?: strin
       <dd>{value}</dd>
     </div>
   );
+
+/**
+ * Identifiers exist to be pasted into a terminal, so they carry a copy control
+ * rather than asking the reader to select 36 characters of monospace by hand.
+ */
+function CopyableFact({ label, value }: { readonly label: string; readonly value?: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 1_600);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  if (value === undefined || value === "") {
+    return null;
+  }
+  const copy = () => {
+    // `writeText` rejects without a secure context or clipboard permission; the
+    // value stays selectable either way, so a failure just leaves the label be.
+    void navigator.clipboard
+      ?.writeText(value)
+      .then(() => setCopied(true))
+      .catch(() => setCopied(false));
+  };
+  return (
+    <div className="fact-row is-copyable">
+      <dt>{label}</dt>
+      <dd>
+        <span>{value}</span>
+        <button type="button" className="copy-button" onClick={copy} aria-label={`Copy ${label}`}>
+          <Icon name={copied ? "check" : "copy"} size={15} />
+          <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
+        </button>
+      </dd>
+    </div>
+  );
+}
 
 const modeStateLabel = {
   unmanaged: "no saved preference",
@@ -81,6 +119,11 @@ export function SessionFacts({
           <Fact label="Turn" value={turn} />
           <Fact label="Owner" value={`${session.ownerState} · session ${session.sessionState}`} />
         </dl>
+        <h2>Session id</h2>
+        <dl>
+          <CopyableFact label="ACPX record" value={session.id} />
+          <CopyableFact label="Provider session" value={session.providerSessionId} />
+        </dl>
         {session.modeRemediation && (
           <div
             className={`mode-warning${session.modeState === "conflict" ? " is-error" : ""}`}
@@ -98,19 +141,19 @@ export function SessionFacts({
           </div>
         )}
         <div className="facts-disclosures">
-          <details className="facts-disclosure">
-            <summary>
-              Identifiers
-              <Icon name="chevron" size={18} />
-            </summary>
-            <div>
-              <dl>
-                <Fact label="ACPX record" value={session.id} />
-                <Fact label="Provider session" value={session.providerSessionId} />
-                <Fact label="Active turn" value={session.activeTurnId} />
-              </dl>
-            </div>
-          </details>
+          {session.activeTurnId !== undefined && (
+            <details className="facts-disclosure">
+              <summary>
+                Active turn
+                <Icon name="chevron" size={18} />
+              </summary>
+              <div>
+                <dl>
+                  <CopyableFact label="Turn id" value={session.activeTurnId} />
+                </dl>
+              </div>
+            </details>
+          )}
           {session.permissionPolicy !== undefined && (
             <details className="facts-disclosure">
               <summary>

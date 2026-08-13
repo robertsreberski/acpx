@@ -13,6 +13,7 @@ import {
   timelineActivityToolName,
   timelineEventIsRunning,
 } from "./timeline-projector";
+import { conversationEvents } from "./transcript-visibility";
 import type { PendingInteraction, TranscriptEvent } from "./types";
 import { consumeUiAction } from "./ui-actions";
 
@@ -162,11 +163,13 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
   );
   const messages = useMemo<readonly TimelineMessage[]>(() => {
     const timeline = store.timeline?.events ?? [];
+    // Coverage is computed over the complete ledger, before transport events are
+    // hidden, so hiding one can never resurrect a duplicate pending card.
     const covered = new Set(
       timeline.flatMap((event) => (event.requestId ? [event.requestId] : [])),
     );
     const synthetic = syntheticPendingInteractionEvents(store.pending, covered);
-    const allEvents = [...timeline, ...synthetic].toSorted(
+    const allEvents = [...conversationEvents(timeline), ...synthetic].toSorted(
       (left, right) =>
         left.sequence - right.sequence || left.occurredAt.localeCompare(right.occurredAt),
     );
