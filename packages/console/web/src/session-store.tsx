@@ -132,41 +132,67 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
   const refreshSelection = useCallback(
     async (id: string, preserveLoadedHistory = true) => {
       const generation = ++selectionGeneration.current;
-      try {
-        const [detail, page, interactions] = await Promise.all([
-          api.session(id),
-          api.timeline(id),
-          api.pending(id),
-        ]);
-        if (generation !== selectionGeneration.current) {
-          return;
-        }
-        setSelectedSession(detail);
-        setQueuedPrompts((current) =>
-          mergeSessionQueuedProjection(
-            current,
-            id,
-            detail.ownerState,
-            detail.queuedTurns,
-            performance.now(),
-          ),
-        );
-        setTimeline((current) =>
-          preserveLoadedHistory
-            ? mergeRefreshedTimelinePage(current, page)
-            : normalizeTimelinePage(page),
-        );
-        setPending(interactions);
-      } catch (error) {
-        if (generation !== selectionGeneration.current) {
-          return;
-        }
-        if (error instanceof ApiError && error.status === 404) {
-          setSelectedSessionId(null);
-          window.history.replaceState(null, "", "/");
-        }
-        notice(errorMessage(error));
-      }
+      const isCurrent = () => generation === selectionGeneration.current;
+      const loadDetail = api
+        .session(id)
+        .then((detail) => {
+          if (!isCurrent()) {
+            return;
+          }
+          setSelectedSession(detail);
+          setQueuedPrompts((current) =>
+            mergeSessionQueuedProjection(
+              current,
+              id,
+              detail.ownerState,
+              detail.queuedTurns,
+              performance.now(),
+            ),
+          );
+        })
+        .catch((error: unknown) => {
+          if (!isCurrent()) {
+            return;
+          }
+          if (error instanceof ApiError && error.status === 404) {
+            selectionGeneration.current += 1;
+            setSelectedSessionId(null);
+            window.history.replaceState(null, "", "/");
+            return;
+          }
+          notice(`Session details could not be refreshed: ${errorMessage(error)}`);
+        });
+      const loadTimeline = api
+        .timeline(id)
+        .then((page) => {
+          if (!isCurrent()) {
+            return;
+          }
+          setTimeline((current) =>
+            preserveLoadedHistory
+              ? mergeRefreshedTimelinePage(current, page)
+              : normalizeTimelinePage(page),
+          );
+        })
+        .catch((error: unknown) => {
+          if (isCurrent()) {
+            notice(`Transcript could not be refreshed: ${errorMessage(error)}`);
+          }
+        });
+      const loadPending = api
+        .pending(id)
+        .then((interactions) => {
+          if (isCurrent()) {
+            setPending(interactions);
+          }
+        })
+        .catch((error: unknown) => {
+          if (isCurrent()) {
+            notice(`Pending requests could not be refreshed: ${errorMessage(error)}`);
+          }
+        });
+
+      await Promise.all([loadDetail, loadTimeline, loadPending]);
     },
     [notice],
   );
