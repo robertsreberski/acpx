@@ -639,19 +639,40 @@ export async function startAcpxConsoleServer(
   options: AcpxConsoleServerOptions,
 ): Promise<RunningAcpxConsoleServer> {
   const logger = options.logger ?? console;
-  const workspaceRoots = await Promise.all(
-    options.config.workspaceRoots.map(async (root) => await realpath(root)),
-  );
-  Object.freeze(workspaceRoots);
-  const allowedHosts = [...options.config.allowedHosts];
-  Object.freeze(allowedHosts);
-  const config: ResolvedConsoleConfig = {
-    ...options.config,
-    workspaceRoots,
-    allowedHosts,
+  let disposal: Promise<void> | undefined;
+  const disposeServiceOnce = (): Promise<void> => {
+    disposal ??= (async () => {
+      await options.service.dispose?.();
+    })();
+    return disposal;
   };
-  Object.freeze(config);
-  const selectedDisplayHost = consoleDisplayHost(config);
+  const disposeAfterStartupFailure = async (error: unknown): Promise<never> => {
+    try {
+      await disposeServiceOnce();
+    } catch (disposeError) {
+      logger.error(disposeError);
+    }
+    throw error;
+  };
+  let config: ResolvedConsoleConfig;
+  let selectedDisplayHost: string;
+  try {
+    const workspaceRoots = await Promise.all(
+      options.config.workspaceRoots.map(async (root) => await realpath(root)),
+    );
+    Object.freeze(workspaceRoots);
+    const allowedHosts = [...options.config.allowedHosts];
+    Object.freeze(allowedHosts);
+    config = {
+      ...options.config,
+      workspaceRoots,
+      allowedHosts,
+    };
+    Object.freeze(config);
+    selectedDisplayHost = consoleDisplayHost(config);
+  } catch (error) {
+    return await disposeAfterStartupFailure(error);
+  }
   const csrfToken = randomBytes(32).toString("base64url");
   const mutationRateLimiter = new MutationRateLimiter(
     options.mutationRateLimit?.maxRequests,
@@ -714,8 +735,7 @@ export async function startAcpxConsoleServer(
   try {
     unsubscribe = options.service.subscribe?.(publish);
   } catch (error) {
-    await options.service.dispose?.();
-    throw error;
+    return await disposeAfterStartupFailure(error);
   }
   const connectSse = (response: ServerResponse, lastEventId?: string): void => {
     if (clients.size >= MAX_SSE_CLIENTS) {
@@ -816,8 +836,7 @@ export async function startAcpxConsoleServer(
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    await options.service.dispose?.();
-    throw error;
+    return await disposeAfterStartupFailure(error);
   }
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : config.port;
@@ -854,7 +873,7 @@ export async function startAcpxConsoleServer(
         }
         sockets.clear();
         await closed;
-        await options.service.dispose?.();
+        await disposeServiceOnce();
       })();
       return closeStarted;
     },

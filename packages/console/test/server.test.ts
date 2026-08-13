@@ -305,9 +305,13 @@ test("an invalid direct wildcard display host fails before subscription", async 
   const root = await mkdtemp(join(tmpdir(), "acpx-console-invalid-display-"));
   const service = new MockSessionService();
   let subscribed = false;
+  let disposed = 0;
   service.subscribe = () => {
     subscribed = true;
     return () => undefined;
+  };
+  service.dispose = () => {
+    disposed += 1;
   };
   await assert.rejects(
     startAcpxConsoleServer({
@@ -325,6 +329,44 @@ test("an invalid direct wildcard display host fails before subscription", async 
     /non-wildcard allowed host/,
   );
   assert.equal(subscribed, false);
+  assert.equal(disposed, 1);
+});
+
+test("a missing startup workspace root disposes the service exactly once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "acpx-console-missing-root-"));
+  const missingRoot = join(root, "missing");
+  const service = new MockSessionService();
+  let subscribed = 0;
+  let disposed = 0;
+  service.subscribe = () => {
+    subscribed += 1;
+    return () => undefined;
+  };
+  service.dispose = () => {
+    disposed += 1;
+  };
+
+  await assert.rejects(
+    startAcpxConsoleServer({
+      config: {
+        host: "127.0.0.1",
+        port: 0,
+        trustNetwork: false,
+        allowedHosts: ["127.0.0.1"],
+        workspaceRoots: [missingRoot],
+        stateDir: join(root, "state"),
+        staticDir: join(root, "web"),
+      },
+      service,
+      logger: { info() {}, warn() {}, error() {} },
+    }),
+    (error: unknown) =>
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT" &&
+      error.message.includes(missingRoot),
+  );
+  assert.equal(subscribed, 0);
+  assert.equal(disposed, 1);
 });
 
 test("JSON request bodies are bounded before parsing", async () => {
