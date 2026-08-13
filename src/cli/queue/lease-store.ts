@@ -30,12 +30,17 @@ const QUEUE_OWNER_STALE_HEARTBEAT_MS = 15_000;
  * 2: permission policies carry `defer` rules and permission_escalation events
  *    carry action "defer". A v1 owner drops unknown rule lists, so a request
  *    the user asked to park is instead settled by the permission mode.
+ * 3: prompt session options carry `effort`, and clients may send the
+ *    `apply_session_preferences` control request. A v2 owner silently drops
+ *    effort from prompt options and cannot apply the combined control.
  */
-export const QUEUE_PROTOCOL_VERSION = 2;
+export const QUEUE_PROTOCOL_VERSION = 3;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
+/** First protocol version that understands effort-bearing requests. */
+export const QUEUE_PROTOCOL_EFFORT_VERSION = 3;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided

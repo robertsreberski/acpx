@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { trySubmitToRunningOwner } from "../src/cli/queue/ipc.js";
 import {
+  tryApplySessionPreferencesOnRunningOwner,
+  trySubmitToRunningOwner,
+} from "../src/cli/queue/ipc.js";
+import {
+  QUEUE_PROTOCOL_EFFORT_VERSION,
   QUEUE_PROTOCOL_RULE_KEY_COUNT,
   QUEUE_PROTOCOL_VERSION,
   queueOwnerProtocolVersion,
@@ -35,6 +39,7 @@ async function submitWithPolicy(params: {
   permissionPolicy?: PermissionPolicy;
   defer?: boolean;
   deferMaxAgeMs?: number;
+  effort?: string;
 }): Promise<unknown> {
   return await trySubmitToRunningOwner({
     sessionId: params.sessionId,
@@ -43,6 +48,7 @@ async function submitWithPolicy(params: {
     ...(params.permissionPolicy ? { permissionPolicy: params.permissionPolicy } : {}),
     ...(params.defer ? { defer: true } : {}),
     ...(params.deferMaxAgeMs === undefined ? {} : { deferMaxAgeMs: params.deferMaxAgeMs }),
+    ...(params.effort ? { sessionOptions: { effort: params.effort } } : {}),
     outputFormatter: noopFormatter(),
     waitForCompletion: true,
   });
@@ -197,6 +203,56 @@ test("a current queue owner accepts defer policies", async () => {
           sessionId: "owner-current-defer",
           permissionPolicy: DEFER_POLICY,
         });
+      },
+    );
+  });
+});
+
+test("a pre-effort queue owner refuses effort-bearing prompts", async () => {
+  await withTempHome(async (homeDir) => {
+    await withFakeOwner(
+      homeDir,
+      "owner-pre-effort-prompt",
+      { queueProtocol: QUEUE_PROTOCOL_EFFORT_VERSION - 1, acpxVersion: "0.13.0" },
+      async () => {
+        await assert.rejects(
+          async () =>
+            await submitWithPolicy({
+              sessionId: "owner-pre-effort-prompt",
+              effort: "high",
+            }),
+          (error: unknown) => {
+            const queueError = error as QueueConnectionError;
+            assert.equal(queueError.detailCode, "QUEUE_OWNER_PROTOCOL_MISMATCH");
+            assert.equal(queueError.retryable, false);
+            assert.match(queueError.message, /would ignore the requested effort/);
+            return true;
+          },
+        );
+
+        await assertReachesTransport({ sessionId: "owner-pre-effort-prompt" });
+      },
+    );
+  });
+});
+
+test("a pre-effort queue owner refuses combined preference controls", async () => {
+  await withTempHome(async (homeDir) => {
+    await withFakeOwner(
+      homeDir,
+      "owner-pre-effort-control",
+      { queueProtocol: QUEUE_PROTOCOL_EFFORT_VERSION - 1 },
+      async () => {
+        await assert.rejects(
+          async () =>
+            await tryApplySessionPreferencesOnRunningOwner({
+              sessionId: "owner-pre-effort-control",
+              modelId: "smart-model",
+              effort: "high",
+            }),
+          (error: unknown) =>
+            (error as QueueConnectionError).detailCode === "QUEUE_OWNER_PROTOCOL_MISMATCH",
+        );
       },
     );
   });

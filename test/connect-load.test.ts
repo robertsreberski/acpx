@@ -62,6 +62,7 @@ type FakeClient = {
   setSessionModel: (
     sessionId: string,
     modelId: string,
+    controlOverride?: SessionModelState,
   ) => Promise<void | SetSessionConfigOptionResponse>;
   setSessionConfigOption?: (
     sessionId: string,
@@ -219,6 +220,114 @@ test("connectAndLoadSession resumes an existing load-capable session", async () 
   });
 });
 
+test("connectAndLoadSession re-applies saved effort before publishing a rebound client", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const events: string[] = [];
+    const record = makeSessionRecord({
+      acpxRecordId: "rebound-effort-record",
+      acpSessionId: "rebound-effort-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        session_options: { effort: "high" },
+        desired_config_options: { reasoning_effort: "high" },
+        config_options: effortConfigOptions("high"),
+      },
+    });
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {
+        events.push("start");
+      },
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => {
+        events.push("load");
+        return {
+          configOptions: effortConfigOptions("medium"),
+          configOptionsPresent: true,
+          legacyModelMetadataPresent: false,
+        };
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async (sessionId, configId, value) => {
+        events.push(`set:${configId}:${value}`);
+        assert.equal(sessionId, "rebound-effort-session");
+        return { configOptions: effortConfigOptions(value) };
+      },
+    };
+
+    await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+      onClientAvailable: () => {
+        events.push("available");
+      },
+    });
+
+    assert.deepEqual(events, ["start", "load", "set:reasoning_effort:high", "available"]);
+    assert.equal(record.acpx?.session_options?.effort, "high");
+    assert.equal(record.acpx?.config_options?.[0]?.currentValue, "high");
+  });
+});
+
+test("connectAndLoadSession forces saved effort replay when rebound metadata is sparse", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const configCalls: Array<{ configId: string; value: string }> = [];
+    const record = makeSessionRecord({
+      acpxRecordId: "sparse-effort-record",
+      acpSessionId: "sparse-effort-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        session_options: { effort: "high" },
+        desired_config_options: { reasoning_effort: "high" },
+        config_options: effortConfigOptions("high"),
+      },
+    });
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => ({
+        configOptionsPresent: false,
+        legacyModelMetadataPresent: false,
+      }),
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+      setSessionConfigOption: async (_sessionId, configId, value) => {
+        configCalls.push({ configId, value });
+        return { configOptions: effortConfigOptions(value) };
+      },
+    };
+
+    await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(configCalls, [{ configId: "reasoning_effort", value: "high" }]);
+    assert.equal(record.acpx?.session_options?.effort, "high");
+    assert.equal(record.acpx?.config_options?.[0]?.currentValue, "high");
+  });
+});
+
 test("connectAndLoadSession retains legacy model state when load omits model metadata", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -342,6 +451,88 @@ test("connectAndLoadSession lets explicit legacy metadata replace stale model co
       record.acpx?.config_options?.map((option) => option.id),
       ["reasoning_effort"],
     );
+  });
+});
+
+test("connectAndLoadSession uses rebound legacy metadata when replaying a saved model", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "legacy-model-replay-record",
+      acpSessionId: "legacy-model-replay-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: {
+        session_options: { model: "smart-model" },
+        current_model_id: "stale-config-model",
+        available_models: ["stale-config-model", "smart-model"],
+        model_control: "config_option",
+        config_options: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: "stale-config-model",
+            options: [
+              { value: "stale-config-model", name: "Stale" },
+              { value: "smart-model", name: "Smart" },
+            ],
+          },
+        ],
+      },
+    });
+    const modelCalls: Array<{ sessionId: string; modelId: string; models?: SessionModelState }> =
+      [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => false,
+      loadSessionWithOptions: async () => ({
+        models: {
+          currentModelId: "legacy-default",
+          availableModels: [
+            { modelId: "legacy-default", name: "Legacy Default" },
+            { modelId: "smart-model", name: "Smart" },
+          ],
+        },
+        configOptionsPresent: false,
+        legacyModelMetadataPresent: true,
+      }),
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async (sessionId, modelId, models) => {
+        modelCalls.push({ sessionId, modelId, models });
+      },
+    };
+
+    await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.deepEqual(modelCalls, [
+      {
+        sessionId: "legacy-model-replay-session",
+        modelId: "smart-model",
+        models: {
+          currentModelId: "legacy-default",
+          availableModels: [
+            { modelId: "legacy-default", name: "Legacy Default" },
+            { modelId: "smart-model", name: "Smart" },
+          ],
+        },
+      },
+    ]);
+    assert.equal(record.acpx?.model_control, "legacy_set_model");
+    assert.equal(record.acpx?.current_model_id, "smart-model");
+    assert.deepEqual(record.acpx?.available_models, ["legacy-default", "smart-model"]);
   });
 });
 
@@ -1541,4 +1732,22 @@ function makeSessionRecord(
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
   await withTempHomeFixture("acpx-connect-load-home-", run);
+}
+
+function effortConfigOptions(
+  currentValue: string,
+): SetSessionConfigOptionResponse["configOptions"] {
+  return [
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
 }

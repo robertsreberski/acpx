@@ -1667,10 +1667,29 @@ test("integration: sparse reconnect metadata does not erase saved effort", async
         .acpxRecordId;
 
       const prompted = await runCli(
-        ["--agent", agentCommand, "--approve-all", "--cwd", cwd, "prompt", "echo sparse"],
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "prompt",
+          "echo sparse",
+        ],
         homeDir,
       );
       assert.equal(prompted.code, 0, prompted.stderr);
+      const payloads = parseJsonRpcOutputLines(prompted.stdout);
+      const effortIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown } | undefined)?.configId === "reasoning_effort",
+      );
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(effortIndex >= 0, "expected saved effort to be forced onto sparse reconnect");
+      assert(promptIndex > effortIndex, "saved effort must be applied before the prompt");
 
       const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
       assert.deepEqual(acpxState.session_options, { effort: "high" });
@@ -2337,6 +2356,80 @@ test("integration: legacy model changes clear effort saved for the previous mode
         homeDir,
       );
       assert.equal(setModel.code, 0, setModel.stderr);
+
+      const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
+      assert.deepEqual(acpxState.session_options, { model: "alternate-model" });
+      assert.equal(
+        (acpxState.desired_config_options as Record<string, unknown> | undefined)?.reasoning_effort,
+        undefined,
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: prompt-time legacy model changes do not resurrect cleared effort", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-legacy-models --advertise-config-options --omit-model-config-option`;
+
+    try {
+      const created = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--effort",
+          "high",
+          "sessions",
+          "new",
+        ],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+      const sessionId = (JSON.parse(created.stdout.trim()) as { acpxRecordId: string })
+        .acpxRecordId;
+
+      const prompted = await runCli(
+        [
+          "--agent",
+          agentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "alternate-model",
+          "prompt",
+          "echo legacy switch",
+        ],
+        homeDir,
+      );
+      assert.equal(prompted.code, 0, prompted.stderr);
+
+      const payloads = parseJsonRpcOutputLines(prompted.stdout);
+      const modelIndex = payloads.findIndex((payload) => payload.method === "session/set_model");
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(modelIndex >= 0, "expected legacy session/set_model");
+      assert(promptIndex > modelIndex, "model must be applied before the prompt");
+      assert.equal(
+        payloads
+          .slice(modelIndex + 1, promptIndex)
+          .some(
+            (payload) =>
+              payload.method === "session/set_config_option" &&
+              (payload.params as { configId?: unknown } | undefined)?.configId ===
+                "reasoning_effort",
+          ),
+        false,
+        "cleared effort must not be re-applied after a legacy model change",
+      );
 
       const acpxState = await readStoredSessionAcpxState(homeDir, sessionId);
       assert.deepEqual(acpxState.session_options, { model: "alternate-model" });

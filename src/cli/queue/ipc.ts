@@ -28,6 +28,7 @@ import { connectToQueueOwner, type QueueRequestBudget } from "./ipc-transport.js
 import {
   ensureOwnerIsUsable,
   QUEUE_PROTOCOL_DEFER_VERSION,
+  QUEUE_PROTOCOL_EFFORT_VERSION,
   readLiveQueueOwner,
   type QueueOwnerRecord,
   queueOwnerProtocolVersion,
@@ -862,6 +863,37 @@ function assertQueueOwnerUnderstandsPolicy(
   );
 }
 
+function assertQueueOwnerUnderstandsEffort(owner: QueueOwnerRecord): void {
+  const ownerProtocol = queueOwnerProtocolVersion(owner);
+  if (ownerProtocol >= QUEUE_PROTOCOL_EFFORT_VERSION) {
+    return;
+  }
+
+  const ownerBuild = owner.acpxVersion ? ` (owner acpx ${owner.acpxVersion})` : "";
+  throw new QueueConnectionError(
+    `Session queue owner speaks queue protocol v${ownerProtocol}${ownerBuild} and would ignore ` +
+      "the requested effort; close the session so a new owner can start",
+    {
+      detailCode: "QUEUE_OWNER_PROTOCOL_MISMATCH",
+      origin: "queue",
+      retryable: false,
+    },
+  );
+}
+
+function assertQueueOwnerUnderstandsSubmit(
+  owner: QueueOwnerRecord,
+  options: SubmitToQueueOwnerOptions,
+): void {
+  assertQueueOwnerUnderstandsPolicy(owner, options);
+  if (options.sessionOptions?.effort) {
+    assertQueueOwnerUnderstandsEffort(owner);
+  }
+  assertQueueOwnerSupportsParking(owner, options);
+  assertQueueOwnerParkingMaxAgeMatches(owner, options);
+  assertQueueOwnerMcpConfigMatches(owner, options);
+}
+
 /**
  * --defer is owner-level: it is fixed when the owner process starts, so a warm
  * owner started without it cannot park anything. Submitting anyway produced a
@@ -944,10 +976,7 @@ export async function trySubmitToRunningOwner(
   if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
     return undefined;
   }
-  assertQueueOwnerUnderstandsPolicy(owner, options);
-  assertQueueOwnerSupportsParking(owner, options);
-  assertQueueOwnerParkingMaxAgeMatches(owner, options);
-  assertQueueOwnerMcpConfigMatches(owner, options);
+  assertQueueOwnerUnderstandsSubmit(owner, options);
 
   let submitted: SessionSendOutcome | undefined;
   try {
@@ -1340,6 +1369,10 @@ export async function tryApplySessionPreferencesOnRunningOwner(options: {
   if (!owner) {
     return undefined;
   }
+  if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
+    return undefined;
+  }
+  assertQueueOwnerUnderstandsEffort(owner);
 
   const response = await submitApplySessionPreferencesToQueueOwner(
     owner,

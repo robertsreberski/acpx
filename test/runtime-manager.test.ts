@@ -67,7 +67,13 @@ type FakeClient = {
     sessionId: string,
     cwd: string,
     options: { suppressReplayUpdates: boolean },
-  ) => Promise<{ agentSessionId?: string }>;
+  ) => Promise<{
+    agentSessionId?: string;
+    configOptions?: SetSessionConfigOptionResponse["configOptions"];
+    models?: SessionModelState;
+    configOptionsPresent?: boolean;
+    legacyModelMetadataPresent?: boolean;
+  }>;
   getAgentLifecycleSnapshot: () => {
     pid?: number;
     startedAt?: string;
@@ -3274,6 +3280,94 @@ test("AcpRuntimeManager persists sessionOptions with model-aware effort", async 
     env: undefined,
   });
   assert.deepEqual(record.acpx?.desired_config_options, { reasoning_effort: "high" });
+});
+
+test("AcpRuntimeManager re-applies persisted effort before prompting a rebound session", async () => {
+  const configOptions = (effort: string): SetSessionConfigOptionResponse["configOptions"] => [
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select",
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
+  const record = makeSessionRecord({
+    acpxRecordId: "runtime-rebound-effort",
+    acpSessionId: "runtime-rebound-effort-session",
+    agentCommand: "codex --acp",
+    cwd: "/workspace",
+    acpx: {
+      session_options: { effort: "high" },
+      desired_config_options: { reasoning_effort: "high" },
+      config_options: configOptions("high"),
+    },
+  });
+  const store = new InMemorySessionStore([record]);
+  const calls: string[] = [];
+  let activeEffort = "medium";
+  const manager = new AcpRuntimeManager(
+    createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
+    {
+      clientFactory: () =>
+        ({
+          initializeResult: { protocolVersion: 1, agentCapabilities: { loadSession: true } },
+          start: async () => {
+            calls.push("start");
+          },
+          close: async () => {},
+          createSession: async () => ({ sessionId: "unused" }),
+          loadSession: async () => ({ agentSessionId: "unused" }),
+          hasReusableSession: () => false,
+          supportsLoadSession: () => true,
+          supportsResumeSession: () => false,
+          loadSessionWithOptions: async () => {
+            calls.push("load");
+            return {
+              agentSessionId: "runtime-agent-session",
+              configOptions: configOptions("medium"),
+              configOptionsPresent: true,
+              legacyModelMetadataPresent: false,
+            };
+          },
+          getAgentLifecycleSnapshot: () => ({ running: true }),
+          prompt: async () => {
+            calls.push(`prompt:${activeEffort}`);
+            return { stopReason: "end_turn" };
+          },
+          requestCancelActivePrompt: async () => false,
+          hasActivePrompt: () => false,
+          setSessionMode: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string, value: string) => {
+            calls.push(`set:${configId}:${value}`);
+            activeEffort = value;
+            return { configOptions: configOptions(value) };
+          },
+          clearEventHandlers: () => {},
+          setEventHandlers: () => {},
+        }) as never,
+    },
+  );
+
+  const { result } = await collectTurn(
+    manager.startTurn({
+      handle: createHandle(record.acpxRecordId),
+      text: "check effort",
+      mode: "prompt",
+      sessionMode: "persistent",
+      requestId: "runtime-rebound-effort-request",
+    }),
+  );
+
+  assert.equal(result.status, "completed");
+  assert.deepEqual(calls, ["start", "load", "set:reasoning_effort:high", "prompt:high"]);
+  const stored = store.records.get(record.acpxRecordId);
+  assert.equal(stored?.acpx?.session_options?.effort, "high");
+  assert.deepEqual(stored?.acpx?.desired_config_options, { reasoning_effort: "high" });
 });
 
 test("persistSessionOptions preserves an explicit empty allowedTools list", () => {

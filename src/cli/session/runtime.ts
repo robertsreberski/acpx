@@ -36,7 +36,11 @@ import {
 } from "../../session/conversation-model.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
-import { clearDesiredConfigOption, setDesiredEffort } from "../../session/mode-preference.js";
+import {
+  clearDesiredConfigOption,
+  getDesiredEffort,
+  setDesiredEffort,
+} from "../../session/mode-preference.js";
 import {
   applyRequestedModelAndEffortIfAdvertised,
   applyRequestedModelPreferenceToRecord,
@@ -373,7 +377,11 @@ async function reapplySavedPromptEffort(params: {
   replacesEffort: boolean;
   timeoutMs?: number;
 }): Promise<void> {
-  if (params.replacesEffort || params.record.acpx?.config_options === undefined) {
+  if (
+    params.replacesEffort ||
+    params.record.acpx?.config_options === undefined ||
+    !getDesiredEffort(params.record.acpx)
+  ) {
     return;
   }
   const effort = await reapplyDesiredEffortAfterModelChange({
@@ -1255,10 +1263,6 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           verbose: options.verbose,
           suppressWarnings: options.suppressSdkConsoleErrors,
           activeController,
-          onClientAvailable: () => {
-            options.onClientAvailable?.(activeController);
-            notifiedClientAvailable = true;
-          },
           onConnectedRecord: (connectedRecord) => {
             connectedRecord.lastPromptAt = isoNow();
           },
@@ -1407,6 +1411,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }).finally(() => {
       acpxState = cloneSessionAcpxState(record.acpx);
     });
+    options.onClientAvailable?.(activeController);
+    notifiedClientAvailable = true;
 
     output.setContext({
       sessionId: record.acpxRecordId,
