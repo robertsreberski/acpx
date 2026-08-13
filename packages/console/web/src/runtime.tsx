@@ -58,10 +58,17 @@ const record = (value: unknown): { readonly [key: string]: JsonValue } => {
     : { value: normalized };
 };
 
-const convertTimelineMessage = ({ event, interaction }: TimelineMessage): ThreadMessageLike => {
-  const role = event.role === "user" ? "user" : "assistant";
+export const convertTimelineMessage = ({
+  event,
+  interaction,
+}: TimelineMessage): ThreadMessageLike => {
   const hasActivity =
     interaction !== undefined || (event.kind !== "message" && event.kind !== "text");
+  // assistant-ui accepts tool-call parts only on assistant messages. ACP session
+  // updates can retain the originating user's role even when the event itself
+  // is agent activity, so derive the message role from the rendered part shape
+  // rather than passing that persisted role through blindly.
+  const role = hasActivity ? "assistant" : event.role === "user" ? "user" : "assistant";
   const content: Exclude<ThreadMessageLike["content"], string> = hasActivity
     ? [
         {
