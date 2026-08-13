@@ -95,8 +95,18 @@ owner:   absent | starting | online | unreachable | dead
 turn:    idle | queued | starting | running
        | waiting_permission | waiting_elicitation | cancelling
        | completed | failed | cancelled | interrupted | unknown
-queue:   non-negative queued prompt count
+queue:   non-negative queued prompt count plus unresolved turn id, submitted-at,
+         and optional display text for each currently queued prompt
 ```
+
+Session summaries merge the durable pending-request ledger with the live queue
+owner's in-memory waiter set. The owner read is bounded, and reads for separate
+sessions run concurrently, so one slow owner does not turn a session listing
+into an unbounded serial wait. A live-only waiter can exist when its durable
+write failed; when the owner answers, it remains authoritative for both the
+pending count and the `waiting_permission` or `waiting_elicitation` state. If a
+live owner cannot answer within the bound, the durable ledger is retained as a
+safe lower bound rather than killing or reconciling the owner during a read.
 
 The service allocates and persists a `turnId` before attempting queue
 admission. A successful mutation therefore returns a stable receipt even when
@@ -106,6 +116,13 @@ turn without another submit, while a fresh key deliberately denotes a new user
 action. The guarantee is exactly-once local admission. ACPX
 does not promise exactly-once external-agent execution after an ambiguous
 process failure.
+
+The submitted lifecycle envelope also retains browser-safe prompt display text.
+Session projection combines unresolved submissions with the live owner's queue
+depth, so reloading the console reconstructs the exact queued rows and their
+cancellation targets instead of relying on browser memory. Older envelopes
+without text remain readable, and owner loss never turns stale submissions into
+apparently cancellable work.
 
 Session close has two explicit outcomes in one receipt: the local record is
 durably closed, and provider close is either `confirmed` or `degraded` with a

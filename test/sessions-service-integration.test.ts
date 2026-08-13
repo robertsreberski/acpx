@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { pendingRequestFilePath } from "../src/session/pending-requests.js";
 import { listSessions } from "../src/session/persistence.js";
 import { idempotencyTestInternals } from "../src/sessions-service/idempotency.js";
 import {
@@ -583,7 +584,7 @@ test("fresh sessions use collision-safe local ids when adapters return the same 
   });
 });
 
-test("the service drives create, queue, park, answer, transcript, and close end to end", async () => {
+test("the service drives the full queue flow and summarizes a live-only parked request", async () => {
   await withTempHome("acpx-sessions-service-integration-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -610,7 +611,14 @@ test("the service drives create, queue, park, answer, transcript, and close end 
       });
       assert.equal(pending.kind, "permission");
       assert.equal(pending.title, "Run the focused checks");
+      await fs.rm(pendingRequestFilePath(created.result.acpxRecordId, pending.requestId, homeDir));
+      const liveOnlySummary = (await service.listSessions()).find(
+        (session) => session.acpxRecordId === created.result.acpxRecordId,
+      );
+      assert.equal(liveOnlySummary?.pendingCount, 1);
+      assert.equal(liveOnlySummary?.turnState, "waiting_permission");
       const waiting = await service.getSession({ acpxRecordId: created.result.acpxRecordId });
+      assert.equal(waiting?.pendingCount, 1);
       assert.equal(waiting?.turnState, "waiting_permission");
       assert.equal(waiting?.activeTurnId, enqueued.result.turnId);
 
