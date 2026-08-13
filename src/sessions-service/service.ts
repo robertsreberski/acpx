@@ -938,7 +938,7 @@ class SessionService implements AcpxSessionService {
     const legacyOwnerCanAppend = liveOwner !== undefined && !queueOwnerWritesTimeline(liveOwner);
     if (
       record.timeline?.legacy_import_complete !== true ||
-      (record.timeline?.legacy_retained && legacyOwnerCanAppend) ||
+      legacyOwnerCanAppend ||
       (!record.timeline && record.lastSeq > 0)
     ) {
       // Retained pre-ledger traffic used to appear only after the next prompt,

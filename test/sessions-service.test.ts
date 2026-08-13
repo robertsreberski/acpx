@@ -181,6 +181,57 @@ test("later compatibility appends appear on the next transcript read exactly onc
   });
 });
 
+test("a live legacy owner can append its first retained message after an empty read", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-first-late-legacy-append",
+      acpSessionId: "provider-first-late-legacy-append",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    const keeper = await startKeeperProcess();
+    const ownerPaths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...ownerPaths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      queueProtocol: 2,
+    });
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const empty = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.equal(empty.items.filter((item) => "payload" in item).length, 0);
+
+      const later = retainedMessage(record.acpSessionId, "First retained message");
+      await fs.writeFile(
+        sessionEventActivePath(record.acpxRecordId),
+        `${JSON.stringify(later)}\n`,
+        "utf8",
+      );
+      const hydrated = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.deepEqual(
+        hydrated.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        ),
+        [later],
+      );
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("modern timeline appends are not re-imported from their compatibility copy", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
