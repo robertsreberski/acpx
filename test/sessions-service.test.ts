@@ -750,6 +750,51 @@ test("session recovery scopes use canonical agent identity and effective normali
   assert.deepEqual(implicitDefault, explicitDefault);
 });
 
+test("session invalidation fingerprints ignore heartbeat timestamps until owner health changes", async () => {
+  const keeper = await startKeeperProcess();
+  try {
+    const record = makeSessionRecord({
+      acpxRecordId: "session-heartbeat-fingerprint",
+      acpSessionId: "provider-heartbeat-fingerprint",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: process.cwd(),
+    });
+    const owner = {
+      pid: keeper.pid!,
+      sessionId: record.acpxRecordId,
+      socketPath: "/tmp/acpx-heartbeat-fingerprint.sock",
+      createdAt: "2026-08-13T10:00:00.000Z",
+      heartbeatAt: new Date().toISOString(),
+      ownerGeneration: 71,
+      queueDepth: 0,
+    };
+    const first = sessionsServiceTestInternals.recordFingerprint(record, owner);
+    const refreshed = sessionsServiceTestInternals.recordFingerprint(record, {
+      ...owner,
+      heartbeatAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+    const stale = sessionsServiceTestInternals.recordFingerprint(record, {
+      ...owner,
+      heartbeatAt: "2000-01-01T00:00:00.000Z",
+    });
+    const queued = sessionsServiceTestInternals.recordFingerprint(record, {
+      ...owner,
+      queueDepth: 1,
+    });
+
+    assert.equal(refreshed, first, "a fresh heartbeat alone invalidated the session");
+    assert.notEqual(stale, first, "fresh-to-stale owner health was not observable");
+    assert.notEqual(queued, first, "queue-depth changes were not observable");
+    assert.notEqual(
+      sessionsServiceTestInternals.recordFingerprint(record, undefined),
+      first,
+      "owner removal was not observable",
+    );
+  } finally {
+    stopProcess(keeper);
+  }
+});
+
 test("a live owner with a stale heartbeat is unreachable, never starting", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -1736,6 +1781,81 @@ test("a first pending request on a newly observed session emits an invalidation"
     } finally {
       unsubscribe();
       service.dispose();
+    }
+  });
+});
+
+test("subscription polling collapses heartbeat churn but emits owner health transitions", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-heartbeat-polling",
+      acpSessionId: "provider-heartbeat-polling",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, record);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, record.acpxRecordId);
+    const server = createSingleRequestServer(() => {});
+    const createdAt = new Date().toISOString();
+    const writeOwner = async (heartbeatAt: string): Promise<void> => {
+      await writeQueueOwnerLock({
+        ...paths,
+        pid: keeper.pid,
+        sessionId: record.acpxRecordId,
+        ownerGeneration: 72,
+        queueDepth: 0,
+        createdAt,
+        heartbeatAt,
+      });
+    };
+    await writeOwner(createdAt);
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd, timelinePollMs: 100 });
+    const invalidations: string[] = [];
+    const unsubscribe = service.subscribe((event) => {
+      if (event.type === "session" && event.acpxRecordId === record.acpxRecordId) {
+        invalidations.push(event.type);
+      }
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      assert.equal(
+        (await service.getSession({ acpxRecordId: record.acpxRecordId }))?.ownerState,
+        "online",
+      );
+
+      await writeOwner(new Date().toISOString());
+      await new Promise<void>((resolve) => setTimeout(resolve, 350));
+      assert.deepEqual(invalidations, [], "fresh heartbeat churn emitted a session invalidation");
+
+      const transitioned = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error("timed out waiting for stale-owner invalidation")),
+          2_000,
+        );
+        const observe = service.subscribe((event) => {
+          if (event.type === "session" && event.acpxRecordId === record.acpxRecordId) {
+            clearTimeout(timeout);
+            observe();
+            resolve();
+          }
+        });
+      });
+      await writeOwner("2000-01-01T00:00:00.000Z");
+      await transitioned;
+      assert.equal(
+        (await service.getSession({ acpxRecordId: record.acpxRecordId }))?.ownerState,
+        "unreachable",
+      );
+    } finally {
+      unsubscribe();
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
     }
   });
 });

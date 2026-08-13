@@ -15,6 +15,7 @@ import {
   tryRespondOnRunningOwner,
 } from "../cli/queue/ipc.js";
 import {
+  isQueueOwnerHeartbeatStale,
   queueOwnerWritesTimeline,
   readLiveQueueOwner,
   readQueueOwnerRecord,
@@ -28,6 +29,7 @@ import {
 } from "../cli/session/session-control.js";
 import { createSessionWithClient, listAgentSessions } from "../cli/session/session-management.js";
 import { PendingRequestOwnerGoneError, SessionNotFoundError } from "../errors.js";
+import { isProcessAlive } from "../process-liveness.js";
 import { promptToDisplayText, textPrompt } from "../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../runtime/engine/lifecycle.js";
 import { normalizeModeId, setDesiredModeId } from "../session/mode-preference.js";
@@ -331,6 +333,22 @@ async function listSubscriptionRecords(
   return roots?.length === 0 ? [] : await listOpenSessionsForSubscription(roots);
 }
 
+function ownerFingerprint(owner: Awaited<ReturnType<typeof readQueueOwnerRecord>>): string {
+  if (!owner) {
+    return "absent";
+  }
+  // The timestamp itself advances during healthy idle operation and carries no
+  // projected state. Hash only the semantic threshold it crosses so normal
+  // heartbeats do not fan out as session + timeline invalidations, while a
+  // stopped process or stale owner still refreshes browser-visible health.
+  return [
+    owner.ownerGeneration,
+    owner.queueDepth,
+    isProcessAlive(owner.pid) ? "alive" : "dead",
+    isQueueOwnerHeartbeatStale(owner) ? "stale" : "fresh",
+  ].join(":");
+}
+
 // oxlint-disable-next-line eslint/complexity -- The fingerprint intentionally covers independent persisted and owner axes.
 function recordFingerprint(
   record: SessionRecord,
@@ -341,9 +359,7 @@ function recordFingerprint(
     record.closed === true ? "closed" : "open",
     record.timeline?.epoch ?? "",
     record.timeline?.last_seq ?? 0,
-    owner?.ownerGeneration ?? "",
-    owner?.queueDepth ?? 0,
-    owner?.heartbeatAt ?? "",
+    ownerFingerprint(owner),
   ].join(":");
 }
 
@@ -1082,7 +1098,9 @@ export const sessionsServiceTestInternals = {
   listSubscriptionRecords,
   mapConcurrentBounded,
   mergePending,
+  ownerFingerprint,
   providerSessionProjection,
+  recordFingerprint,
   registeredAgent,
   sessionStartRecoveryScope,
 };
