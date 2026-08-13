@@ -3,6 +3,11 @@ import { QueueConnectionError } from "../../errors.js";
 
 export type QueueOwnerTurnState = "idle" | "starting" | "active" | "closing";
 
+export type AppliedSessionPreferences = {
+  effortConfigId: string;
+  response: SetSessionConfigOptionResponse;
+};
+
 export type QueueOwnerActiveSessionController = {
   hasActivePrompt: () => boolean;
   requestCancelActivePrompt: () => Promise<boolean>;
@@ -12,6 +17,10 @@ export type QueueOwnerActiveSessionController = {
     configId: string,
     value: string,
   ) => Promise<SetSessionConfigOptionResponse>;
+  applySessionPreferences: (
+    modelId: string | undefined,
+    effort: string,
+  ) => Promise<AppliedSessionPreferences>;
 };
 
 type QueueOwnerTurnControllerOptions = {
@@ -26,6 +35,11 @@ type QueueOwnerTurnControllerOptions = {
     value: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse>;
+  applySessionPreferencesFallback: (
+    modelId: string | undefined,
+    effort: string,
+    timeoutMs?: number,
+  ) => Promise<AppliedSessionPreferences>;
 };
 
 export class QueueOwnerTurnController {
@@ -33,6 +47,8 @@ export class QueueOwnerTurnController {
   private state: QueueOwnerTurnState = "idle";
   private pendingCancel = false;
   private activeController?: QueueOwnerActiveSessionController;
+  private controlTargetReady?: Promise<void>;
+  private resolveControlTargetReady?: () => void;
 
   constructor(options: QueueOwnerTurnControllerOptions) {
     this.options = options;
@@ -49,6 +65,7 @@ export class QueueOwnerTurnController {
   beginTurn(): void {
     this.state = "starting";
     this.pendingCancel = false;
+    this.startControlTargetWait();
   }
 
   markPromptActive(): void {
@@ -60,20 +77,50 @@ export class QueueOwnerTurnController {
   endTurn(): void {
     this.state = "idle";
     this.pendingCancel = false;
+    this.finishControlTargetWait();
   }
 
   beginClosing(): void {
     this.state = "closing";
     this.pendingCancel = false;
     this.activeController = undefined;
+    this.finishControlTargetWait();
   }
 
   setActiveController(controller: QueueOwnerActiveSessionController): void {
     this.activeController = controller;
+    this.finishControlTargetWait();
   }
 
   clearActiveController(): void {
     this.activeController = undefined;
+    if (this.state === "starting" || this.state === "active") {
+      this.startControlTargetWait();
+    }
+  }
+
+  private startControlTargetWait(): void {
+    this.finishControlTargetWait();
+    this.controlTargetReady = new Promise((resolve) => {
+      this.resolveControlTargetReady = resolve;
+    });
+  }
+
+  private finishControlTargetWait(): void {
+    this.resolveControlTargetReady?.();
+    this.resolveControlTargetReady = undefined;
+    this.controlTargetReady = undefined;
+  }
+
+  private async waitForActiveControllerOrIdle(timeoutMs?: number): Promise<void> {
+    if (this.activeController || this.state === "idle") {
+      return;
+    }
+    const ready = this.controlTargetReady;
+    if (ready) {
+      await this.options.withTimeout(async () => await ready, timeoutMs);
+    }
+    this.assertCanHandleControlRequest();
   }
 
   private assertCanHandleControlRequest(): void {
@@ -162,5 +209,23 @@ export class QueueOwnerTurnController {
     }
 
     return await this.options.setSessionConfigOptionFallback(configId, value, timeoutMs);
+  }
+
+  async applySessionPreferences(
+    modelId: string | undefined,
+    effort: string,
+    timeoutMs?: number,
+  ): Promise<AppliedSessionPreferences> {
+    this.assertCanHandleControlRequest();
+    await this.waitForActiveControllerOrIdle(timeoutMs);
+    const activeController = this.activeController;
+    if (activeController) {
+      return await this.options.withTimeout(
+        async () => await activeController.applySessionPreferences(modelId, effort),
+        timeoutMs,
+      );
+    }
+
+    return await this.options.applySessionPreferencesFallback(modelId, effort, timeoutMs);
   }
 }

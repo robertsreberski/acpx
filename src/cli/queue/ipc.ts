@@ -36,10 +36,12 @@ import {
 } from "./lease-store.js";
 import {
   parseQueueOwnerMessage,
+  type QueueApplySessionPreferencesRequest,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
   type QueueListRequestsRequest,
   type QueueOwnerCancelResultMessage,
+  type QueueOwnerApplySessionPreferencesResultMessage,
   type QueueOwnerCloseSessionResultMessage,
   type QueueOwnerListRequestsResultMessage,
   type QueueOwnerMessage,
@@ -746,6 +748,42 @@ async function submitSetConfigOptionToQueueOwner(
   return response.response;
 }
 
+async function submitApplySessionPreferencesToQueueOwner(
+  owner: QueueOwnerRecord,
+  modelId: string | undefined,
+  effort: string,
+  timeoutMs?: number,
+): Promise<QueueOwnerApplySessionPreferencesResultMessage | undefined> {
+  const request: QueueApplySessionPreferencesRequest = {
+    type: "apply_session_preferences",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    ...(modelId ? { modelId } : {}),
+    effort,
+    timeoutMs,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerApplySessionPreferencesResultMessage =>
+      message.type === "apply_session_preferences_result",
+  );
+  if (!response) {
+    return undefined;
+  }
+  if (response.requestId !== request.requestId) {
+    throw new QueueProtocolError(
+      "Queue owner returned mismatched apply_session_preferences response",
+      {
+        detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+        origin: "queue",
+        retryable: true,
+      },
+    );
+  }
+  return response;
+}
+
 async function submitCloseSessionToQueueOwner(
   owner: QueueOwnerRecord,
   timeoutMs?: number,
@@ -1283,6 +1321,48 @@ export async function trySetConfigOptionOnRunningOwner(
 
   throw new QueueConnectionError(
     "Session queue owner is running but not accepting set_config_option requests",
+    {
+      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
+      origin: "queue",
+      retryable: true,
+    },
+  );
+}
+
+export async function tryApplySessionPreferencesOnRunningOwner(options: {
+  sessionId: string;
+  modelId?: string;
+  effort: string;
+  timeoutMs?: number;
+  verbose?: boolean;
+}): Promise<QueueOwnerApplySessionPreferencesResultMessage | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+
+  const response = await submitApplySessionPreferencesToQueueOwner(
+    owner,
+    options.modelId,
+    options.effort,
+    options.timeoutMs,
+  );
+  if (response) {
+    if (options.verbose) {
+      process.stderr.write(
+        `[acpx] applied model and effort preferences on owner pid ${owner.pid} for session ${options.sessionId}\n`,
+      );
+    }
+    return response;
+  }
+
+  const health = await probeQueueOwnerHealth(options.sessionId);
+  if (!health.hasLease) {
+    return undefined;
+  }
+
+  throw new QueueConnectionError(
+    "Session queue owner is running but not accepting apply_session_preferences requests",
     {
       detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
       origin: "queue",

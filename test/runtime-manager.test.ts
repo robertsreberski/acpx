@@ -3169,10 +3169,35 @@ test("AcpRuntimeManager forwards sessionOptions to createClient on fresh session
   });
 });
 
-test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTools/maxTurns", async () => {
+test("AcpRuntimeManager persists sessionOptions with model-aware effort", async () => {
   const store = new InMemorySessionStore();
   const factoryCalls: Array<Record<string, unknown>> = [];
   const setModelCalls: Array<{ sessionId: string; modelId: string }> = [];
+  const preferenceCalls: string[] = [];
+  const configOptions = (model: string, effort: string) => [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select" as const,
+      currentValue: model,
+      options: [
+        { value: "default", name: "Default" },
+        { value: "fast", name: "Fast" },
+      ],
+    },
+    {
+      id: "reasoning_effort",
+      name: "Reasoning Effort",
+      category: "thought_level",
+      type: "select" as const,
+      currentValue: effort,
+      options: [
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+      ],
+    },
+  ];
   const manager = new AcpRuntimeManager(
     createRuntimeOptions({ cwd: "/workspace", sessionStore: store }),
     {
@@ -3193,6 +3218,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
                 { modelId: "fast", name: "Fast" },
               ],
             },
+            configOptions: configOptions("default", "medium"),
           }),
           loadSession: async () => ({ agentSessionId: "unused" }),
           hasReusableSession: () => false,
@@ -3206,8 +3232,13 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
           setSessionMode: async () => {},
           setSessionModel: async (sessionId: string, modelId: string) => {
             setModelCalls.push({ sessionId, modelId });
+            preferenceCalls.push(`model:${modelId}`);
+            return { configOptions: configOptions(modelId, "medium") };
           },
-          setSessionConfigOption: async () => {},
+          setSessionConfigOption: async (_sessionId: string, configId: string, value: string) => {
+            preferenceCalls.push(`${configId}:${value}`);
+            return { configOptions: configOptions("fast", value) };
+          },
           clearEventHandlers: () => {},
           setEventHandlers: () => {},
         } as never;
@@ -3218,6 +3249,7 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
   const sessionOptions = {
     systemPrompt: { append: "Also review tests." },
     model: "fast",
+    effort: "high",
     allowedTools: ["read", "edit"],
     maxTurns: 5,
   };
@@ -3230,15 +3262,18 @@ test("AcpRuntimeManager persists sessionOptions { append } and model/allowedTool
 
   assert.deepEqual(factoryCalls[0]?.sessionOptions, sessionOptions);
   assert.deepEqual(setModelCalls, [{ sessionId: "new-sid", modelId: "fast" }]);
+  assert.deepEqual(preferenceCalls, ["model:fast", "reasoning_effort:high"]);
   assert.equal(record.acpx?.current_model_id, "fast");
   assert.deepEqual(record.acpx?.available_models, ["default", "fast"]);
   assert.deepEqual(record.acpx?.session_options, {
     model: "fast",
+    effort: "high",
     allowed_tools: ["read", "edit"],
     max_turns: 5,
     system_prompt: { append: "Also review tests." },
     env: undefined,
   });
+  assert.deepEqual(record.acpx?.desired_config_options, { reasoning_effort: "high" });
 });
 
 test("persistSessionOptions preserves an explicit empty allowedTools list", () => {

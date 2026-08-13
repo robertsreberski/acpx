@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   getDesiredConfigOptions,
+  getDesiredEffort,
   getDesiredModeId,
   normalizeModeId,
+  reconcileDesiredEffortForModelChange,
   setDesiredConfigOption,
+  setDesiredEffort,
   setDesiredModeId,
   setDesiredModelId,
 } from "../src/session/mode-preference.js";
@@ -79,6 +82,70 @@ test("setDesiredModelId preserves session env when clearing model", () => {
     },
   });
 });
+
+test("setDesiredEffort persists the portable value and adapter config id", () => {
+  const record = makeSessionRecord();
+
+  setDesiredEffort(record, " high ", "reasoning_effort");
+
+  assert.equal(getDesiredEffort(record.acpx), "high");
+  assert.deepEqual(record.acpx, {
+    session_options: { effort: "high" },
+    desired_config_options: { reasoning_effort: "high" },
+  });
+
+  setDesiredEffort(record, undefined, "reasoning_effort");
+  assert.deepEqual(record.acpx, {});
+});
+
+test("model changes clear a saved effort the new model does not advertise", () => {
+  const previousState = {
+    session_options: { model: "smart-model", effort: "xhigh" },
+    desired_config_options: { reasoning_effort: "xhigh", other: "kept" },
+    config_options: [effortOption("reasoning_effort", "xhigh", ["high", "xhigh"])],
+  };
+  const nextState = {
+    ...previousState,
+    session_options: { ...previousState.session_options, model: "fast-model" },
+    config_options: [effortOption("reasoning_effort", "medium", ["low", "medium"])],
+  };
+
+  const result = reconcileDesiredEffortForModelChange(previousState, nextState);
+
+  assert.equal(result.selection, undefined);
+  assert.deepEqual(result.state.session_options, { model: "fast-model" });
+  assert.deepEqual(result.state.desired_config_options, { other: "kept" });
+});
+
+test("model changes retain and rebase a compatible saved effort", () => {
+  const previousState = {
+    session_options: { model: "old-model", effort: "xhigh" },
+    desired_config_options: { old_effort: "xhigh" },
+    config_options: [effortOption("old_effort", "xhigh", ["high", "xhigh"])],
+  };
+  const nextState = {
+    ...previousState,
+    session_options: { ...previousState.session_options, model: "new-model" },
+    config_options: [effortOption("new_effort", "high", ["high", "xhigh"])],
+  };
+
+  const result = reconcileDesiredEffortForModelChange(previousState, nextState);
+
+  assert.deepEqual(result.selection, { configId: "new_effort", effort: "xhigh" });
+  assert.deepEqual(result.state.desired_config_options, { new_effort: "xhigh" });
+  assert.equal(result.state.session_options?.effort, "xhigh");
+});
+
+function effortOption(id: string, currentValue: string, values: string[]) {
+  return {
+    id,
+    name: "Reasoning Effort",
+    category: "thought_level",
+    type: "select" as const,
+    currentValue,
+    options: values.map((value) => ({ value, name: value })),
+  };
+}
 
 function makeSessionRecord(): SessionRecord {
   const timestamp = "2026-01-01T00:00:00.000Z";

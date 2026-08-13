@@ -40,6 +40,7 @@ import {
   type SessionSendOptions,
 } from "./contracts.js";
 import {
+  runSessionApplyPreferencesDirect,
   runSessionSetConfigOptionDirect,
   runSessionSetModelDirect,
   runSessionSetModeDirect,
@@ -242,21 +243,13 @@ function createParkingBridge(params: {
 
 function createQueueOwnerTurnController(
   options: QueueOwnerRuntimeOptions,
+  retireRetainedClient: () => Promise<void>,
 ): QueueOwnerTurnController {
   return new QueueOwnerTurnController({
     withTimeout: async (run, timeoutMs) => await withTimeout(run(), timeoutMs),
-    // KNOWN GAP: these fallbacks run when no turn is active, and each opens its
-    // own client — so the change lands on a throwaway adapter session while the
-    // owner's `sharedClient` keeps the session the next turn reuses. For the
-    // mode that is a security posture silently not taking effect: the record is
-    // updated, the next prompt runs at the old mode, and `status` shows nothing.
-    // The agreed fix is for the idle path to apply through `sharedClient` when
-    // it still holds the record's session, not to re-assert the saved mode at
-    // reuse time — connectAndLoadSession deliberately leaves a session this
-    // client already holds open alone (see reapplyModeOnBoundSession), because
-    // re-asserting per turn would also override a mode the agent moved to
-    // itself mid-conversation. Documented as a hazard in docs/session-control.md
-    // and docs/deferred-requests.md until then.
+    // Idle fallbacks use a separate connection. Combined model/effort changes
+    // therefore retire the owner's retained client so the next prompt rebinds
+    // and replays the preferences that the direct path persisted.
     setSessionModeFallback: async (modeId: string, timeoutMs?: number) => {
       await runSessionSetModeDirect({
         sessionRecordId: options.sessionId,
@@ -301,6 +294,33 @@ function createQueueOwnerTurnController(
         verbose: options.verbose,
       });
       return result.response;
+    },
+    applySessionPreferencesFallback: async (
+      modelId: string | undefined,
+      effort: string,
+      timeoutMs?: number,
+    ) => {
+      try {
+        const result = await runSessionApplyPreferencesDirect({
+          sessionRecordId: options.sessionId,
+          modelId,
+          effort,
+          mcpServers: options.mcpServers,
+          nonInteractivePermissions: options.nonInteractivePermissions,
+          authCredentials: options.authCredentials,
+          authPolicy: options.authPolicy,
+          fs: options.fs,
+          terminal: options.terminal,
+          timeoutMs,
+          verbose: options.verbose,
+        });
+        return {
+          effortConfigId: result.effortConfigId,
+          response: result.response,
+        };
+      } finally {
+        await retireRetainedClient();
+      }
     },
   });
 }
@@ -561,7 +581,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const taskPollTimeoutMs = ttlMs === 0 ? undefined : ttlMs;
   const initialTaskPollTimeoutMs =
     taskPollTimeoutMs == null ? undefined : Math.max(taskPollTimeoutMs, 1_000);
-  const turnController = createQueueOwnerTurnController(options);
+  const turnController = createQueueOwnerTurnController(options, async () => {
+    await sharedClient.close();
+  });
 
   const applyPendingCancel = async (): Promise<boolean> => {
     return await turnController.applyPendingCancel();
@@ -645,6 +667,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
           return await turnController.setSessionConfigOption(configId, value, timeoutMs);
         },
+        applySessionPreferences: async (
+          modelId: string | undefined,
+          effort: string,
+          timeoutMs?: number,
+        ) => await turnController.applySessionPreferences(modelId, effort, timeoutMs),
         listPendingRequests: async () => (await parking?.manager.listPending()) ?? [],
         respondToPendingRequest: async (pendingRequestId, answer) => {
           if (!parking) {

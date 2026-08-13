@@ -192,6 +192,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
       verbose: false,
       format: "json",
       model: " opus ",
+      effort: " high ",
       allowedTools: ["Read", "Edit"],
       maxTurns: 3,
       systemPrompt: "replace",
@@ -216,6 +217,7 @@ test("resolveGlobalFlags validates and normalizes dynamic Commander options", ()
     verbose: false,
     format: "json",
     model: "opus",
+    effort: "high",
     allowedTools: ["Read", "Edit"],
     maxTurns: 3,
     systemPrompt: "replace",
@@ -358,6 +360,8 @@ test("global flag registration parses each supported option", () => {
     "--suppress-reads",
     "--model",
     "sonnet",
+    "--effort",
+    "high",
     "--allowed-tools",
     "Read,Edit",
     "--max-turns",
@@ -386,6 +390,7 @@ test("global flag registration parses each supported option", () => {
     format: "json",
     suppressReads: true,
     model: "sonnet",
+    effort: "high",
     allowedTools: ["Read", "Edit"],
     maxTurns: 4,
     systemPrompt: "be precise",
@@ -407,6 +412,10 @@ test("global flag registration validates option parsers at parse time", () => {
   assert.throws(
     () => parseCommand(addGlobalFlags(new Command()), ["--max-turns", "0"]),
     /Max turns must be a positive integer/,
+  );
+  assert.throws(
+    () => parseCommand(addGlobalFlags(new Command()), ["--effort", ""]),
+    /Effort must not be empty/,
   );
   assert.throws(
     () => parseCommand(addGlobalFlags(new Command()), ["--system-prompt", ""]),

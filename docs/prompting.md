@@ -109,13 +109,14 @@ Decimal seconds are allowed. Negative or zero is rejected as a usage error.
 
 If the timeout fires, `acpx` exits with code `3` and the agent process is cancelled cooperatively first.
 
-## Models
+## Models and effort
 
 `--model <id>` requests a specific model:
 
 ```bash
 acpx --model claude-sonnet-4-6 claude 'do the thing'
 acpx --model gpt-5.4 codex exec 'one-shot summary'
+acpx --model gpt-5.6-sol --effort high codex 'review the changed files'
 ```
 
 Behavior varies by adapter:
@@ -123,12 +124,15 @@ Behavior varies by adapter:
 - **Claude** consumes the value as session-creation metadata.
 - Other agents must advertise a model session config option or legacy `models` metadata. Config options use `session/set_config_option`; explicitly advertised legacy models use `session/set_model`.
 - Model ids must appear in the adapter's advertised values. Unknown ids are rejected.
+- `--effort <level>` selects an advertised ACP thought/reasoning level. The values are not a global enum: they come from the adapter and may change with the selected model.
+- When both flags are present, `acpx` applies `--model` first, reads the refreshed config options, then validates and applies `--effort`. An unsupported value fails before the prompt and reports the selected model plus its advertised effort values.
+- Persistent sessions save an explicitly selected effort and re-apply it on later prompts and fresh adapter sessions. Omitting `--effort` on a new session leaves the adapter default unpinned.
 - Cursor may advertise model variants with bracketed settings such as
   `composer-2.5[fast=false]`. When exactly one advertised Cursor id has the requested
   bare model as its prefix, `acpx` forwards that advertised id automatically; ambiguous
   variants remain rejected.
 
-For mid-session model switches, use `set model <id>` instead. See [Session control](session-control.md#set-key-value).
+For mid-session changes, use `set model <id>` and the adapter's advertised effort key (for current Codex adapters, `set reasoning_effort <value>`). See [Session control](session-control.md#set-key-value).
 
 ## Permissions inside a prompt
 

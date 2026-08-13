@@ -66,7 +66,13 @@ acpx codex set reasoning_effort max
 acpx claude set model claude-sonnet-4-6
 ```
 
-For setting the model at session creation instead, use the `--model` global flag. See [Prompting](prompting.md#models).
+The preferred prompt/session form is the portable global flag:
+
+```bash
+acpx --model gpt-5.6-sol --effort max codex 'review the changed files'
+```
+
+`acpx` resolves `--effort` from the adapter's advertised thought-level config option, applies the model first, and validates against the refreshed values for that model. Direct `set reasoning_effort max` remains supported and updates the same persisted effort preference. See [Prompting](prompting.md#models-and-effort).
 
 ## `status`
 

@@ -177,10 +177,89 @@ test("QueueOwnerTurnController routes setSessionConfigOption through fallback wh
   assert.deepEqual(response, { configOptions: [] });
 });
 
+test("QueueOwnerTurnController routes combined preferences through active and fallback controllers", async () => {
+  const activeRequests: Array<[string | undefined, string]> = [];
+  const fallbackRequests: Array<[string | undefined, string, number | undefined]> = [];
+  const observedTimeouts: Array<number | undefined> = [];
+  const controller = createQueueOwnerTurnController({
+    withTimeout: async (run, timeoutMs) => {
+      observedTimeouts.push(timeoutMs);
+      return await run();
+    },
+    applySessionPreferencesFallback: async (modelId, effort, timeoutMs) => {
+      fallbackRequests.push([modelId, effort, timeoutMs]);
+      return {
+        effortConfigId: "thought_level",
+        response: { configOptions: [] },
+      };
+    },
+  });
+  controller.setActiveController(
+    makeActiveController({
+      applySessionPreferences: async (modelId, effort) => {
+        activeRequests.push([modelId, effort]);
+        return {
+          effortConfigId: "reasoning_effort",
+          response: { configOptions: [] },
+        };
+      },
+    }),
+  );
+
+  const activeResult = await controller.applySessionPreferences("smart-model", "xhigh", 900);
+  assert.deepEqual(activeRequests, [["smart-model", "xhigh"]]);
+  assert.deepEqual(fallbackRequests, []);
+  assert.deepEqual(observedTimeouts, [900]);
+  assert.equal(activeResult.effortConfigId, "reasoning_effort");
+
+  controller.clearActiveController();
+  const fallbackResult = await controller.applySessionPreferences(undefined, "low", 1_200);
+  assert.deepEqual(fallbackRequests, [[undefined, "low", 1_200]]);
+  assert.equal(fallbackResult.effortConfigId, "thought_level");
+});
+
+test("QueueOwnerTurnController waits for a starting turn before applying preferences", async () => {
+  let activeCalls = 0;
+  let fallbackCalls = 0;
+  const controller = createQueueOwnerTurnController({
+    applySessionPreferencesFallback: async () => {
+      fallbackCalls += 1;
+      return {
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      };
+    },
+  });
+
+  controller.beginTurn();
+  const resultPromise = controller.applySessionPreferences("smart-model", "high", 1_000);
+  await Promise.resolve();
+  assert.equal(activeCalls, 0);
+  assert.equal(fallbackCalls, 0);
+
+  controller.setActiveController(
+    makeActiveController({
+      applySessionPreferences: async () => {
+        activeCalls += 1;
+        return {
+          effortConfigId: "reasoning_effort",
+          response: { configOptions: [] },
+        };
+      },
+    }),
+  );
+
+  const result = await resultPromise;
+  assert.equal(result.effortConfigId, "reasoning_effort");
+  assert.equal(activeCalls, 1);
+  assert.equal(fallbackCalls, 0);
+});
+
 test("QueueOwnerTurnController rejects control requests while closing", async () => {
   let setModeFallbackCalls = 0;
   let setModelFallbackCalls = 0;
   let setConfigFallbackCalls = 0;
+  let applyPreferencesFallbackCalls = 0;
   const controller = createQueueOwnerTurnController({
     setSessionModeFallback: async () => {
       setModeFallbackCalls += 1;
@@ -191,6 +270,13 @@ test("QueueOwnerTurnController rejects control requests while closing", async ()
     setSessionConfigOptionFallback: async () => {
       setConfigFallbackCalls += 1;
       return { configOptions: [] };
+    },
+    applySessionPreferencesFallback: async () => {
+      applyPreferencesFallbackCalls += 1;
+      return {
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      };
     },
   });
 
@@ -208,9 +294,14 @@ test("QueueOwnerTurnController rejects control requests while closing", async ()
     async () => await controller.setSessionConfigOption("k", "v"),
     /Queue owner is closing/,
   );
+  await assert.rejects(
+    async () => await controller.applySessionPreferences("gpt-5.4", "high"),
+    /Queue owner is closing/,
+  );
   assert.equal(setModeFallbackCalls, 0);
   assert.equal(setModelFallbackCalls, 0);
   assert.equal(setConfigFallbackCalls, 0);
+  assert.equal(applyPreferencesFallbackCalls, 0);
 });
 
 type QueueOwnerTurnControllerOverrides = Partial<{
@@ -225,6 +316,7 @@ type QueueOwnerTurnControllerOverrides = Partial<{
     value: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse>;
+  applySessionPreferencesFallback: QueueOwnerTurnController["applySessionPreferences"];
 }>;
 
 function createQueueOwnerTurnController(
@@ -247,12 +339,19 @@ function createQueueOwnerTurnController(
     (async () => ({
       configOptions: [],
     }));
+  const applySessionPreferencesFallback =
+    overrides.applySessionPreferencesFallback ??
+    (async () => ({
+      effortConfigId: "reasoning_effort",
+      response: { configOptions: [] },
+    }));
 
   return new QueueOwnerTurnController({
     withTimeout,
     setSessionModeFallback,
     setSessionModelFallback,
     setSessionConfigOptionFallback,
+    applySessionPreferencesFallback,
   });
 }
 
@@ -276,5 +375,11 @@ function makeActiveController(
       })),
     setSessionConfigOption:
       overrides.setSessionConfigOption ?? (async () => ({ configOptions: [] })),
+    applySessionPreferences:
+      overrides.applySessionPreferences ??
+      (async () => ({
+        effortConfigId: "reasoning_effort",
+        response: { configOptions: [] },
+      })),
   };
 }

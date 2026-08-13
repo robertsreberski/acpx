@@ -277,6 +277,7 @@ function rowStatusFromPermissionStats(stats: PermissionStats): CompareRow["statu
 function sessionOptionsFromGlobalFlags(globalFlags: ReturnType<typeof resolveGlobalFlags>) {
   return {
     model: globalFlags.model,
+    effort: globalFlags.effort,
     allowedTools: globalFlags.allowedTools,
     maxTurns: globalFlags.maxTurns,
     systemPrompt: globalFlags.systemPrompt,

@@ -1,14 +1,12 @@
 import { AcpClient } from "../../acp/client.js";
+import { effortStateFromConfigOptions } from "../../acp/effort-support.js";
 import {
   extractAcpError,
   formatErrorMessage,
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
-import {
-  assertRequestedModelSupported,
-  modelStateFromConfigOptions,
-} from "../../acp/model-support.js";
+import { modelStateFromConfigOptions } from "../../acp/model-support.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
@@ -38,14 +36,13 @@ import {
 } from "../../session/conversation-model.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
+import { clearDesiredConfigOption, setDesiredEffort } from "../../session/mode-preference.js";
 import {
-  clearDesiredConfigOption,
-  setCurrentModelId,
-  setDesiredModelId,
-} from "../../session/mode-preference.js";
-import {
-  applyRequestedModelIfAdvertised,
+  applyRequestedModelAndEffortIfAdvertised,
+  applyRequestedModelPreferenceToRecord,
+  clearDesiredEffortAfterUnrefreshedModelChange,
   currentModelIdFromSetModelResponse,
+  reapplyDesiredEffortAfterModelChange,
 } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import type { PendingRequest } from "../../session/pending-requests.js";
@@ -85,6 +82,7 @@ type RunSessionPromptOptions = Omit<
   "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
 > & {
   sessionRecordId: string;
+  requestedEffort?: string;
   handleProcessInterrupts?: boolean;
   /**
    * Hands back a sink that turns pending-request transitions into event-log
@@ -250,10 +248,6 @@ function toPromptResult(
   };
 }
 
-function requestedModelId(value: string | undefined): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
 function applyConfigOptionResponseToState(
   state: SessionAcpxState | undefined,
   response:
@@ -320,48 +314,320 @@ function mergeConnectedModelPreferences(
   }
 }
 
-async function applyPromptModelIfAdvertised(params: {
+async function applyPromptPreferences(params: {
   client: AcpClient;
   sessionId: string;
   requestedModel: string | undefined;
+  requestedEffort: string | undefined;
   record: SessionRecord;
   timeoutMs?: number;
   suppressWarnings?: boolean;
 }): Promise<void> {
-  const requestedModel = requestedModelId(params.requestedModel);
-  if (!requestedModel) {
-    return;
-  }
-
   const models = advertisedModelState(params.record.acpx);
-  const warning = assertRequestedModelSupported({
-    requestedModel,
+  const previousState = cloneSessionAcpxState(params.record.acpx);
+  const previousEffortConfigId = effortStateFromConfigOptions(
+    params.record.acpx?.config_options,
+  )?.configId;
+  const replacesEffort = Boolean(params.requestedEffort?.trim());
+  const application = await applyRequestedModelAndEffortIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
+    requestedModel: params.requestedModel,
+    requestedEffort: params.requestedEffort,
     models,
+    configOptions: params.record.acpx?.config_options,
     agentCommand: params.record.agentCommand,
-    context: "apply",
+    timeoutMs: params.timeoutMs,
+    onWarning: (warning) => emitModelSupportWarning(warning, params.suppressWarnings),
+    onModelApplied: (modelApplication) => {
+      applyRequestedModelPreferenceToRecord({
+        record: params.record,
+        application: modelApplication,
+        requestedModel: params.requestedModel,
+        initialModels: models,
+        previousEffortConfigId,
+        replacesEffort,
+      });
+    },
   });
-  emitModelSupportWarning(warning, params.suppressWarnings);
-  if (!models) {
-    return;
-  }
-  if (params.record.acpx?.current_model_id === requestedModel) {
-    setDesiredModelId(params.record, requestedModel, models.configId);
-    return;
-  }
+  applyConfigOptionsToRecord(params.record, application.effort.response);
 
-  const response = await withTimeout(
-    params.client.setSessionModel(params.sessionId, requestedModel, models),
-    params.timeoutMs,
-  );
-  applyConfigOptionsToRecord(params.record, response);
-  setDesiredModelId(params.record, requestedModel, models.configId);
-  setCurrentModelId(params.record, currentModelIdFromSetModelResponse(response, requestedModel));
+  if (application.effort.applied) {
+    setDesiredEffort(params.record, params.requestedEffort, application.effort.configId);
+  }
+  await reapplySavedPromptEffort({
+    client: params.client,
+    sessionId: params.sessionId,
+    record: params.record,
+    previousState,
+    replacesEffort,
+    timeoutMs: params.timeoutMs,
+  });
+}
+
+async function reapplySavedPromptEffort(params: {
+  client: AcpClient;
+  sessionId: string;
+  record: SessionRecord;
+  previousState: SessionAcpxState | undefined;
+  replacesEffort: boolean;
+  timeoutMs?: number;
+}): Promise<void> {
+  if (params.replacesEffort || params.record.acpx?.config_options === undefined) {
+    return;
+  }
+  const effort = await reapplyDesiredEffortAfterModelChange({
+    client: params.client,
+    sessionId: params.sessionId,
+    previousState: params.previousState,
+    nextState: params.record.acpx,
+    timeoutMs: params.timeoutMs,
+  });
+  params.record.acpx = effort.state;
 }
 
 function emitModelSupportWarning(warning: string | undefined, suppressWarnings?: boolean): void {
   if (warning && !suppressWarnings) {
     process.stderr.write(`[acpx] warning: ${warning}\n`);
   }
+}
+
+function storeActiveEffortPreference(params: {
+  state: SessionAcpxState;
+  effortConfigId: string;
+  effort: string;
+  previousEffortConfigId: string | undefined;
+}): void {
+  if (params.previousEffortConfigId !== params.effortConfigId) {
+    clearDesiredConfigOption(params.state, params.previousEffortConfigId);
+  }
+  params.state.session_options = { ...params.state.session_options, effort: params.effort };
+  params.state.desired_config_options = {
+    ...params.state.desired_config_options,
+    [params.effortConfigId]: params.effort,
+  };
+}
+
+function clearActiveEffortPreference(
+  state: SessionAcpxState,
+  previousEffortConfigId: string | undefined,
+): void {
+  clearDesiredConfigOption(state, previousEffortConfigId);
+  clearDesiredConfigOption(state, effortStateFromConfigOptions(state.config_options)?.configId);
+  const sessionOptions = { ...state.session_options };
+  delete sessionOptions.effort;
+  if (Object.keys(sessionOptions).length > 0) {
+    state.session_options = sessionOptions;
+  } else {
+    delete state.session_options;
+  }
+}
+
+function applyActiveModelPreferenceState(params: {
+  state: SessionAcpxState | undefined;
+  application: Awaited<ReturnType<typeof applyRequestedModelAndEffortIfAdvertised>>["model"];
+  modelId: string | undefined;
+  initialModelId: string | undefined;
+  modelConfigId: string | undefined;
+  previousEffortConfigId: string | undefined;
+  replacesEffort: boolean;
+}): SessionAcpxState {
+  const state = applyConfigOptionResponseToState(params.state, params.application.response);
+  const nextState = cloneSessionAcpxState(state) ?? {};
+  if (!params.application.applied) {
+    return nextState;
+  }
+  nextState.session_options = { ...nextState.session_options, model: params.modelId };
+  nextState.current_model_id = currentModelIdFromSetModelResponse(
+    params.application.response,
+    params.modelId,
+  );
+  clearDesiredConfigOption(nextState, params.modelConfigId);
+  if (params.replacesEffort && params.initialModelId !== params.modelId) {
+    clearActiveEffortPreference(nextState, params.previousEffortConfigId);
+  }
+  return nextState;
+}
+
+function applyActivePreferenceState(params: {
+  state: SessionAcpxState | undefined;
+  application: Awaited<ReturnType<typeof applyRequestedModelAndEffortIfAdvertised>>;
+  modelId: string | undefined;
+  initialModelId: string | undefined;
+  effort: string;
+  modelConfigId: string | undefined;
+  previousEffortConfigId: string | undefined;
+}): { state: SessionAcpxState; effortConfigId: string } {
+  let state = applyActiveModelPreferenceState({
+    state: params.state,
+    application: params.application.model,
+    modelId: params.modelId,
+    initialModelId: params.initialModelId,
+    modelConfigId: params.modelConfigId,
+    previousEffortConfigId: params.previousEffortConfigId,
+    replacesEffort: true,
+  });
+  state = applyConfigOptionResponseToState(state, params.application.effort.response) ?? state;
+  const nextState = cloneSessionAcpxState(state) ?? {};
+  const effortConfigId = params.application.effort.configId;
+  if (!effortConfigId) {
+    throw new Error("Applied effort did not resolve to an ACP session config option");
+  }
+  storeActiveEffortPreference({
+    state: nextState,
+    effortConfigId,
+    effort: params.effort,
+    previousEffortConfigId: params.previousEffortConfigId,
+  });
+  return { state: nextState, effortConfigId };
+}
+
+function notifyActiveModelState(
+  callback: ((state: SessionAcpxState) => void | Promise<void>) | undefined,
+  state: SessionAcpxState,
+): void | Promise<void> {
+  return callback?.(state);
+}
+
+function activePreferenceResponse(
+  application: Awaited<ReturnType<typeof applyRequestedModelAndEffortIfAdvertised>>,
+  state: SessionAcpxState,
+): Awaited<ReturnType<AcpClient["setSessionConfigOption"]>> {
+  return (
+    application.effort.response ??
+    application.model.response ?? {
+      configOptions: structuredClone(state.config_options ?? []),
+    }
+  );
+}
+
+function currentModelIdFromActiveState(state: SessionAcpxState, fallbackModelId: string): string {
+  return modelStateFromConfigOptions(state.config_options)?.currentModelId ?? fallbackModelId;
+}
+
+async function applyActiveSessionPreferences(params: {
+  client: AcpClient;
+  sessionId: string;
+  record: SessionRecord;
+  state: SessionAcpxState | undefined;
+  modelId: string | undefined;
+  effort: string;
+  onModelApplied?: (state: SessionAcpxState) => void | Promise<void>;
+}): Promise<{
+  state: SessionAcpxState;
+  effortConfigId: string;
+  response: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>;
+}> {
+  const models = advertisedModelState(params.state);
+  const previousEffortConfigId = effortStateFromConfigOptions(
+    params.state?.config_options,
+  )?.configId;
+  let state = params.state;
+  const application = await applyRequestedModelAndEffortIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
+    requestedModel: params.modelId,
+    requestedEffort: params.effort,
+    models,
+    configOptions: params.state?.config_options,
+    agentCommand: params.record.agentCommand,
+    onModelApplied: async (modelApplication) => {
+      state = applyActiveModelPreferenceState({
+        state,
+        application: modelApplication,
+        modelId: params.modelId,
+        initialModelId: models?.currentModelId,
+        modelConfigId: models?.configId,
+        previousEffortConfigId,
+        replacesEffort: true,
+      });
+      await notifyActiveModelState(params.onModelApplied, state);
+    },
+  });
+  const applied = applyActivePreferenceState({
+    state,
+    application,
+    modelId: params.modelId,
+    initialModelId: models?.currentModelId,
+    effort: params.effort,
+    modelConfigId: models?.configId,
+    previousEffortConfigId,
+  });
+  return {
+    ...applied,
+    response: activePreferenceResponse(application, applied.state),
+  };
+}
+
+function storeActiveConfigSelection(params: {
+  state: SessionAcpxState | undefined;
+  previousModelConfigId: string | undefined;
+  configId: string;
+  value: string;
+}): { state: SessionAcpxState; changedModel: boolean } {
+  const state = cloneSessionAcpxState(params.state) ?? {};
+  const modelConfigId = modelStateFromConfigOptions(state.config_options)?.configId;
+  const effortConfigId = effortStateFromConfigOptions(state.config_options)?.configId;
+  const changedModel =
+    params.configId === params.previousModelConfigId || params.configId === modelConfigId;
+  if (changedModel) {
+    state.session_options = { ...state.session_options, model: params.value };
+    state.current_model_id = currentModelIdFromActiveState(state, params.value);
+    clearDesiredConfigOption(state, params.configId);
+  } else if (params.configId === "mode") {
+    state.desired_mode_id = params.value;
+  } else if (params.configId === effortConfigId) {
+    storeActiveEffortPreference({
+      state,
+      effortConfigId: params.configId,
+      effort: params.value,
+      previousEffortConfigId: effortConfigId,
+    });
+  } else {
+    state.desired_config_options = {
+      ...state.desired_config_options,
+      [params.configId]: params.value,
+    };
+  }
+  return { state, changedModel };
+}
+
+async function setActiveSessionConfigOption(params: {
+  client: AcpClient;
+  sessionId: string;
+  state: SessionAcpxState | undefined;
+  configId: string;
+  value: string;
+}): Promise<{
+  state: SessionAcpxState;
+  response: Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>;
+}> {
+  const previousState = cloneSessionAcpxState(params.state);
+  const previousModelConfigId = modelStateFromConfigOptions(
+    previousState?.config_options,
+  )?.configId;
+  const response = await params.client.setSessionConfigOption(
+    params.sessionId,
+    params.configId,
+    params.value,
+  );
+  const responseState = applyConfigOptionResponseToState(params.state, response);
+  const stored = storeActiveConfigSelection({
+    state: responseState,
+    previousModelConfigId,
+    configId: params.configId,
+    value: params.value,
+  });
+  if (!stored.changedModel) {
+    return { state: stored.state, response };
+  }
+  const effort = await reapplyDesiredEffortAfterModelChange({
+    client: params.client,
+    sessionId: params.sessionId,
+    previousState,
+    nextState: stored.state,
+  });
+  return { state: effort.state, response: effort.response ?? response };
 }
 
 function jsonRpcIdKey(value: unknown): string | undefined {
@@ -657,6 +923,7 @@ function buildQueuedTaskRunOptions(
     verbose: options.verbose,
     promptRetries: task.promptRetries ?? options.promptRetries ?? 0,
     sessionOptions: mergeSessionOptions(task.sessionOptions, options.sessionOptions),
+    requestedEffort: task.sessionOptions?.effort,
     onClientAvailable: options.onClientAvailable,
     onClientClosed: options.onClientClosed,
     onPromptActive: options.onPromptActive,
@@ -906,6 +1173,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await client.setSessionMode(activeSessionIdForControl, modeId);
     },
     setSessionModel: async (modelId: string) => {
+      const previousState = cloneSessionAcpxState(acpxState);
       const models = advertisedModelState(acpxState);
       const response = await client.setSessionModel(activeSessionIdForControl, modelId, models);
       acpxState = applyConfigOptionResponseToState(acpxState, response);
@@ -914,31 +1182,55 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       nextState.current_model_id = currentModelIdFromSetModelResponse(response, modelId);
       clearDesiredConfigOption(nextState, models?.configId);
       acpxState = nextState;
-      return response;
+      if (!response) {
+        acpxState = clearDesiredEffortAfterUnrefreshedModelChange({
+          state: acpxState,
+          modelResponse: response,
+          previousModelId: models?.currentModelId,
+          requestedModelId: modelId,
+          previousEffortConfigId: effortStateFromConfigOptions(previousState?.config_options)
+            ?.configId,
+        });
+        return response;
+      }
+      const effort = await reapplyDesiredEffortAfterModelChange({
+        client,
+        sessionId: activeSessionIdForControl,
+        previousState,
+        nextState: acpxState,
+      });
+      acpxState = effort.state;
+      return effort.response ?? response;
     },
     setSessionConfigOption: async (configId: string, value: string) => {
-      const response = await client.setSessionConfigOption(
-        activeSessionIdForControl,
+      const result = await setActiveSessionConfigOption({
+        client,
+        sessionId: activeSessionIdForControl,
+        state: acpxState,
         configId,
         value,
-      );
-      acpxState = applyConfigOptionResponseToState(acpxState, response);
-      const nextState = cloneSessionAcpxState(acpxState) ?? {};
-      const modelConfigId = modelStateFromConfigOptions(nextState.config_options)?.configId;
-      if (configId === modelConfigId) {
-        nextState.session_options = { ...nextState.session_options, model: value };
-        nextState.current_model_id = currentModelIdFromSetModelResponse(response, value);
-        clearDesiredConfigOption(nextState, configId);
-      } else if (configId === "mode") {
-        nextState.desired_mode_id = value;
-      } else {
-        nextState.desired_config_options = {
-          ...nextState.desired_config_options,
-          [configId]: value,
-        };
-      }
-      acpxState = nextState;
-      return response;
+      });
+      acpxState = result.state;
+      return result.response;
+    },
+    applySessionPreferences: async (modelId: string | undefined, effort: string) => {
+      const result = await applyActiveSessionPreferences({
+        client,
+        sessionId: activeSessionIdForControl,
+        record,
+        state: acpxState,
+        modelId,
+        effort,
+        onModelApplied: async (state) => {
+          acpxState = state;
+          await liveCheckpoint.checkpoint();
+        },
+      });
+      acpxState = result.state;
+      return {
+        effortConfigId: result.effortConfigId,
+        response: result.response,
+      };
     },
   };
 
@@ -963,8 +1255,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           verbose: options.verbose,
           suppressWarnings: options.suppressSdkConsoleErrors,
           activeController,
-          onClientAvailable: (controller) => {
-            options.onClientAvailable?.(controller);
+          onClientAvailable: () => {
+            options.onClientAvailable?.(activeController);
             notifiedClientAvailable = true;
           },
           onConnectedRecord: (connectedRecord) => {
@@ -1104,15 +1396,17 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const runPrompt = async (): Promise<SessionSendResult> => {
     const { sessionId: activeSessionId, resumed, loadError } = await connectForPrompt();
 
-    await applyPromptModelIfAdvertised({
+    await applyPromptPreferences({
       client,
       sessionId: activeSessionId,
       requestedModel: sessionOptions?.model,
+      requestedEffort: options.requestedEffort,
       record,
       timeoutMs: options.timeoutMs,
       suppressWarnings: options.suppressSdkConsoleErrors,
+    }).finally(() => {
+      acpxState = cloneSessionAcpxState(record.acpx);
     });
-    acpxState = cloneSessionAcpxState(record.acpx);
 
     output.setContext({
       sessionId: record.acpxRecordId,
@@ -1268,11 +1562,13 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
           );
         });
         const sessionId = createdSession.sessionId;
-        await applyRequestedModelIfAdvertised({
+        await applyRequestedModelAndEffortIfAdvertised({
           client,
           sessionId,
           requestedModel: options.sessionOptions?.model,
+          requestedEffort: options.sessionOptions?.effort,
           models: createdSession.models,
+          configOptions: createdSession.configOptions,
           agentCommand: options.agentCommand,
           timeoutMs: options.timeoutMs,
           onWarning: options.suppressSdkConsoleErrors
@@ -1327,6 +1623,8 @@ export async function sendSessionDirect(options: SessionSendOptions): Promise<Se
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     client: options.client,
+    sessionOptions: options.sessionOptions,
+    requestedEffort: options.sessionOptions?.effort,
   });
 }
 

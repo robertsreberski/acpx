@@ -3,14 +3,21 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { splitCommandLine } from "../../acp/client-process.js";
+import { effortStateFromConfigOptions } from "../../acp/effort-support.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
+import { cloneSessionAcpxState } from "../../session/conversation-model.js";
 import {
+  reconcileDesiredEffortForModelChange,
   setCurrentModelId,
   setDesiredConfigOption,
+  setDesiredEffort,
   setDesiredModeId,
   setDesiredModelId,
 } from "../../session/mode-preference.js";
-import { currentModelIdFromSetModelResponse } from "../../session/model-application.js";
+import {
+  clearDesiredEffortAfterUnrefreshedModelChange,
+  currentModelIdFromSetModelResponse,
+} from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import { resolveSessionRecord, writeSessionRecord, isoNow } from "../../session/persistence.js";
 import type {
@@ -24,6 +31,7 @@ import {
   terminateProcess,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
+  tryApplySessionPreferencesOnRunningOwner,
   tryCloseSessionOnRunningOwner,
   trySetConfigOptionOnRunningOwner,
   trySetModelOnRunningOwner,
@@ -32,11 +40,13 @@ import {
 import type {
   SessionCancelOptions,
   SessionCancelResult,
+  SessionApplyPreferencesOptions,
   SessionSetConfigOptionOptions,
   SessionSetModelOptions,
   SessionSetModeOptions,
 } from "./contracts.js";
 import {
+  runSessionApplyPreferencesDirect,
   runSessionSetConfigOptionDirect,
   runSessionSetModelDirect,
   runSessionSetModeDirect,
@@ -98,12 +108,25 @@ export async function setSessionModel(
   );
   if (submittedToOwner) {
     const record = await resolveSessionRecord(options.sessionId);
+    const previousState = cloneSessionAcpxState(record.acpx);
     applyConfigOptionsToRecord(record, submittedToOwner.response);
     setDesiredModelId(record, options.modelId, advertisedModelState(record.acpx)?.configId);
     setCurrentModelId(
       record,
       currentModelIdFromSetModelResponse(submittedToOwner.response, options.modelId),
     );
+    if (submittedToOwner.response) {
+      record.acpx = reconcileDesiredEffortForModelChange(previousState, record.acpx).state;
+    } else {
+      record.acpx = clearDesiredEffortAfterUnrefreshedModelChange({
+        state: record.acpx,
+        modelResponse: submittedToOwner.response,
+        previousModelId: advertisedModelState(previousState)?.currentModelId,
+        requestedModelId: options.modelId,
+        previousEffortConfigId: effortStateFromConfigOptions(previousState?.config_options)
+          ?.configId,
+      });
+    }
     await writeSessionRecord(record);
     return {
       record,
@@ -126,9 +149,126 @@ export async function setSessionModel(
   });
 }
 
+export async function applySessionPreferences(
+  options: SessionApplyPreferencesOptions,
+): Promise<SessionSetConfigOptionResult> {
+  const ownerResult = await tryApplySessionPreferencesOnRunningOwner({
+    sessionId: options.sessionId,
+    modelId: options.modelId,
+    effort: options.effort,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
+  if (ownerResult) {
+    const record = await resolveSessionRecord(options.sessionId);
+    const previousEffortConfigId = effortStateFromConfigOptions(
+      record.acpx?.config_options,
+    )?.configId;
+    const modelConfigId = advertisedModelState(record.acpx)?.configId;
+    applyConfigOptionsToRecord(record, ownerResult.response);
+    if (options.modelId) {
+      setDesiredModelId(record, options.modelId, modelConfigId);
+      setCurrentModelId(
+        record,
+        currentModelIdFromSetModelResponse(ownerResult.response, options.modelId),
+      );
+    }
+    if (previousEffortConfigId && previousEffortConfigId !== ownerResult.effortConfigId) {
+      setDesiredConfigOption(record, previousEffortConfigId, undefined);
+    }
+    setDesiredEffort(record, options.effort, ownerResult.effortConfigId);
+    await writeSessionRecord(record);
+    return {
+      record,
+      response: ownerResult.response,
+      resumed: false,
+    };
+  }
+
+  const result = await runSessionApplyPreferencesDirect({
+    sessionRecordId: options.sessionId,
+    modelId: options.modelId,
+    effort: options.effort,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    fs: options.fs,
+    terminal: options.terminal,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+    onModelWarning: options.onModelWarning,
+  });
+  return {
+    record: result.record,
+    response: result.response,
+    resumed: result.resumed,
+    loadError: result.loadError,
+  };
+}
+
+async function applyPortableEffortIfAdvertised(
+  options: SessionSetConfigOptionOptions,
+): Promise<SessionSetConfigOptionResult | undefined> {
+  const storedRecord = await resolveSessionRecord(options.sessionId);
+  const portableEffortConfigId = effortStateFromConfigOptions(
+    storedRecord.acpx?.config_options,
+  )?.configId;
+  if (options.configId !== portableEffortConfigId) {
+    return undefined;
+  }
+
+  return await applySessionPreferences({
+    sessionId: options.sessionId,
+    effort: options.value,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    fs: options.fs,
+    terminal: options.terminal,
+    timeoutMs: options.timeoutMs,
+    verbose: options.verbose,
+  });
+}
+
+async function applyOwnerConfigOptionResult(params: {
+  options: SessionSetConfigOptionOptions;
+  response: SessionSetConfigOptionResult["response"];
+}): Promise<SessionSetConfigOptionResult> {
+  const { options, response } = params;
+  const record = await resolveSessionRecord(options.sessionId);
+  const previousState = cloneSessionAcpxState(record.acpx);
+  const modelConfigId = advertisedModelState(record.acpx)?.configId;
+  applyConfigOptionsToRecord(record, response);
+  const effortConfigId = effortStateFromConfigOptions(record.acpx?.config_options)?.configId;
+  if (options.configId === modelConfigId) {
+    setDesiredModelId(record, options.value, options.configId);
+    setCurrentModelId(record, currentModelIdFromSetModelResponse(response, options.value));
+    record.acpx = reconcileDesiredEffortForModelChange(previousState, record.acpx).state;
+  } else if (options.configId === "mode") {
+    setDesiredModeId(record, options.value);
+  } else if (options.configId === effortConfigId) {
+    setDesiredEffort(record, options.value, options.configId);
+  } else {
+    setDesiredConfigOption(record, options.configId, options.value);
+  }
+  await writeSessionRecord(record);
+  return {
+    record,
+    response,
+    resumed: false,
+  };
+}
+
 export async function setSessionConfigOption(
   options: SessionSetConfigOptionOptions,
 ): Promise<SessionSetConfigOptionResult> {
+  const portableEffortResult = await applyPortableEffortIfAdvertised(options);
+  if (portableEffortResult) {
+    return portableEffortResult;
+  }
+
   const ownerResponse = await trySetConfigOptionOnRunningOwner(
     options.sessionId,
     options.configId,
@@ -137,23 +277,7 @@ export async function setSessionConfigOption(
     options.verbose,
   );
   if (ownerResponse) {
-    const record = await resolveSessionRecord(options.sessionId);
-    const modelConfigId = advertisedModelState(record.acpx)?.configId;
-    applyConfigOptionsToRecord(record, ownerResponse);
-    if (options.configId === modelConfigId) {
-      setDesiredModelId(record, options.value, options.configId);
-      setCurrentModelId(record, currentModelIdFromSetModelResponse(ownerResponse, options.value));
-    } else if (options.configId === "mode") {
-      setDesiredModeId(record, options.value);
-    } else {
-      setDesiredConfigOption(record, options.configId, options.value);
-    }
-    await writeSessionRecord(record);
-    return {
-      record,
-      response: ownerResponse,
-      resumed: false,
-    };
+    return await applyOwnerConfigOptionResult({ options, response: ownerResponse });
   }
 
   return await runSessionSetConfigOptionDirect({
