@@ -79,6 +79,27 @@ test("console releases reject dependency ranges and workspace references", () =>
   }
 });
 
+test("release planning rejects unexpected manifest names before selecting a route", () => {
+  assert.throws(
+    () =>
+      resolveReleasePlan({
+        releaseTag: "console-v0.1.0",
+        rootPackage: { name: "acpx-renamed", version: "not-a-release-version" },
+        consolePackage,
+      }),
+    /Root package manifest name must be exactly acpx; found acpx-renamed/,
+  );
+  assert.throws(
+    () =>
+      resolveReleasePlan({
+        releaseTag: "v0.13.0-fork.3",
+        rootPackage: { name: "acpx", version: "0.13.0-fork.3" },
+        consolePackage: { ...consolePackage, name: "acpx-console-renamed", version: "invalid" },
+      }),
+    /Console package manifest name must be exactly acpx-console; found acpx-console-renamed/,
+  );
+});
+
 test("release tags must exactly match the selected package version", () => {
   assert.throws(
     () =>

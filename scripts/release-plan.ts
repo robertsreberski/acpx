@@ -49,6 +49,14 @@ export function resolveReleasePlan(input: {
   consolePackage: ReleasePackage;
 }): ReleasePlan {
   const { releaseTag, rootPackage, consolePackage } = input;
+  if (rootPackage.name !== "acpx") {
+    fail(`Root package manifest name must be exactly acpx; found ${rootPackage.name}`);
+  }
+  if (consolePackage.name !== "acpx-console") {
+    fail(
+      `Console package manifest name must be exactly acpx-console; found ${consolePackage.name}`,
+    );
+  }
   if (releaseTag.startsWith("console-v")) {
     if (!STABLE_VERSION.test(consolePackage.version)) {
       fail(`Console release versions must match X.Y.Z; received ${consolePackage.version}`);
