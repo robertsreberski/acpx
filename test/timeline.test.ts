@@ -7,7 +7,7 @@ import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { sessionRuntimeTestInternals } from "../src/cli/session/runtime.js";
 import { defaultSessionEventLog } from "../src/session/event-log.js";
-import { sessionEventActivePath } from "../src/session/event-log.js";
+import { sessionEventActivePath, sessionEventSegmentPath } from "../src/session/event-log.js";
 import {
   SessionEventAppendError,
   SessionEventWriter,
@@ -813,6 +813,66 @@ test("a transcript read waiting behind prune cannot resurrect the primary record
     await assert.rejects(waitingRead, /Session not found/i);
     await assert.rejects(resolveSessionRecord(record.acpxRecordId), /Session not found/i);
     assert.equal(sessionTimelineTestInternals.timelineLockQueueDepth(record.acpxRecordId), 0);
+  });
+});
+
+test("legacy rotation between enumeration and open neither loses nor duplicates either inode", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-legacy-rotation-race", cwd);
+    record.lastSeq = 2;
+    record.eventLog.last_write_at = "2026-08-12T10:00:00.000Z";
+    await writeSessionRecord(record);
+    const activePath = sessionEventActivePath(record.acpxRecordId);
+    const segmentPath = sessionEventSegmentPath(record.acpxRecordId, 1);
+    const first = updateMessage(record.acpSessionId, "before rotation");
+    const second = updateMessage(record.acpSessionId, "after rotation");
+    await fs.writeFile(activePath, `${JSON.stringify(first)}\n`, "utf8");
+
+    sessionTimelineTestInternals.beforeNextLegacySourceOpen(async (source) => {
+      assert.equal(source.filePath, activePath);
+      await fs.rename(activePath, segmentPath);
+      await fs.writeFile(activePath, `${JSON.stringify(second)}\n`, "utf8");
+    });
+
+    assert.equal(await SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId), true);
+    assert.equal(
+      await SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId),
+      false,
+    );
+    assert.equal(
+      await SessionTimelineWriter.refreshLegacyCompatibility(record.acpxRecordId),
+      false,
+    );
+    const page = await listSessionTimelinePage(record.acpxRecordId, { limit: 20 });
+    assert.deepEqual(
+      page.items.flatMap((item) =>
+        "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+      ),
+      [first, second],
+    );
+  });
+});
+
+test("an unlink failure cannot poison the in-process timeline lock queue", async () => {
+  await withTempHome(async () => {
+    const sessionId = "timeline-release-recovery";
+    sessionTimelineTestInternals.failNextTimelineLockUnlinks(3);
+    await assert.rejects(
+      withSessionTimelineLock(sessionId, async () => "first"),
+      /Injected timeline lock unlink failure/,
+    );
+    assert.equal(sessionTimelineTestInternals.timelineLockQueueDepth(sessionId), 0);
+
+    const second = await Promise.race([
+      withSessionTimelineLock(sessionId, async () => "second"),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("second timeline lock operation stalled")), 1_000),
+      ),
+    ]);
+    assert.equal(second, "second");
+    assert.equal(sessionTimelineTestInternals.timelineLockQueueDepth(sessionId), 0);
   });
 });
 

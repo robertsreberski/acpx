@@ -627,7 +627,8 @@ function parseTimeline(raw: unknown): SessionTimelineMetadata | null | undefined
     legacy_retained: record.legacy_retained,
     // Metadata written before the retained-stream importer existed represents
     // an already-active epoch. Treat it as complete rather than appending old
-    // compatibility messages after newer lossless events.
+    // compatibility messages after newer lossless events. New metadata keeps
+    // this false while a legacy owner can append, reserving one final scan.
     legacy_import_complete:
       typeof record.legacy_import_complete === "boolean" ? record.legacy_import_complete : true,
     legacy_import_sources: parseLegacyImportSources(record.legacy_import_sources),

@@ -125,9 +125,14 @@ type TimelineCursor = {
   seq: number;
 };
 
-type TimelineLock = { filePath: string };
+type TimelineLock = { filePath: string; ownerId: string };
 const timelineLockQueues = new Map<string, Promise<void>>();
 const timelineLockQueueDepths = new Map<string, number>();
+const ownedTimelineLocks = new Map<string, { ownerId: string; state: "held" | "reclaimable" }>();
+let beforeLegacySourceOpen:
+  | ((source: LegacyCompatibilitySource) => Promise<void> | void)
+  | undefined;
+let timelineLockUnlinkFailures = 0;
 
 function timelinePath(sessionId: string, epoch: string): string {
   return path.join(
@@ -193,6 +198,8 @@ type LegacySourceRead = {
   bytesRead: number;
   discardingLine: boolean;
   trailingFragment: boolean;
+  /** The enumerated pathname changed identity before it could be opened. */
+  sourceChanged: boolean;
 };
 
 async function legacyCompatibilitySources(
@@ -268,9 +275,44 @@ async function readLegacySource(input: {
   byteBudget: number;
   messageBudget: number;
 }): Promise<LegacySourceRead> {
-  const handle = await fs.open(input.source.filePath, "r");
+  const beforeOpen = beforeLegacySourceOpen;
+  beforeLegacySourceOpen = undefined;
+  await beforeOpen?.(input.source);
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    let position = Math.min(input.cursor.offset, input.source.size);
+    handle = await fs.open(input.source.filePath, "r");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        messages: [],
+        offset: input.cursor.offset,
+        bytesRead: 0,
+        discardingLine: input.cursor.discarding_line === true,
+        trailingFragment: input.cursor.trailing_fragment === true,
+        sourceChanged: true,
+      };
+    }
+    throw error;
+  }
+  try {
+    // A pre-timeline writer rotates under its own stream lock. The pathname
+    // enumerated above can therefore name a new inode by the time it is
+    // opened. Only the opened handle is authoritative: never advance the old
+    // inode's cursor with bytes from its replacement.
+    const openedStat = await handle.stat();
+    const openedIdentity = `${String(openedStat.dev)}:${String(openedStat.ino)}`;
+    if (openedIdentity !== input.source.identity) {
+      return {
+        messages: [],
+        offset: input.cursor.offset,
+        bytesRead: 0,
+        discardingLine: input.cursor.discarding_line === true,
+        trailingFragment: input.cursor.trailing_fragment === true,
+        sourceChanged: true,
+      };
+    }
+    const sourceSize = openedStat.size;
+    let position = Math.min(input.cursor.offset, sourceSize);
     let committedOffset = position;
     let carry = Buffer.alloc(0);
     let carryStart = position;
@@ -278,13 +320,13 @@ async function readLegacySource(input: {
     let discardingLine = input.cursor.discarding_line === true;
     const messages: LegacyCompatibilityMessage[] = [];
     while (
-      position < input.source.size &&
+      position < sourceSize &&
       bytesReadTotal < input.byteBudget &&
       messages.length < input.messageBudget
     ) {
       const bytesToRead = Math.min(
         LEGACY_READ_CHUNK_BYTES,
-        input.source.size - position,
+        sourceSize - position,
         input.byteBudget - bytesReadTotal,
       );
       if (bytesToRead <= 0) {
@@ -323,14 +365,15 @@ async function readLegacySource(input: {
       bytesRead: bytesReadTotal,
       discardingLine,
       trailingFragment:
-        position === input.source.size && carry.length > 0 && messages.length < input.messageBudget,
+        position === sourceSize && carry.length > 0 && messages.length < input.messageBudget,
+      sourceChanged: false,
     };
   } finally {
     await handle.close();
   }
 }
 
-function parseLock(raw: string): { pid?: number; createdAt?: string } {
+function parseLock(raw: string): { pid?: number; createdAt?: string; ownerId?: string } {
   try {
     const value = JSON.parse(raw) as unknown;
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -340,6 +383,7 @@ function parseLock(raw: string): { pid?: number; createdAt?: string } {
     return {
       pid: typeof record.pid === "number" ? record.pid : undefined,
       createdAt: typeof record.created_at === "string" ? record.created_at : undefined,
+      ownerId: typeof record.owner_id === "string" ? record.owner_id : undefined,
     };
   } catch {
     return {};
@@ -353,6 +397,17 @@ function lockOwnerIsAlive(pid: number | undefined): boolean {
 async function removeStaleLock(filePath: string): Promise<boolean> {
   try {
     const parsed = parseLock(await fs.readFile(filePath, "utf8"));
+    const locallyOwned = ownedTimelineLocks.get(filePath);
+    if (
+      parsed.pid === process.pid &&
+      parsed.ownerId !== undefined &&
+      locallyOwned?.ownerId === parsed.ownerId &&
+      locallyOwned.state === "reclaimable"
+    ) {
+      await fs.unlink(filePath);
+      ownedTimelineLocks.delete(filePath);
+      return true;
+    }
     // Timeline locks cover one append/checkpoint critical section. Filesystem
     // I/O can still pause indefinitely, so a live owner remains authoritative
     // regardless of the lock's age.
@@ -369,11 +424,17 @@ async function removeStaleLock(filePath: string): Promise<boolean> {
 async function acquireTimelineLock(sessionId: string): Promise<TimelineLock> {
   await fs.mkdir(sessionBaseDir(), { recursive: true });
   const filePath = timelineLockPath(sessionId);
-  const payload = `${JSON.stringify({ pid: process.pid, created_at: isoNow() })}\n`;
+  const ownerId = randomUUID();
+  const payload = `${JSON.stringify({
+    pid: process.pid,
+    created_at: isoNow(),
+    owner_id: ownerId,
+  })}\n`;
   for (;;) {
     try {
       await fs.writeFile(filePath, payload, { encoding: "utf8", flag: "wx" });
-      return { filePath };
+      ownedTimelineLocks.set(filePath, { ownerId, state: "held" });
+      return { filePath, ownerId };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
@@ -387,11 +448,32 @@ async function acquireTimelineLock(sessionId: string): Promise<TimelineLock> {
 }
 
 async function releaseTimelineLock(lock: TimelineLock): Promise<void> {
-  await fs.unlink(lock.filePath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      if (timelineLockUnlinkFailures > 0) {
+        timelineLockUnlinkFailures -= 1;
+        throw Object.assign(new Error("Injected timeline lock unlink failure"), { code: "EBUSY" });
+      }
+      await fs.unlink(lock.filePath);
+      ownedTimelineLocks.delete(lock.filePath);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        ownedTimelineLocks.delete(lock.filePath);
+        return;
+      }
+      lastError = error;
+      if (attempt < 2) {
+        await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      }
     }
-  });
+  }
+  const owned = ownedTimelineLocks.get(lock.filePath);
+  if (owned?.ownerId === lock.ownerId) {
+    owned.state = "reclaimable";
+  }
+  throw lastError;
 }
 
 /**
@@ -417,18 +499,23 @@ export async function withSessionTimelineLock<T>(
     lock = await acquireTimelineLock(sessionId);
     return await operation();
   } finally {
-    if (lock) {
-      await releaseTimelineLock(lock);
-    }
-    releaseLocal();
-    if (timelineLockQueues.get(sessionId) === tail) {
-      timelineLockQueues.delete(sessionId);
-    }
-    const depth = (timelineLockQueueDepths.get(sessionId) ?? 1) - 1;
-    if (depth === 0) {
-      timelineLockQueueDepths.delete(sessionId);
-    } else {
-      timelineLockQueueDepths.set(sessionId, depth);
+    try {
+      if (lock) {
+        await releaseTimelineLock(lock);
+      }
+    } finally {
+      // Filesystem cleanup must never poison the in-process FIFO. A failed
+      // unlink leaves this operation's token reclaimable by the next waiter.
+      releaseLocal();
+      if (timelineLockQueues.get(sessionId) === tail) {
+        timelineLockQueues.delete(sessionId);
+      }
+      const depth = (timelineLockQueueDepths.get(sessionId) ?? 1) - 1;
+      if (depth === 0) {
+        timelineLockQueueDepths.delete(sessionId);
+      } else {
+        timelineLockQueueDepths.set(sessionId, depth);
+      }
     }
   }
 }
@@ -730,11 +817,21 @@ export class SessionTimelineWriter {
     return new SessionTimelineWriter(record, metadata);
   }
 
-  static async refreshLegacyCompatibility(sessionId: string): Promise<boolean> {
+  static async refreshLegacyCompatibility(
+    sessionId: string,
+    options: { legacyOwnerCanAppend?: boolean } = {},
+  ): Promise<boolean> {
     return await withSessionTimelineLock(sessionId, async () => {
       const record = await resolveSessionRecord(sessionId);
       const writer = await SessionTimelineWriter.openWhileLocked(record);
       const pending = await writer.importLegacyCompatibilityMessagesBounded();
+      if (options.legacyOwnerCanAppend === true) {
+        // A caught-up legacy stream is only a snapshot while its owner lives.
+        // Persist the need for one final scan so an owner that appends and then
+        // exits cannot strand its suffix forever. The next no-owner read or a
+        // modern writer performs that catch-up before declaring completion.
+        writer.metadata.legacy_import_complete = false;
+      }
       await checkpointTimelineMetadata(record, writer.metadata);
       return pending;
     });
@@ -795,6 +892,7 @@ export class SessionTimelineWriter {
     }
     let bytesRemaining = LEGACY_IMPORT_MAX_BYTES_PER_READ;
     let messagesRemaining = LEGACY_IMPORT_MAX_MESSAGES_PER_READ;
+    let sourceChanged = false;
     for (const source of sources) {
       if (bytesRemaining <= 0 || messagesRemaining <= 0) {
         break;
@@ -817,6 +915,10 @@ export class SessionTimelineWriter {
         byteBudget: bytesRemaining,
         messageBudget: messagesRemaining,
       });
+      if (read.sourceChanged) {
+        sourceChanged = true;
+        break;
+      }
       bytesRemaining -= read.bytesRead;
       for (const imported of read.messages) {
         await this.appendWithoutLock({
@@ -846,14 +948,16 @@ export class SessionTimelineWriter {
       await checkpointTimelineMetadata(this.record, this.metadata);
     }
     const latestSources = await legacyCompatibilitySources(this.record);
-    const pending = latestSources.some((source) => {
-      const cursor = cursors.find((entry) => entry.source_identity === source.identity);
-      return (
-        !cursor ||
-        (cursor.offset < source.size && cursor.trailing_fragment !== true) ||
-        (cursor.discarding_line === true && cursor.trailing_fragment !== true)
-      );
-    });
+    const pending =
+      sourceChanged ||
+      latestSources.some((source) => {
+        const cursor = cursors.find((entry) => entry.source_identity === source.identity);
+        return (
+          !cursor ||
+          (cursor.offset < source.size && cursor.trailing_fragment !== true) ||
+          (cursor.discarding_line === true && cursor.trailing_fragment !== true)
+        );
+      });
     this.metadata.legacy_import_complete = !pending;
     return pending;
   }
@@ -1494,6 +1598,14 @@ export async function deleteSessionTimelineWhileLocked(sessionId: string): Promi
 export const sessionTimelineTestInternals = {
   removeStaleLock,
   readTimelineEventsBackward,
+  beforeNextLegacySourceOpen: (
+    hook: (source: LegacyCompatibilitySource) => Promise<void> | void,
+  ): void => {
+    beforeLegacySourceOpen = hook;
+  },
+  failNextTimelineLockUnlinks: (count = 1): void => {
+    timelineLockUnlinkFailures = count;
+  },
   timelineLockQueueDepth: (sessionId: string): number =>
     timelineLockQueueDepths.get(sessionId) ?? 0,
 };

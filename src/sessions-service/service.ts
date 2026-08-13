@@ -947,6 +947,7 @@ class SessionService implements AcpxSessionService {
       // append more compatibility traffic after an earlier scan completed.
       legacyImportPending = await SessionTimelineWriter.refreshLegacyCompatibility(
         record.acpxRecordId,
+        { legacyOwnerCanAppend },
       );
     }
     const page = await listSessionTimelinePage(input.acpxRecordId, {

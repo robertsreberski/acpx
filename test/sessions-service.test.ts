@@ -232,6 +232,133 @@ test("a live legacy owner can append its first retained message after an empty r
   });
 });
 
+test("the final legacy suffix is recovered after its owner exits", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-final-legacy-suffix",
+      acpSessionId: "provider-final-legacy-suffix",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const firstMessage = retainedMessage(record.acpSessionId, "Before owner exit");
+    const finalMessage = retainedMessage(record.acpSessionId, "Final owner suffix");
+    record.lastSeq = 2;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    const streamPath = sessionEventActivePath(record.acpxRecordId);
+    await fs.writeFile(streamPath, `${JSON.stringify(firstMessage)}\n`, "utf8");
+    const keeper = await startKeeperProcess();
+    const ownerPaths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...ownerPaths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      queueProtocol: 1,
+    });
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const first = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.deepEqual(
+        first.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        ),
+        [firstMessage],
+      );
+      assert.equal(
+        (await resolveSessionRecord(record.acpxRecordId)).timeline?.legacy_import_complete,
+        false,
+      );
+
+      await fs.appendFile(streamPath, `${JSON.stringify(finalMessage)}\n`, "utf8");
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+
+      const caughtUp = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const repeated = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      const messages = (page: typeof caughtUp) =>
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        );
+      assert.deepEqual(messages(caughtUp), [firstMessage, finalMessage]);
+      assert.deepEqual(messages(repeated), [firstMessage, finalMessage]);
+      assert.equal(
+        (await resolveSessionRecord(record.acpxRecordId)).timeline?.legacy_import_complete,
+        true,
+      );
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("a modern writer catches the final legacy suffix before writing compatibility twins", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "session-legacy-to-modern-handoff",
+      acpSessionId: "provider-legacy-to-modern-handoff",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    const first = retainedMessage(record.acpSessionId, "Legacy first");
+    const suffix = retainedMessage(record.acpSessionId, "Legacy final suffix");
+    const modern = retainedMessage(record.acpSessionId, "Modern event");
+    record.lastSeq = 2;
+    record.eventLog.last_write_at = "2026-08-13T08:00:00.000Z";
+    await writeSessionRecordFile(homeDir, record);
+    const streamPath = sessionEventActivePath(record.acpxRecordId);
+    await fs.writeFile(streamPath, `${JSON.stringify(first)}\n`, "utf8");
+    const keeper = await startKeeperProcess();
+    const ownerPaths = queuePaths(homeDir, record.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...ownerPaths,
+      pid: keeper.pid,
+      sessionId: record.acpxRecordId,
+      queueProtocol: 1,
+    });
+    const service = createAcpxSessionService({ cwd });
+    try {
+      await service.getTranscriptPage({ acpxRecordId: record.acpxRecordId, limit: 20 });
+      await fs.appendFile(streamPath, `${JSON.stringify(suffix)}\n`, "utf8");
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+
+      const writer = await SessionEventWriter.open(await resolveSessionRecord(record.acpxRecordId));
+      await writer.appendMessage(modern);
+      await writer.close({ checkpoint: true });
+
+      const page = await service.getTranscriptPage({
+        acpxRecordId: record.acpxRecordId,
+        limit: 20,
+      });
+      assert.deepEqual(
+        page.items.flatMap((item) =>
+          "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+        ),
+        [first, suffix, modern],
+      );
+    } finally {
+      service.dispose();
+      await cleanupOwnerArtifacts(ownerPaths);
+      stopProcess(keeper);
+    }
+  });
+});
+
 test("modern timeline appends are not re-imported from their compatibility copy", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

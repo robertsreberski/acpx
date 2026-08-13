@@ -291,7 +291,7 @@ export type SessionTimelineMetadata = {
   last_write_error?: string | null;
   /** True when events existed before the lossless timeline was enabled. */
   legacy_retained: boolean;
-  /** True when every compatibility stream was caught up at the last bounded scan. */
+  /** True when compatibility streams were caught up after the last legacy owner disappeared. */
   legacy_import_complete?: boolean;
   /** Resumable compatibility-stream cursors, keyed by filesystem identity. */
   legacy_import_sources?: SessionTimelineLegacyImportSource[];
