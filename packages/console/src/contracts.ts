@@ -131,7 +131,10 @@ export interface AcpxConsoleSessionService {
     turnId: string;
     idempotencyKey: string;
   }): Promise<{ turnId: string; state: TurnState }>;
-  closeSession(input: { acpxRecordId: string; idempotencyKey: string }): Promise<ConsoleSession>;
+  closeSession(input: {
+    acpxRecordId: string;
+    idempotencyKey: string;
+  }): Promise<ConsoleCloseSessionResult>;
   listPendingRequests(input: { acpxRecordId: string }): Promise<PendingInteraction[]>;
   respondToPendingRequest(input: {
     acpxRecordId: string;
@@ -146,6 +149,17 @@ export interface AcpxConsoleSessionService {
   }): Promise<TimelinePage>;
   subscribe?(listener: (event: ServiceInvalidation) => void): () => void;
   dispose?(): Promise<void> | void;
+}
+
+export interface ConsoleCloseSessionResult {
+  session: ConsoleSession;
+  localClose: "closed";
+  providerClose:
+    | { status: "confirmed" }
+    | {
+        status: "degraded";
+        reason: "owner_absent" | "unsupported" | "provider_error";
+      };
 }
 
 export interface ConsoleBootstrap {

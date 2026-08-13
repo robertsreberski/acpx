@@ -269,11 +269,37 @@ function splitCommandLineLike(commandLine: string | undefined): string[] {
 
 export const sessionControlTestInternals = { firstAgentCommandToken, splitCommandLineLike };
 
-export async function closeSession(sessionId: string): Promise<SessionRecord> {
+export type SessionProviderCloseResult =
+  | { status: "confirmed" }
+  | {
+      status: "degraded";
+      reason: "owner_absent" | "unsupported" | "provider_error";
+    };
+
+export type SessionCloseResult = {
+  record: SessionRecord;
+  providerClose: SessionProviderCloseResult;
+};
+
+/**
+ * Soft-close locally even when the live adapter cannot confirm session/close,
+ * while retaining a browser-safe account of that provider-side outcome.
+ */
+export async function closeSessionWithResult(sessionId: string): Promise<SessionCloseResult> {
   const record = await resolveSessionRecord(sessionId);
-  await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
-    // Preserve local close semantics even if best-effort ACP session shutdown fails.
-  });
+  let providerClose: SessionProviderCloseResult;
+  try {
+    const closed = await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId });
+    providerClose =
+      closed === true
+        ? { status: "confirmed" }
+        : closed === false
+          ? { status: "degraded", reason: "unsupported" }
+          : { status: "degraded", reason: "owner_absent" };
+  } catch {
+    // Never expose adapter or transport error text through the public close receipt.
+    providerClose = { status: "degraded", reason: "provider_error" };
+  }
   await terminateQueueOwnerForSession(record.acpxRecordId);
 
   if (
@@ -289,5 +315,9 @@ export async function closeSession(sessionId: string): Promise<SessionRecord> {
   record.closedAt = isoNow();
   await writeSessionRecordWithLatestTimeline(record);
 
-  return record;
+  return { record, providerClose };
+}
+
+export async function closeSession(sessionId: string): Promise<SessionRecord> {
+  return (await closeSessionWithResult(sessionId)).record;
 }

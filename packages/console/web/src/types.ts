@@ -183,6 +183,17 @@ export interface MutationReceipt {
   readonly state?: "started" | "queued" | "unknown";
 }
 
+export interface CloseSessionResult {
+  readonly session: SessionDetail;
+  readonly localClose: "closed";
+  readonly providerClose:
+    | { readonly status: "confirmed" }
+    | {
+        readonly status: "degraded";
+        readonly reason: "owner_absent" | "unsupported" | "provider_error";
+      };
+}
+
 export interface ConsoleNotice {
   readonly id: number;
   readonly tone: "info" | "success" | "error";

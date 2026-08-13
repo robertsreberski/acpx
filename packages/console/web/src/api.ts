@@ -6,6 +6,7 @@ import {
 import type {
   AdoptSessionInput,
   BootstrapSnapshot,
+  CloseSessionResult,
   CreateSessionInput,
   MutationReceipt,
   PendingInteraction,
@@ -223,8 +224,14 @@ export class ConsoleApi {
     );
   }
 
-  closeSession(sessionId: string): Promise<void> {
-    return this.mutate(`/api/v1/sessions/${encodeURIComponent(sessionId)}/close`, {});
+  closeSession(sessionId: string): Promise<CloseSessionResult> {
+    return this.mutate<{ readonly close: WireCloseSessionResult }>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/close`,
+      {},
+    ).then(({ close }) => ({
+      ...close,
+      session: sessionDetail(close.session),
+    }));
   }
 
   answerInteraction(sessionId: string, requestId: string, answer: unknown): Promise<void> {
@@ -306,6 +313,12 @@ interface WirePendingInteraction {
 interface WireMutationReceipt {
   readonly turnId: string;
   readonly admission: "started" | "queued" | "unknown";
+}
+
+interface WireCloseSessionResult {
+  readonly session: WireSession;
+  readonly localClose: "closed";
+  readonly providerClose: CloseSessionResult["providerClose"];
 }
 
 const sessionSummary = (session: WireSession): SessionSummary => ({

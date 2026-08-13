@@ -2,6 +2,7 @@ import { ConsoleInputError } from "./config.js";
 import type {
   AcpxConsoleSessionService,
   ConsoleAgent,
+  ConsoleCloseSessionResult,
   ConsoleSession,
   PendingInteraction,
   ProviderSession,
@@ -32,6 +33,7 @@ type CoreProviderSession = {
 type CorePending = Omit<PendingInteraction, "schema"> & {
   requestedSchema?: Record<string, unknown>;
 };
+type CoreCloseSessionResult = ConsoleCloseSessionResult;
 type CorePermissionPolicy = {
   autoApprove?: string[];
   autoDeny?: string[];
@@ -80,7 +82,7 @@ interface CoreSessionsService {
   closeSession(input: {
     acpxRecordId: string;
     idempotencyKey: string;
-  }): Promise<CoreReceipt<CoreSession>>;
+  }): Promise<CoreReceipt<CoreCloseSessionResult>>;
   listPendingRequests(input: { acpxRecordId: string }): Promise<CorePending[]>;
   respondToPendingRequest(input: {
     acpxRecordId: string;

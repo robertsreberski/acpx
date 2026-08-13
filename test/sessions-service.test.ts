@@ -370,20 +370,24 @@ test("ambiguous queue transport loss is replayed without a duplicate turn or fal
       idempotencyKey: "ambiguous-admission",
     };
     try {
-      await assert.rejects(
-        async () => await service.enqueuePrompt(input),
-        (error: unknown) => {
-          assert.equal(
-            (error as { detailCode?: string }).detailCode,
-            "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE",
-          );
-          return true;
-        },
-      );
+      const first = await service.enqueuePrompt(input);
+      assert.equal(first.replayed, true);
+      assert.equal(first.result.admission, "unknown");
       const replay = await service.enqueuePrompt(input);
       assert.equal(replay.replayed, true);
       assert.equal(replay.result.admission, "unknown");
+      assert.equal(replay.result.turnId, first.result.turnId);
       assert.equal(submissions, 1);
+
+      // A fresh key is explicitly a new user action, not a reconciliation
+      // retry. It gets a distinct turn id and may therefore submit again.
+      const fresh = await service.enqueuePrompt({
+        ...input,
+        idempotencyKey: "ambiguous-new-action",
+      });
+      assert.equal(fresh.result.admission, "unknown");
+      assert.notEqual(fresh.result.turnId, first.result.turnId);
+      assert.equal(submissions, 2);
 
       const transcript = await service.getTranscriptPage({
         acpxRecordId: initial.acpxRecordId,
@@ -392,7 +396,105 @@ test("ambiguous queue transport loss is replayed without a duplicate turn or fal
       const lifecycleTypes = transcript.items.flatMap((item) =>
         "seq" in item && item.payload.kind === "lifecycle" ? [item.payload.event.type] : [],
       );
-      assert.deepEqual(lifecycleTypes, ["turn_submitted"]);
+      assert.deepEqual(lifecycleTypes, ["turn_submitted", "turn_submitted"]);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("close reports provider confirmation separately from the durable local close", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-close-confirmed",
+      acpSessionId: "provider-close-confirmed",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 91,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+    });
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "close_session");
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "close_session_result",
+          requestId: request.requestId,
+          closed: true,
+        })}\n`,
+      );
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const closed = await service.closeSession({
+        acpxRecordId: initial.acpxRecordId,
+        idempotencyKey: "close-confirmed",
+      });
+      assert.equal(closed.result.session.sessionState, "closed");
+      assert.equal(closed.result.localClose, "closed");
+      assert.deepEqual(closed.result.providerClose, { status: "confirmed" });
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("close reports a safe degraded provider result while still closing locally", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-close-degraded",
+      acpSessionId: "provider-close-degraded",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 92,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+    });
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "close_session");
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(`${"x".repeat(MAX_MESSAGE_BUFFER_SIZE + 1)}\n`);
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    try {
+      const closed = await service.closeSession({
+        acpxRecordId: initial.acpxRecordId,
+        idempotencyKey: "close-degraded",
+      });
+      assert.equal(closed.result.session.sessionState, "closed");
+      assert.equal(closed.result.localClose, "closed");
+      assert.deepEqual(closed.result.providerClose, {
+        status: "degraded",
+        reason: "provider_error",
+      });
+      assert.equal(JSON.stringify(closed.result).includes("response too large"), false);
     } finally {
       service.dispose();
       await closeServer(server);

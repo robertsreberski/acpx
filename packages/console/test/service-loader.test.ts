@@ -65,7 +65,11 @@ function coreFixture() {
         return receipt({ turnId: input.turnId, state: "cancelling" as const });
       },
       async closeSession() {
-        return receipt(session);
+        return receipt({
+          session,
+          localClose: "closed" as const,
+          providerClose: { status: "confirmed" as const },
+        });
       },
       async listPendingRequests() {
         return [];
@@ -137,6 +141,15 @@ test("adapter unwraps mutation receipts and projects provider and agent inventor
       idempotencyKey: "create-key",
     },
   });
+  const retained = await fixture.core.getSession();
+  assert.deepEqual(
+    await service.closeSession({ acpxRecordId: "record-1", idempotencyKey: "close-key" }),
+    {
+      session: retained,
+      localClose: "closed",
+      providerClose: { status: "confirmed" },
+    },
+  );
 });
 
 test("adapter translates web prompt and pending answer shapes into the stable core contract", async () => {

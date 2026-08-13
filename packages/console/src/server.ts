@@ -14,6 +14,8 @@ import {
 import type {
   AcpxConsoleSessionService,
   ConsoleBootstrap,
+  ConsoleSession,
+  ProviderSession,
   ServiceInvalidation,
 } from "./contracts.js";
 import {
@@ -302,6 +304,56 @@ function parseLimit(url: URL): number {
   return value;
 }
 
+async function canonicalAllowedWorkspace(
+  cwd: string | undefined,
+  roots: string[],
+): Promise<string | undefined> {
+  if (!cwd) {
+    return undefined;
+  }
+  try {
+    return await assertWorkspaceAllowed(cwd, roots);
+  } catch {
+    return undefined;
+  }
+}
+
+async function allowedSessions(
+  service: AcpxConsoleSessionService,
+  roots: string[],
+): Promise<ConsoleSession[]> {
+  const sessions = await service.listSessions();
+  const decisions = await Promise.all(
+    sessions.map(
+      async (session) => (await canonicalAllowedWorkspace(session.cwd, roots)) !== undefined,
+    ),
+  );
+  return sessions.filter((_, index) => decisions[index]);
+}
+
+async function requireAllowedSession(
+  service: AcpxConsoleSessionService,
+  roots: string[],
+  acpxRecordId: string,
+): Promise<ConsoleSession> {
+  const session = await service.getSession({ acpxRecordId });
+  if (!session || !(await canonicalAllowedWorkspace(session.cwd, roots))) {
+    throw new HttpError(404, "SESSION_NOT_FOUND", "Session not found");
+  }
+  return session;
+}
+
+async function scopedProviderSessions(
+  sessions: ProviderSession[],
+  cwd: string,
+  roots: string[],
+): Promise<ProviderSession[]> {
+  const canonical = await Promise.all(
+    sessions.map(async (session) => await canonicalAllowedWorkspace(session.cwd, roots)),
+  );
+  return sessions.filter((_, index) => canonical[index] === cwd);
+}
+
 async function handleApi(
   request: IncomingMessage,
   response: ServerResponse,
@@ -336,8 +388,8 @@ async function handleApi(
       `acpx_console_csrf=${encodeURIComponent(context.csrfToken)}; Path=/; HttpOnly; SameSite=Strict`,
     );
     const [agents, sessions] = await Promise.all([
-      context.service.listAgents({ cwd: context.config.workspaceRoots[0]! }),
-      context.service.listSessions(),
+      context.service.listAgents({ cwd: context.config.workspaceRoots[0] }),
+      allowedSessions(context.service, context.config.workspaceRoots),
     ]);
     const body: ConsoleBootstrap = {
       version: 1,
@@ -360,7 +412,18 @@ async function handleApi(
     return true;
   }
   if (method === "GET" && path === "/api/v1/sessions") {
-    sendJson(response, 200, { sessions: await context.service.listSessions() });
+    sendJson(response, 200, {
+      sessions: await allowedSessions(context.service, context.config.workspaceRoots),
+    });
+    return true;
+  }
+  if (method === "GET" && path === "/api/v1/agents") {
+    const cwdParam = url.searchParams.get("cwd");
+    if (!cwdParam) {
+      throw new ConsoleInputError("Agent inventory requires an explicit cwd");
+    }
+    const cwd = await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots);
+    sendJson(response, 200, { agents: await context.service.listAgents({ cwd }) });
     return true;
   }
   if (method === "POST" && path === "/api/v1/sessions") {
@@ -385,6 +448,9 @@ async function handleApi(
       policy: body.policy,
       idempotencyKey: idempotencyKey!,
     });
+    if ((await canonicalAllowedWorkspace(session.cwd, context.config.workspaceRoots)) !== cwd) {
+      throw new HttpError(500, "INTERNAL_ERROR", "ACPX Console could not complete the request");
+    }
     sendJson(response, 201, { session });
     return true;
   }
@@ -402,6 +468,9 @@ async function handleApi(
       mode: optionalString(body, "mode"),
       idempotencyKey: idempotencyKey!,
     });
+    if ((await canonicalAllowedWorkspace(session.cwd, context.config.workspaceRoots)) !== cwd) {
+      throw new HttpError(500, "INTERNAL_ERROR", "ACPX Console could not complete the request");
+    }
     sendJson(response, 201, { session });
     return true;
   }
@@ -414,24 +483,25 @@ async function handleApi(
     }
     const cwd = await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots);
     const client = request.socket.remoteAddress ?? "unknown";
-    sendJson(
-      response,
-      200,
-      await context.providerEnumerationLimiter.run(
-        client,
-        async () =>
-          await context.service.listProviderSessions({
-            agentId: provider[0],
-            cwd,
-            cursor: url.searchParams.get("cursor") ?? undefined,
-          }),
-      ),
+    const page = await context.providerEnumerationLimiter.run(
+      client,
+      async () =>
+        await context.service.listProviderSessions({
+          agentId: provider[0],
+          cwd,
+          cursor: url.searchParams.get("cursor") ?? undefined,
+        }),
     );
+    sendJson(response, 200, {
+      ...page,
+      sessions: await scopedProviderSessions(page.sessions, cwd, context.config.workspaceRoots),
+    });
     return true;
   }
 
   const timeline = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/timeline$/);
   if (method === "GET" && timeline) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, timeline[0]);
     sendJson(
       response,
       200,
@@ -445,6 +515,7 @@ async function handleApi(
   }
   const pending = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/pending$/);
   if (method === "GET" && pending) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, pending[0]);
     sendJson(response, 200, {
       pending: await context.service.listPendingRequests({ acpxRecordId: pending[0] }),
     });
@@ -455,6 +526,7 @@ async function handleApi(
     /^\/api\/v1\/sessions\/([^/]+)\/pending\/([^/]+)\/responses$/,
   );
   if (method === "POST" && responseRoute) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, responseRoute[0]);
     const body = await readJsonBody(request);
     if (!("response" in body)) {
       throw new HttpError(400, "INVALID_INPUT", "response is required");
@@ -471,6 +543,7 @@ async function handleApi(
   }
   const turns = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/turns$/);
   if (method === "POST" && turns) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, turns[0]);
     const body = await readJsonBody(request);
     sendJson(
       response,
@@ -485,6 +558,7 @@ async function handleApi(
   }
   const cancel = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/turns\/([^/]+)\/cancel$/);
   if (method === "POST" && cancel) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, cancel[0]);
     sendJson(
       response,
       202,
@@ -498,8 +572,9 @@ async function handleApi(
   }
   const close = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)\/close$/);
   if (method === "POST" && close) {
+    await requireAllowedSession(context.service, context.config.workspaceRoots, close[0]);
     sendJson(response, 200, {
-      session: await context.service.closeSession({
+      close: await context.service.closeSession({
         acpxRecordId: close[0],
         idempotencyKey: idempotencyKey!,
       }),
@@ -508,10 +583,11 @@ async function handleApi(
   }
   const session = routeMatch(path, /^\/api\/v1\/sessions\/([^/]+)$/);
   if (method === "GET" && session) {
-    const value = await context.service.getSession({ acpxRecordId: session[0] });
-    if (!value) {
-      throw new HttpError(404, "SESSION_NOT_FOUND", "Session not found");
-    }
+    const value = await requireAllowedSession(
+      context.service,
+      context.config.workspaceRoots,
+      session[0],
+    );
     sendJson(response, 200, { session: value });
     return true;
   }
@@ -539,6 +615,7 @@ export async function startAcpxConsoleServer(
   const clients = new Set<ServerResponse>();
   const sockets = new Set<Socket>();
   let nextEventId = 1;
+  let publishQueue = Promise.resolve();
 
   const disconnectSlowClient = (client: ServerResponse): void => {
     clients.delete(client);
@@ -554,6 +631,28 @@ export async function startAcpxConsoleServer(
   };
 
   const publish = (event: ServiceInvalidation): void => {
+    publishQueue = publishQueue
+      .then(async () => {
+        if (event.acpxRecordId) {
+          try {
+            await requireAllowedSession(
+              options.service,
+              options.config.workspaceRoots,
+              event.acpxRecordId,
+            );
+          } catch (error) {
+            if (error instanceof HttpError && error.code === "SESSION_NOT_FOUND") {
+              return;
+            }
+            throw error;
+          }
+        }
+        publishAllowed(event);
+      })
+      .catch((error: unknown) => logger.error(error));
+  };
+
+  const publishAllowed = (event: ServiceInvalidation): void => {
     const item = { id: nextEventId++, event };
     events.push(item);
     if (events.length > SSE_REPLAY_LIMIT) {

@@ -21,9 +21,13 @@ export const session: ConsoleSession = {
 
 export class MockSessionService implements AcpxConsoleSessionService {
   readonly agents: ConsoleAgent[] = [{ agentId: "codex", label: "Codex" }];
-  readonly sessions: ConsoleSession[] = [session];
+  readonly sessions: ConsoleSession[];
   readonly calls: Array<{ method: string; input: unknown }> = [];
   private listener?: (event: ServiceInvalidation) => void;
+
+  constructor(sessionCwd = session.cwd) {
+    this.sessions = [{ ...session, cwd: sessionCwd }];
+  }
 
   async listAgents(_input: { cwd: string }) {
     return this.agents;
@@ -32,9 +36,13 @@ export class MockSessionService implements AcpxConsoleSessionService {
     return this.sessions;
   }
   async getSession(input: { acpxRecordId: string }) {
-    return input.acpxRecordId === session.acpxRecordId ? session : undefined;
+    return this.sessions.find((candidate) => candidate.acpxRecordId === input.acpxRecordId);
   }
-  async listProviderSessions(input: { agentId: string; cwd: string; cursor?: string }) {
+  async listProviderSessions(input: {
+    agentId: string;
+    cwd: string;
+    cursor?: string;
+  }): ReturnType<AcpxConsoleSessionService["listProviderSessions"]> {
     this.calls.push({ method: "listProviderSessions", input });
     return {
       sessions: [{ providerSessionId: "provider-1", title: "Existing", cwd: input.cwd }],
@@ -46,9 +54,11 @@ export class MockSessionService implements AcpxConsoleSessionService {
   }
   async adoptSession(input: Parameters<AcpxConsoleSessionService["adoptSession"]>[0]) {
     this.calls.push({ method: "adoptSession", input });
-    return session;
+    return { ...this.sessions[0], cwd: input.cwd, agentId: input.agentId };
   }
-  async enqueuePrompt(input: Parameters<AcpxConsoleSessionService["enqueuePrompt"]>[0]) {
+  async enqueuePrompt(
+    input: Parameters<AcpxConsoleSessionService["enqueuePrompt"]>[0],
+  ): ReturnType<AcpxConsoleSessionService["enqueuePrompt"]> {
     this.calls.push({ method: "enqueuePrompt", input });
     return { turnId: "turn-1", admission: "started" as const };
   }
@@ -56,9 +66,15 @@ export class MockSessionService implements AcpxConsoleSessionService {
     this.calls.push({ method: "cancelTurn", input });
     return { turnId: input.turnId, state: "cancelling" as const };
   }
-  async closeSession(input: Parameters<AcpxConsoleSessionService["closeSession"]>[0]) {
+  async closeSession(
+    input: Parameters<AcpxConsoleSessionService["closeSession"]>[0],
+  ): ReturnType<AcpxConsoleSessionService["closeSession"]> {
     this.calls.push({ method: "closeSession", input });
-    return { ...session, sessionState: "closed" as const };
+    return {
+      session: { ...this.sessions[0], sessionState: "closed" as const },
+      localClose: "closed" as const,
+      providerClose: { status: "confirmed" as const },
+    };
   }
   async listPendingRequests(): Promise<PendingInteraction[]> {
     return [

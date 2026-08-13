@@ -82,13 +82,19 @@ modify the active turn.
 
 Every submit receives a durable turn receipt before queue admission. Retrying
 the same browser mutation uses the same idempotency key and returns the
-original receipt. ACPX guarantees exactly-once local admission, not
+original receipt. If transport fails after the queue write, the first response
+is an `unknown` admission with that durable turn ID, not a generic failure.
+Reconcile that receipt or retry with the same idempotency key; a fresh key is a
+new user action and may create another turn. ACPX guarantees exactly-once local admission, not
 exactly-once execution by an external agent. If an owner dies after dispatch,
 the turn becomes `interrupted` or `unknown` and is never replayed
 automatically.
 
-**Cancel turn** cooperatively cancels only the active turn. **Close session**
-is a separate action and does not masquerade as cancel or deletion.
+**Cancel turn** cooperatively cancels only the targeted active or queued turn.
+**Close session** is a separate action and does not masquerade as cancel or
+deletion. Local close always completes durably; its result separately reports
+whether provider `session/close` was confirmed or degraded, so the console does
+not present a best-effort provider failure as full success.
 
 ## Answer requests
 

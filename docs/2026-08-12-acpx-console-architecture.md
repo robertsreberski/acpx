@@ -100,9 +100,17 @@ queue:   non-negative queued prompt count
 
 The service allocates and persists a `turnId` before attempting queue
 admission. A successful mutation therefore returns a stable receipt even when
-the turn has not started. The guarantee is exactly-once local admission. ACPX
+the turn has not started. An ambiguous post-write transport result is returned
+as an `unknown` receipt on the first call; exact-key replay returns the same
+turn without another submit, while a fresh key deliberately denotes a new user
+action. The guarantee is exactly-once local admission. ACPX
 does not promise exactly-once external-agent execution after an ambiguous
 process failure.
+
+Session close has two explicit outcomes in one receipt: the local record is
+durably closed, and provider close is either `confirmed` or `degraded` with a
+coarse, non-sensitive reason. Provider failure never rolls back the local
+close, but it is also never collapsed into an apparent complete success.
 
 No automatic recovery may replay a turn that could already have reached the
 agent. Owner loss after dispatch settles the local turn as `interrupted` or

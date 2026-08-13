@@ -26,7 +26,7 @@ async function fixture(
     stateDir: join(root, "state"),
     staticDir: web,
   };
-  const service = new MockSessionService();
+  const service = new MockSessionService(workspace);
   const running = await startAcpxConsoleServer({
     config,
     service,
@@ -290,7 +290,7 @@ test("wildcard binds display an explicit allowed host", async () => {
       stateDir: join(root, "state"),
       staticDir: web,
     },
-    service: new MockSessionService(),
+    service: new MockSessionService(root),
     logger: { info() {}, warn() {}, error() {} },
   });
   try {
@@ -548,7 +548,7 @@ test("mutation rate limits are bounded per direct client", async () => {
       stateDir: join(root, "state"),
       staticDir: web,
     },
-    service: new MockSessionService(),
+    service: new MockSessionService(root),
     mutationRateLimit: { maxRequests: 1, windowMs: 60_000 },
     logger: { info() {}, warn() {}, error() {} },
   });
@@ -825,7 +825,66 @@ test("session detail, provider inventory, timeline, pending, cancellation, respo
       body: "{}",
     });
     assert.equal(closed.status, 200);
+    assert.deepEqual(await closed.json(), {
+      close: {
+        session: { ...service.sessions[0], sessionState: "closed" },
+        localClose: "closed",
+        providerClose: { status: "confirmed" },
+      },
+    });
     assert.equal(service.calls.at(-1)?.method, "closeSession");
+  } finally {
+    await running.close();
+  }
+});
+
+test("an ambiguous prompt admission is returned as a durable unknown HTTP receipt", async () => {
+  const { running, service } = await fixture();
+  service.enqueuePrompt = async (input) => {
+    service.calls.push({ method: "enqueuePrompt", input });
+    return { turnId: "turn-unknown", admission: "unknown" };
+  };
+  try {
+    const auth = await bootstrap(running.origin);
+    const response = await fetch(`${running.origin}/api/v1/sessions/record-1/turns`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "ambiguous-http-key"),
+      body: JSON.stringify({ text: "run this once" }),
+    });
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { turnId: "turn-unknown", admission: "unknown" });
+    assert.equal(service.calls.filter(({ method }) => method === "enqueuePrompt").length, 1);
+  } finally {
+    await running.close();
+  }
+});
+
+test("close reports local success and a degraded provider outcome separately", async () => {
+  const { running, service } = await fixture();
+  service.closeSession = async (input) => {
+    service.calls.push({ method: "closeSession", input });
+    return {
+      session: { ...service.sessions[0], sessionState: "closed" },
+      localClose: "closed",
+      providerClose: { status: "degraded", reason: "provider_error" },
+    };
+  };
+  try {
+    const auth = await bootstrap(running.origin);
+    const response = await fetch(`${running.origin}/api/v1/sessions/record-1/close`, {
+      method: "POST",
+      headers: mutationHeaders(auth, "close-degraded-key"),
+      body: "{}",
+    });
+    assert.equal(response.status, 200);
+    const result = (await response.json()) as {
+      close: { localClose: string; providerClose: { status: string; reason?: string } };
+    };
+    assert.equal(result.close.localClose, "closed");
+    assert.deepEqual(result.close.providerClose, {
+      status: "degraded",
+      reason: "provider_error",
+    });
   } finally {
     await running.close();
   }

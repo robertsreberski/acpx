@@ -171,6 +171,11 @@ export type AcpxEnqueuePromptInput = {
 
 export type AcpxEnqueuePromptResult = {
   turnId: string;
+  /**
+   * `unknown` means queue admission may have succeeded. Keep and replay the
+   * same idempotency key while reconciling this turn id; a fresh key is a new
+   * prompt request and may intentionally create another turn.
+   */
   admission: "started" | "queued" | "unknown";
 };
 
@@ -188,6 +193,17 @@ export type AcpxCancelTurnResult = {
 export type AcpxCloseSessionInput = {
   acpxRecordId: string;
   idempotencyKey: string;
+};
+
+export type AcpxCloseSessionResult = {
+  session: AcpxSessionDetail;
+  localClose: "closed";
+  providerClose:
+    | { status: "confirmed" }
+    | {
+        status: "degraded";
+        reason: "owner_absent" | "unsupported" | "provider_error";
+      };
 };
 
 export type AcpxRespondPendingRequestInput = {
@@ -244,7 +260,7 @@ export interface AcpxSessionService {
     input: AcpxEnqueuePromptInput,
   ): Promise<AcpxMutationReceipt<AcpxEnqueuePromptResult>>;
   cancelTurn(input: AcpxCancelTurnInput): Promise<AcpxMutationReceipt<AcpxCancelTurnResult>>;
-  closeSession(input: AcpxCloseSessionInput): Promise<AcpxMutationReceipt<AcpxSessionDetail>>;
+  closeSession(input: AcpxCloseSessionInput): Promise<AcpxMutationReceipt<AcpxCloseSessionResult>>;
   listPendingRequests(input: { acpxRecordId: string }): Promise<AcpxPendingRequest[]>;
   respondToPendingRequest(
     input: AcpxRespondPendingRequestInput,

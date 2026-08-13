@@ -21,6 +21,7 @@ const PUBLISHED_VALUES = [
 
 const PUBLISHED_TYPES = [
   "AcpxCreateSessionInput",
+  "AcpxCloseSessionResult",
   "AcpxMutationReceipt",
   "AcpxModeState",
   "AcpxPendingRequest",

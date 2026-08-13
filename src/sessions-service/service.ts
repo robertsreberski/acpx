@@ -19,7 +19,7 @@ import { queueOwnerSpawnArgsForModule } from "../cli/session/queue-owner-process
 import { sendSession } from "../cli/session/queue-owner-runtime.js";
 import {
   cancelSessionPrompt,
-  closeSession as closeOwnedSession,
+  closeSessionWithResult as closeOwnedSessionWithResult,
   setSessionMode,
 } from "../cli/session/session-control.js";
 import { createSessionWithClient, listAgentSessions } from "../cli/session/session-management.js";
@@ -45,6 +45,7 @@ import type {
   AcpxCancelTurnInput,
   AcpxCancelTurnResult,
   AcpxCloseSessionInput,
+  AcpxCloseSessionResult,
   AcpxCreateSessionInput,
   AcpxEnqueuePromptInput,
   AcpxEnqueuePromptResult,
@@ -436,10 +437,10 @@ class SessionService implements AcpxSessionService {
 
   async listProviderSessions(input: {
     agentId: string;
-    cwd?: string;
+    cwd: string;
     cursor?: string;
   }): Promise<AcpxProviderSessionPage> {
-    const cwd = input.cwd ?? this.options.cwd ?? process.cwd();
+    const cwd = input.cwd;
     const agent = await this.resolveAgent(input.agentId, cwd);
     const response = await listAgentSessions({
       agentCommand: agent.agentCommand,
@@ -635,7 +636,7 @@ class SessionService implements AcpxSessionService {
   ): Promise<AcpxMutationReceipt<AcpxEnqueuePromptResult>> {
     const turnId = randomUUID();
     const unknown: AcpxEnqueuePromptResult = { turnId, admission: "unknown" };
-    const receipt = await runIdempotentMutation({
+    const mutation = {
       operation: "enqueue_prompt",
       idempotencyKey: input.idempotencyKey,
       input,
@@ -707,7 +708,20 @@ class SessionService implements AcpxSessionService {
           "queued" in result ? "queued" : "started";
         return { turnId, admission };
       },
-    });
+    } as const;
+    let receipt: AcpxMutationReceipt<AcpxEnqueuePromptResult>;
+    try {
+      receipt = await runIdempotentMutation(mutation);
+    } catch (error) {
+      if (!isQueueAdmissionOutcomeUnknown(error)) {
+        throw error;
+      }
+      // Queue admission crossed the write boundary, so surfacing the transport
+      // error would invite a caller to retry with a fresh key and duplicate the
+      // prompt. Replaying the exact key reads the durable recovery result and
+      // never submits again; callers receive the original turn id as unknown.
+      receipt = await runIdempotentMutation(mutation);
+    }
     this.emit({ type: "session", acpxRecordId: input.acpxRecordId });
     this.emit({ type: "timeline", acpxRecordId: input.acpxRecordId });
     return receipt;
@@ -746,14 +760,19 @@ class SessionService implements AcpxSessionService {
 
   async closeSession(
     input: AcpxCloseSessionInput,
-  ): Promise<AcpxMutationReceipt<AcpxSessionDetail>> {
-    const receipt = await runIdempotentMutation({
+  ): Promise<AcpxMutationReceipt<AcpxCloseSessionResult>> {
+    const receipt = await runIdempotentMutation<AcpxCloseSessionResult>({
       operation: "close_session",
       idempotencyKey: input.idempotencyKey,
       input,
       run: async () => {
         const record = await this.requireExactRecord(input.acpxRecordId);
-        return await this.projectDetail(await closeOwnedSession(record.acpxRecordId));
+        const closed = await closeOwnedSessionWithResult(record.acpxRecordId);
+        return {
+          session: await this.projectDetail(closed.record),
+          localClose: "closed",
+          providerClose: closed.providerClose,
+        };
       },
     });
     this.emit({ type: "sessions", acpxRecordId: input.acpxRecordId });

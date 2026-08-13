@@ -648,7 +648,8 @@ test("the service drives create, queue, park, answer, transcript, and close end 
         acpxRecordId: created.result.acpxRecordId,
         idempotencyKey: "queue-close",
       });
-      assert.equal(closed.result.sessionState, "closed");
+      assert.equal(closed.result.session.sessionState, "closed");
+      assert.equal(closed.result.localClose, "closed");
     } finally {
       service.dispose();
     }

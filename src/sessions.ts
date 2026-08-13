@@ -19,6 +19,7 @@ export type {
   AcpxCancelTurnInput,
   AcpxCancelTurnResult,
   AcpxCloseSessionInput,
+  AcpxCloseSessionResult,
   AcpxCreateSessionInput,
   AcpxEnqueuePromptInput,
   AcpxEnqueuePromptResult,

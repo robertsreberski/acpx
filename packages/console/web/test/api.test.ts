@@ -67,6 +67,29 @@ test("unwraps session and pending routes while preserving exact record identity"
   );
 });
 
+test("preserves a degraded provider-close result instead of reporting full success", async () => {
+  const client = new ConsoleApi();
+  await withFetch(
+    async () =>
+      response({
+        close: {
+          session: { ...SESSION, sessionState: "closed" },
+          localClose: "closed",
+          providerClose: { status: "degraded", reason: "provider_error" },
+        },
+      }),
+    async () => {
+      const closed = await client.closeSession("record-1");
+      assert.equal(closed.session.id, "record-1");
+      assert.equal(closed.session.sessionState, "closed");
+      assert.deepEqual(closed.providerClose, {
+        status: "degraded",
+        reason: "provider_error",
+      });
+    },
+  );
+});
+
 test("projects the core item timeline and explicit legacy gap", async () => {
   const client = new ConsoleApi();
   await withFetch(
