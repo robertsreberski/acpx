@@ -172,7 +172,9 @@ Network mode keeps a persistent warning visible.
 The server still applies defense in depth:
 
 - explicit Host allowlisting
-- same-origin, Fetch Metadata, and CSRF checks on mutations
+- same-origin, Fetch Metadata, and CSRF checks on mutations; an HTTPS reverse
+  proxy is supported when the browser Origin authority exactly matches the
+  allowed Host forwarded to the console
 - no permissive CORS
 - strict content security policy, frame denial, and `nosniff`
 - sanitized Markdown with raw HTML disabled

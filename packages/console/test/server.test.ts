@@ -195,20 +195,27 @@ test("costly reads and event streams reject hostile browser requests before serv
     const events = await fetch(`${running.origin}/api/v1/events`, { headers: hostileHeaders });
     assert.equal(events.status, 403);
 
-    const wrongScheme = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const proxiedHttps = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
       headers: { Origin: running.origin.replace(/^http:/, "https:") },
     });
-    assert.equal(wrongScheme.status, 403);
-    assert.equal(
-      service.calls.some((call) => call.method === "listProviderSessions"),
-      false,
-    );
+    assert.equal(proxiedHttps.status, 200);
+    assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
+
+    const unsupportedScheme = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+      headers: { Origin: running.origin.replace(/^http:/, "ftp:") },
+    });
+    assert.equal(unsupportedScheme.status, 403);
+    const mismatchedAuthority = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+      headers: { Origin: "https://evil.example" },
+    });
+    assert.equal(mismatchedAuthority.status, 403);
+    assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
 
     const legitimate = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
       headers: { "Sec-Fetch-Site": "same-origin", Origin: running.origin },
     });
     assert.equal(legitimate.status, 200);
-    assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
+    assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 2);
   } finally {
     await running.close();
   }

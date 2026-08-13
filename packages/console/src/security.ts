@@ -61,7 +61,7 @@ export function assertSameOriginRequest(request: IncomingMessage): void {
     throw new HttpError(403, "INVALID_ORIGIN", "Origin is invalid");
   }
   if (
-    parsedOrigin.protocol !== "http:" ||
+    (parsedOrigin.protocol !== "http:" && parsedOrigin.protocol !== "https:") ||
     parsedOrigin.host.toLowerCase() !== request.headers.host?.toLowerCase()
   ) {
     throw new HttpError(403, "ORIGIN_NOT_ALLOWED", "Cross-origin requests are not allowed");
