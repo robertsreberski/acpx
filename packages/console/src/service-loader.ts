@@ -279,8 +279,14 @@ function sessionsModule(value: unknown): SessionsModule {
   return value as SessionsModule;
 }
 
-export async function loadAcpxSessionService(): Promise<AcpxConsoleSessionService> {
+export async function loadAcpxSessionService(
+  workspaceRoots?: readonly string[],
+): Promise<AcpxConsoleSessionService> {
   const moduleName = "acpx/sessions";
   const module = sessionsModule(await import(moduleName));
-  return adaptAcpxSessionService(module.createAcpxSessionService());
+  return adaptAcpxSessionService(
+    module.createAcpxSessionService({
+      subscriptionWorkspaceRoots: workspaceRoots ? [...workspaceRoots] : undefined,
+    }),
+  );
 }

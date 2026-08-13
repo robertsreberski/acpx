@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     }
     return;
   }
-  const service = await loadAcpxSessionService();
+  const service = await loadAcpxSessionService(config.workspaceRoots);
   const foreground = await startForegroundConsole(config, service);
   const detachSignals = attachShutdownSignals(foreground);
   if (command.open) {

@@ -743,7 +743,7 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
     );
     await appendSessionTimelineLifecycleEvent(
       record,
-      { type: "turn_submitted" },
+      { type: "turn_submitted", prompt_text: "Run this after reload" },
       { turnId: "turn-queued" },
     );
     const keeper = await startKeeperProcess();
@@ -754,9 +754,22 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
       sessionId: initial.acpxRecordId,
       ownerGeneration: 80,
       queueProtocol: QUEUE_PROTOCOL_VERSION,
+      queueDepth: 1,
     });
     const targeted: string[] = [];
     const server = createSingleRequestServer((socket, request) => {
+      if (request.type === "list_requests") {
+        socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+        socket.write(
+          `${JSON.stringify({
+            type: "list_requests_result",
+            requestId: request.requestId,
+            ownerGeneration: 80,
+            requests: [],
+          })}\n`,
+        );
+        return;
+      }
       assert.equal(request.type, "cancel_prompt");
       const targetTurnId = (request as typeof request & { targetTurnId?: string }).targetTurnId;
       if (targetTurnId) {
@@ -774,9 +787,17 @@ test("service cancels queued turns exactly and leaves stale ids alone", async ()
       );
     });
     await listenServer(server, paths.socketPath);
+    const beforeReload = createAcpxSessionService({ cwd });
+    beforeReload.dispose();
     const service = createAcpxSessionService({ cwd });
 
     try {
+      const reloaded = await service.getSession({ acpxRecordId: record.acpxRecordId });
+      assert.equal(reloaded?.queue.depth, 1);
+      assert.equal(reloaded?.queue.turns.length, 1);
+      assert.equal(reloaded?.queue.turns[0]?.turnId, "turn-queued");
+      assert.equal(reloaded?.queue.turns[0]?.promptText, "Run this after reload");
+      assert.match(reloaded?.queue.turns[0]?.submittedAt ?? "", /^\d{4}-\d{2}-\d{2}T/u);
       const queued = await service.cancelTurn({
         acpxRecordId: record.acpxRecordId,
         turnId: "turn-queued",
@@ -926,6 +947,88 @@ test("a first pending request on a newly observed session emits an invalidation"
       await writeSessionRecordFile(homeDir, initial);
       await writePendingRequest(pending);
       await invalidated;
+    } finally {
+      unsubscribe();
+      service.dispose();
+    }
+  });
+});
+
+test("subscription polling skips closed history and sessions outside its workspace roots", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const workspace = path.join(homeDir, "workspace");
+    const outside = path.join(homeDir, "outside");
+    await Promise.all([
+      fs.mkdir(workspace, { recursive: true }),
+      fs.mkdir(outside, { recursive: true }),
+    ]);
+    const active = makeSessionRecord({
+      acpxRecordId: "session-subscription-active",
+      acpSessionId: "provider-subscription-active",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: workspace,
+    });
+    const outsideRecord = makeSessionRecord({
+      acpxRecordId: "session-subscription-outside",
+      acpSessionId: "provider-subscription-outside",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: outside,
+    });
+    const closed = Array.from({ length: 64 }, (_, index) =>
+      makeSessionRecord({
+        acpxRecordId: `session-subscription-closed-${String(index).padStart(2, "0")}`,
+        acpSessionId: `provider-subscription-closed-${index}`,
+        agentCommand: AGENT_REGISTRY.codex,
+        cwd: workspace,
+        closed: true,
+        closedAt: "2026-01-01T00:00:01.000Z",
+        lastUsedAt: `2026-01-01T00:00:${String(59 - (index % 60)).padStart(2, "0")}.000Z`,
+      }),
+    );
+    await Promise.all(
+      [active, outsideRecord, ...closed].map(
+        async (record) => await writeSessionRecordFile(homeDir, record),
+      ),
+    );
+
+    const service = createAcpxSessionService({
+      cwd: workspace,
+      subscriptionWorkspaceRoots: [workspace],
+      timelinePollMs: 100,
+    });
+    const invalidations: string[] = [];
+    let resolveActive: (() => void) | undefined;
+    const activeInvalidated = new Promise<void>((resolve) => {
+      resolveActive = resolve;
+    });
+    const unsubscribe = service.subscribe((event) => {
+      if (event.acpxRecordId) {
+        invalidations.push(event.acpxRecordId);
+      }
+      if (event.type === "session" && event.acpxRecordId === active.acpxRecordId) {
+        resolveActive?.();
+      }
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+      active.lastUsedAt = "2026-01-02T00:00:00.000Z";
+      outsideRecord.lastUsedAt = "2026-01-02T00:00:00.000Z";
+      for (const record of closed) {
+        record.lastUsedAt = "2026-01-02T00:00:00.000Z";
+      }
+      await Promise.all(
+        [active, outsideRecord, ...closed].map(
+          async (record) => await writeSessionRecordFile(homeDir, record),
+        ),
+      );
+      await Promise.race([
+        activeInvalidated,
+        new Promise<never>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("timed out waiting for scoped invalidation")), 2_000),
+        ),
+      ]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      assert.deepEqual([...new Set(invalidations)], [active.acpxRecordId]);
     } finally {
       unsubscribe();
       service.dispose();

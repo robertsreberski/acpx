@@ -10,6 +10,7 @@ import { listPendingRequests, type PendingRequest } from "../session/pending-req
 import {
   getActiveSessionTimelineTurn,
   getLatestSessionTimelineLifecycleEvent,
+  listQueuedSessionTimelineTurns,
 } from "../session/timeline.js";
 import type { SessionRecord } from "../types.js";
 import type {
@@ -178,23 +179,27 @@ export async function projectSession(
   record: SessionRecord,
   detail: true,
   registry?: Record<string, string>,
+  pendingEntries?: PendingRequest[],
 ): Promise<AcpxSessionDetail>;
 export async function projectSession(
   record: SessionRecord,
   detail?: false,
   registry?: Record<string, string>,
+  pendingEntries?: PendingRequest[],
 ): Promise<AcpxSessionSummary>;
 // oxlint-disable-next-line eslint/complexity -- Projection combines deliberately independent session, owner, turn, queue, and pending axes.
 export async function projectSession(
   record: SessionRecord,
   detail = false,
   registry: Record<string, string> = AGENT_REGISTRY,
+  pendingEntries?: PendingRequest[],
 ): Promise<AcpxSessionSummary | AcpxSessionDetail> {
-  const [health, pending, lifecycle, activeTurn] = await Promise.all([
-    inspectQueueOwnerHealth(record.acpxRecordId),
-    listPendingRequests(record.acpxRecordId),
+  const health = await inspectQueueOwnerHealth(record.acpxRecordId);
+  const [pending, lifecycle, activeTurn, queuedTurns] = await Promise.all([
+    pendingEntries ?? listPendingRequests(record.acpxRecordId),
     getLatestSessionTimelineLifecycleEvent(record.acpxRecordId),
     getActiveSessionTimelineTurn(record.acpxRecordId),
+    listQueuedSessionTimelineTurns(record.acpxRecordId, health.queueDepth ?? 0),
   ]);
   const waiting = pendingTurnState(pending);
   const lifecycleState = lifecycleTurnState(lifecycle);
@@ -212,7 +217,7 @@ export async function projectSession(
     sessionState: record.closed === true ? "closed" : "open",
     ownerState: projectedOwnerState,
     turnState: waiting ?? projectedLifecycleState,
-    queue: { depth: health.queueDepth ?? 0 },
+    queue: { depth: health.queueDepth ?? 0, turns: queuedTurns },
     createdAt: record.createdAt,
     updatedAt: record.lastUsedAt,
     model: record.acpx?.current_model_id ?? getDesiredModelId(record.acpx),

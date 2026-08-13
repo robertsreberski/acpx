@@ -32,8 +32,15 @@ export type AcpxTurnState =
   | "interrupted"
   | "unknown";
 
+export type AcpxQueuedTurn = {
+  turnId: string;
+  submittedAt: string;
+  promptText?: string;
+};
+
 export type AcpxQueueState = {
   depth: number;
+  turns: AcpxQueuedTurn[];
 };
 
 /**
@@ -231,6 +238,8 @@ export type AcpxSessionInvalidation = {
 
 export type AcpxSessionsServiceOptions = {
   cwd?: string;
+  /** Restrict live invalidation polling to open sessions under these workspace roots. */
+  subscriptionWorkspaceRoots?: string[];
   mcpConfigPath?: string;
   timelinePollMs?: number;
   /** Receives contained invalidation-poll failures; polling continues on the next interval. */

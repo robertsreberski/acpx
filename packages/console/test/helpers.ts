@@ -15,7 +15,7 @@ export const session: ConsoleSession = {
   sessionState: "open",
   ownerState: "online",
   turnState: "idle",
-  queue: { depth: 0 },
+  queue: { depth: 0, turns: [] },
   updatedAt: "2026-08-12T00:00:00.000Z",
 };
 

@@ -13,7 +13,7 @@ function coreFixture(sessionList: "supported" | "unsupported" | "unknown" = "sup
     sessionState: "open" as const,
     ownerState: "online" as const,
     turnState: "idle" as const,
-    queue: { depth: 0 },
+    queue: { depth: 0, turns: [] },
     createdAt: "2026-08-12T00:00:00.000Z",
     updatedAt: "2026-08-12T00:00:00.000Z",
     pendingCount: 0,

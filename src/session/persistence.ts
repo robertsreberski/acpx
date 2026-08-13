@@ -9,6 +9,7 @@ export {
   findSessionByDirectoryWalk,
   isoNow,
   listSessions,
+  listOpenSessionsForSubscription,
   listSessionsForAgent,
   normalizeName,
   pruneSessions,

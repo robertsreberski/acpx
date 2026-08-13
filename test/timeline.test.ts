@@ -24,6 +24,7 @@ import {
   captureAcpTimelineEvent,
   getActiveSessionTimelineTurn,
   getLatestSessionTimelineLifecycleEvent,
+  listQueuedSessionTimelineTurns,
   listSessionTimelinePage,
   SessionTimelineCursorError,
   SessionTimelineWriter,
@@ -672,6 +673,39 @@ test("active turn lookup ignores newer queued submissions", async () => {
     await reopened.appendLifecycleEvent({ type: "turn_completed" }, { turnId: "turn-1" });
     await reopened.close({ checkpoint: true });
     assert.equal(await getActiveSessionTimelineTurn(record.acpxRecordId), undefined);
+  });
+});
+
+test("queued turn projection survives reload with exact ids and prompt text", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-queued-projection", cwd);
+    await writeSessionRecord(record);
+    const writer = await SessionEventWriter.open(record);
+    await writer.appendLifecycleEvent(
+      { type: "turn_submitted", prompt_text: "First durable follow-up" },
+      { turnId: "turn-first", capturedAt: "2026-08-12T10:00:01.000Z" },
+    );
+    await writer.appendLifecycleEvent(
+      { type: "turn_submitted", prompt_text: "Second durable follow-up" },
+      { turnId: "turn-second", capturedAt: "2026-08-12T10:00:02.000Z" },
+    );
+    await writer.appendLifecycleEvent({ type: "turn_started" }, { turnId: "turn-first" });
+    await writer.appendLifecycleEvent(
+      { type: "turn_submitted" },
+      { turnId: "turn-legacy", capturedAt: "2026-08-12T10:00:03.000Z" },
+    );
+    await writer.appendLifecycleEvent({ type: "turn_cancelled" }, { turnId: "turn-legacy" });
+    await writer.close({ checkpoint: true });
+
+    assert.deepEqual(await listQueuedSessionTimelineTurns(record.acpxRecordId), [
+      {
+        turnId: "turn-second",
+        submittedAt: "2026-08-12T10:00:02.000Z",
+        promptText: "Second durable follow-up",
+      },
+    ]);
   });
 });
 

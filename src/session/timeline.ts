@@ -29,7 +29,7 @@ const LOCK_RETRY_MS = 15;
 export type SessionTimelineDirection = AcpMessageDirection | "internal";
 
 export type SessionTimelineLifecycleEvent =
-  | { type: "turn_submitted" }
+  | { type: "turn_submitted"; prompt_text?: string }
   | { type: "turn_started" }
   | { type: "turn_completed"; stop_reason?: string }
   | { type: "turn_failed"; message: string }
@@ -80,6 +80,12 @@ export type SessionTimelinePage = {
   coverage: SessionTimelineCoverage;
   /** Present when the last authoritative append failed and history may be incomplete. */
   writeError?: string;
+};
+
+export type SessionTimelineQueuedTurn = {
+  turnId: string;
+  submittedAt: string;
+  promptText?: string;
 };
 
 export class SessionTimelineCursorError extends Error {
@@ -251,7 +257,7 @@ function isDirection(value: unknown): value is SessionTimelineDirection {
 }
 
 const LIFECYCLE_VALIDATORS: Record<string, (record: Record<string, unknown>) => boolean> = {
-  turn_submitted: () => true,
+  turn_submitted: (record) => isOptionalString(record.prompt_text),
   turn_started: () => true,
   turn_completed: (record) => isOptionalString(record.stop_reason),
   turn_failed: (record) => typeof record.message === "string",
@@ -1055,6 +1061,86 @@ export async function getActiveSessionTimelineTurn(
       },
     })
   )[0];
+}
+
+const QUEUED_TURN_RESOLVING_LIFECYCLES = new Set<SessionTimelineLifecycleEvent["type"]>([
+  "turn_started",
+  "turn_completed",
+  "turn_failed",
+  "turn_cancelled",
+  "turn_interrupted",
+]);
+
+function queuedTurnLifecycleState(
+  event: SessionTimelineEvent,
+): "submitted" | "resolved" | "ignore" {
+  if (event.payload.kind !== "lifecycle" || !event.turn_id) {
+    return "ignore";
+  }
+  if (event.payload.event.type === "turn_submitted") {
+    return "submitted";
+  }
+  return QUEUED_TURN_RESOLVING_LIFECYCLES.has(event.payload.event.type) ? "resolved" : "ignore";
+}
+
+function queuedTurnPredicate(resolved: Set<string>): (event: SessionTimelineEvent) => boolean {
+  return (event) => {
+    const turnId = event.turn_id;
+    if (!turnId) {
+      return false;
+    }
+    const state = queuedTurnLifecycleState(event);
+    if (state === "resolved") {
+      resolved.add(turnId);
+      return false;
+    }
+    return state === "submitted" && !resolved.has(turnId);
+  };
+}
+
+function projectQueuedTurn(event: SessionTimelineEvent): SessionTimelineQueuedTurn | undefined {
+  if (
+    !event.turn_id ||
+    event.payload.kind !== "lifecycle" ||
+    event.payload.event.type !== "turn_submitted"
+  ) {
+    return undefined;
+  }
+  return {
+    turnId: event.turn_id,
+    submittedAt: event.captured_at,
+    promptText: event.payload.event.prompt_text,
+  };
+}
+
+/**
+ * Reconstruct submitted turns that have not durably started or terminated.
+ *
+ * This is intentionally timeline-derived rather than queue-process memory so a
+ * browser or backend restart retains exact turn ids and display text. Older
+ * envelopes without `prompt_text` remain valid and receive no invented text.
+ */
+export async function listQueuedSessionTimelineTurns(
+  sessionId: string,
+  maximum = Number.POSITIVE_INFINITY,
+): Promise<SessionTimelineQueuedTurn[]> {
+  const record = await resolveSessionRecord(sessionId);
+  const metadata = record.timeline;
+  const limit = Math.min(metadata?.last_seq ?? 0, Math.max(0, Math.trunc(maximum)));
+  if (!metadata || limit === 0) {
+    return [];
+  }
+  const resolved = new Set<string>();
+  const lifecycle = await readTimelineEventsBackward(record.acpxRecordId, metadata, {
+    limit,
+    predicate: queuedTurnPredicate(resolved),
+  });
+  return lifecycle
+    .flatMap((event) => {
+      const queued = projectQueuedTurn(event);
+      return queued ? [queued] : [];
+    })
+    .toReversed();
 }
 
 function legacyGap(record: SessionRecord): SessionTimelineHistoryGap[] {

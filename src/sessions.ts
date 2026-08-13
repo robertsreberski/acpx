@@ -12,6 +12,9 @@ export {
   AcpxIdempotencyCorruptError,
   AcpxIdempotencyConflictError,
   AcpxIdempotencyInDoubtError,
+  AcpxIdempotencyLedgerFullError,
+  AcpxIdempotencyRetiredError,
+  AcpxIdempotencySessionPrunedError,
   AcpxIdempotentMutationError,
 } from "./sessions-service/idempotency.js";
 export type {
@@ -32,6 +35,7 @@ export type {
   AcpxProviderSession,
   AcpxProviderSessionPage,
   AcpxQueueState,
+  AcpxQueuedTurn,
   AcpxRegisteredAgent,
   AcpxRespondPendingRequestInput,
   AcpxSessionDetail,
@@ -47,6 +51,7 @@ export {
   SessionTimelineCursorError,
   appendSessionTimelineLifecycleEvent,
   getActiveSessionTimelineTurn,
+  listQueuedSessionTimelineTurns,
   listSessionTimelinePage,
 } from "./session/timeline.js";
 export type {
@@ -57,6 +62,7 @@ export type {
   SessionTimelineItem,
   SessionTimelineLifecycleEvent,
   SessionTimelinePage,
+  SessionTimelineQueuedTurn,
   SessionTimelinePayload,
 } from "./session/timeline.js";
 export type {

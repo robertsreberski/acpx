@@ -29,7 +29,10 @@ export interface ConsoleSession {
   sessionState: SessionState;
   ownerState: OwnerState;
   turnState: TurnState;
-  queue: { depth: number };
+  queue: {
+    depth: number;
+    turns: Array<{ turnId: string; submittedAt: string; promptText?: string }>;
+  };
   updatedAt: string;
   createdAt?: string;
   model?: string;

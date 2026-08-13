@@ -24,7 +24,7 @@ import {
 } from "../cli/session/session-control.js";
 import { createSessionWithClient, listAgentSessions } from "../cli/session/session-management.js";
 import { PendingRequestOwnerGoneError, SessionNotFoundError } from "../errors.js";
-import { textPrompt } from "../prompt-content.js";
+import { promptToDisplayText, textPrompt } from "../prompt-content.js";
 import { applyLifecycleSnapshotToRecord } from "../runtime/engine/lifecycle.js";
 import { normalizeModeId, setDesiredModeId } from "../session/mode-preference.js";
 import {
@@ -33,7 +33,11 @@ import {
   sweepPendingRequests,
   type PendingRequest,
 } from "../session/pending-requests.js";
-import { listSessions, writeSessionRecord } from "../session/persistence.js";
+import {
+  listOpenSessionsForSubscription,
+  listSessions,
+  writeSessionRecord,
+} from "../session/persistence.js";
 import {
   appendSessionTimelineLifecycleEvent,
   getActiveSessionTimelineTurn,
@@ -71,6 +75,7 @@ const DEFAULT_PENDING_RESPONSE_TIMEOUT_MS = 60_000;
 const DEFAULT_DEFER_MAX_AGE_MS = 86_400_000;
 const NO_LIVE_OWNER_GENERATION = 0;
 const SESSION_SERVICE_QUEUE_OWNER_ARGS = queueOwnerSpawnArgsForModule(import.meta.url);
+const SUBSCRIPTION_POLL_CONCURRENCY = 8;
 
 /** Browser-created sessions stop at the human boundary unless a caller opts into another policy. */
 export const DEFAULT_SESSIONS_PERMISSION_POLICY: Readonly<PermissionPolicy> = {
@@ -279,6 +284,25 @@ function pendingFingerprint(entries: PendingRequest[]): string {
     .join("|");
 }
 
+async function runBounded<T>(
+  values: readonly T[],
+  concurrency: number,
+  run: (value: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    for (;;) {
+      const index = next++;
+      const value = values[index];
+      if (value === undefined) {
+        return;
+      }
+      await run(value);
+    }
+  });
+  await Promise.all(workers);
+}
+
 // oxlint-disable-next-line eslint/complexity -- The fingerprint intentionally covers independent persisted and owner axes.
 function recordFingerprint(
   record: SessionRecord,
@@ -358,11 +382,19 @@ class SessionService implements AcpxSessionService {
   }
 
   private async projectDetail(record: SessionRecord): Promise<AcpxSessionDetail> {
-    return await projectSession(record, true, await this.projectionRegistry(record));
+    const [registry, pending] = await Promise.all([
+      this.projectionRegistry(record),
+      this.pendingEntries(record.acpxRecordId),
+    ]);
+    return await projectSession(record, true, registry, pending);
   }
 
   private async projectSummary(record: SessionRecord): Promise<AcpxSessionSummary> {
-    return await projectSession(record, false, await this.projectionRegistry(record));
+    const [registry, pending] = await Promise.all([
+      this.projectionRegistry(record),
+      this.pendingEntries(record.acpxRecordId),
+    ]);
+    return await projectSession(record, false, registry, pending);
   }
 
   // oxlint-disable-next-line eslint/complexity -- Recovery must validate each durable identity axis before reconnecting.
@@ -427,6 +459,9 @@ class SessionService implements AcpxSessionService {
 
   async listSessions(): Promise<AcpxSessionSummary[]> {
     const records = await listSessions();
+    // Every live-owner read is bounded by LIVE_PENDING_LIST_TIMEOUT_MS. Keep
+    // session projections concurrent so N retained owners cost one bounded
+    // window rather than N serial two-second windows.
     return await Promise.all(records.map(async (record) => await this.projectSummary(record)));
   }
 
@@ -649,9 +684,10 @@ class SessionService implements AcpxSessionService {
           throw new AcpxTurnConflictError(`Session ${record.acpxRecordId} is closed`);
         }
         const config = await this.config(record.cwd);
+        const prompt = typeof input.prompt === "string" ? textPrompt(input.prompt) : input.prompt;
         await appendSessionTimelineLifecycleEvent(
           record,
-          { type: "turn_submitted" },
+          { type: "turn_submitted", prompt_text: promptToDisplayText(prompt) },
           { turnId, requestId: turnId },
         );
         let result: Awaited<ReturnType<typeof sendSession>>;
@@ -659,7 +695,7 @@ class SessionService implements AcpxSessionService {
           result = await sendSession({
             sessionId: record.acpxRecordId,
             turnId,
-            prompt: typeof input.prompt === "string" ? textPrompt(input.prompt) : input.prompt,
+            prompt,
             mcpServers: config.mcpServers,
             mcpConfigPath: config.mcpConfigPath,
             mcpConfigFingerprint: config.mcpConfigFingerprint,
@@ -779,6 +815,12 @@ class SessionService implements AcpxSessionService {
     return receipt;
   }
 
+  /**
+   * Merge durable history with the authoritative waiter set of a live owner.
+   * If that owner cannot answer within the bounded read window, durable state
+   * remains the safe lower bound: inspecting a slow owner must never retire it
+   * or rewrite requests it may still be able to answer.
+   */
   private async pendingEntries(acpxRecordId: string): Promise<PendingRequest[]> {
     const stored = await listStoredPendingRequests(acpxRecordId);
     if (!(await readLiveQueueOwner(acpxRecordId))) {
@@ -910,41 +952,56 @@ class SessionService implements AcpxSessionService {
     });
   }
 
-  // oxlint-disable-next-line eslint/complexity -- Polling compares four independent invalidation sources in one serialized pass.
+  private async pollRecordState(record: SessionRecord): Promise<void> {
+    const previous = this.observedRecords.get(record.acpxRecordId);
+    const owner = await readQueueOwnerRecord(record.acpxRecordId);
+    const next = recordFingerprint(record, owner);
+    if (previous !== undefined && previous !== next) {
+      this.emit({ type: "session", acpxRecordId: record.acpxRecordId });
+      if (record.timeline?.last_seq !== undefined) {
+        this.emit({ type: "timeline", acpxRecordId: record.acpxRecordId });
+      }
+    }
+    if (this.pollingInitialized && previous === undefined) {
+      this.emit({ type: "sessions", acpxRecordId: record.acpxRecordId });
+    }
+    this.observedRecords.set(record.acpxRecordId, next);
+  }
+
+  private async pollPendingState(record: SessionRecord): Promise<void> {
+    const pending = await listStoredPendingRequests(record.acpxRecordId);
+    const nextPending = pendingFingerprint(pending);
+    const previousPending = this.observedPending.get(record.acpxRecordId);
+    if (
+      (previousPending !== undefined && previousPending !== nextPending) ||
+      (previousPending === undefined && pending.length > 0)
+    ) {
+      this.emit({ type: "pending", acpxRecordId: record.acpxRecordId });
+    }
+    this.observedPending.set(record.acpxRecordId, nextPending);
+  }
+
+  private async pollRecord(record: SessionRecord): Promise<void> {
+    await this.pollRecordState(record);
+    await this.pollPendingState(record);
+  }
+
   private async pollInvalidations(): Promise<void> {
     if (this.pollBusy || this.listeners.size === 0) {
       return;
     }
     this.pollBusy = true;
     try {
-      const records = await listSessions();
+      const records = await listOpenSessionsForSubscription(
+        this.options.subscriptionWorkspaceRoots ??
+          (this.options.cwd ? [this.options.cwd] : undefined),
+      );
       const liveIds = new Set(records.map((record) => record.acpxRecordId));
-      for (const record of records) {
-        const previous = this.observedRecords.get(record.acpxRecordId);
-        const owner = await readQueueOwnerRecord(record.acpxRecordId);
-        const next = recordFingerprint(record, owner);
-        if (previous !== undefined && previous !== next) {
-          this.emit({ type: "session", acpxRecordId: record.acpxRecordId });
-          if (record.timeline?.last_seq !== undefined) {
-            this.emit({ type: "timeline", acpxRecordId: record.acpxRecordId });
-          }
-        }
-        if (this.pollingInitialized && previous === undefined) {
-          this.emit({ type: "sessions", acpxRecordId: record.acpxRecordId });
-        }
-        this.observedRecords.set(record.acpxRecordId, next);
-
-        const pending = await listStoredPendingRequests(record.acpxRecordId);
-        const nextPending = pendingFingerprint(pending);
-        const previousPending = this.observedPending.get(record.acpxRecordId);
-        if (
-          (previousPending !== undefined && previousPending !== nextPending) ||
-          (previousPending === undefined && pending.length > 0)
-        ) {
-          this.emit({ type: "pending", acpxRecordId: record.acpxRecordId });
-        }
-        this.observedPending.set(record.acpxRecordId, nextPending);
-      }
+      await runBounded(
+        records,
+        SUBSCRIPTION_POLL_CONCURRENCY,
+        async (record) => await this.pollRecord(record),
+      );
       for (const observedId of this.observedRecords.keys()) {
         if (!liveIds.has(observedId)) {
           this.observedRecords.delete(observedId);

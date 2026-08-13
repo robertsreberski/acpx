@@ -5,6 +5,7 @@ import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
+import { retireIdempotencyReceiptsForSession } from "../../sessions-service/idempotency.js";
 import type { SessionRecord } from "../../types.js";
 import { deletePendingRequestsForSession } from "../pending-requests.js";
 import { deleteSessionTimeline } from "../timeline.js";
@@ -65,6 +66,32 @@ async function loadSessionIndexEntries(): Promise<SessionIndexEntry[]> {
     return await loadOrRebuildSessionIndex(sessionBaseDir());
   });
   return index.entries;
+}
+
+function isWithinWorkspaceRoots(cwd: string, workspaceRoots: readonly string[]): boolean {
+  const candidate = absolutePath(cwd);
+  return workspaceRoots.some((root) => isWithinBoundary(absolutePath(root), candidate));
+}
+
+/**
+ * Materialize only open records relevant to a live subscription. The session
+ * index is the inventory boundary, so closed history and records outside the
+ * embedding application's workspace roots are never re-read by its fast poll.
+ */
+export async function listOpenSessionsForSubscription(
+  workspaceRoots?: readonly string[],
+): Promise<SessionRecord[]> {
+  const entries = (await loadSessionIndexEntries()).filter(
+    (entry) =>
+      !entry.closed &&
+      (!workspaceRoots ||
+        workspaceRoots.length === 0 ||
+        isWithinWorkspaceRoots(entry.cwd, workspaceRoots)),
+  );
+  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  return records
+    .filter((entry): entry is SessionRecord => Boolean(entry))
+    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
 function matchesSessionEntry(
@@ -414,6 +441,10 @@ async function pruneSessionFiles(
   dirEntries: string[],
   includeHistory: boolean,
 ): Promise<number> {
+  // Retire replayable create/adopt and mutation receipts before deleting the
+  // record. Otherwise an old idempotency key could return a phantom session
+  // that pruning has made impossible to address.
+  await retireIdempotencyReceiptsForSession(record.acpxRecordId);
   const safeId = encodeURIComponent(record.acpxRecordId);
   let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
   if (includeHistory) {
