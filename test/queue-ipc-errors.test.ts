@@ -850,7 +850,7 @@ test("SessionQueueOwner rejects no-wait prompts when queue depth exceeds the lim
   });
 });
 
-test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", async () => {
+test("trySubmitToRunningOwner does not retry a prompt after retiring a mismatched owner", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "submit-stale-owner-protocol-mismatch";
     const keeper = await startKeeperProcess();
@@ -885,15 +885,103 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
     await listenServer(server, socketPath);
 
     try {
-      const outcome = await trySubmitToRunningOwner({
-        sessionId,
-        message: "hello",
-        permissionMode: "approve-reads",
-        outputFormatter: NOOP_OUTPUT_FORMATTER,
-        waitForCompletion: true,
-      });
-      assert.equal(outcome, undefined);
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: true,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_OWNER_CHANGED_DURING_REQUEST");
+          assert.equal(error.retryable, false);
+          assert.match(error.message, /may already have been accepted/);
+          return true;
+        },
+      );
       await assert.rejects(fs.access(lockPath));
+    } finally {
+      await closeServer(server);
+      await cleanupOwnerArtifacts({ socketPath, lockPath });
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("trySubmitToRunningOwner does not redeliver a prompt after an ambiguous owner change", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "submit-replacement-owner-protocol-mismatch";
+    const keeper = await startKeeperProcess();
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await writeQueueOwnerLock({
+      lockPath,
+      pid: keeper.pid,
+      sessionId,
+      socketPath,
+      ownerGeneration: 41,
+    });
+    let requestCount = 0;
+
+    const server = createSingleRequestServer((socket, request) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        void writeQueueOwnerLock({
+          lockPath,
+          pid: keeper.pid,
+          sessionId,
+          socketPath,
+          ownerGeneration: 42,
+        }).then(() => {
+          socket.write(
+            `${JSON.stringify({
+              type: "session_update",
+              requestId: request.requestId,
+              update: { sessionId: "replacement-session" },
+            })}\n`,
+          );
+          socket.end();
+        });
+        return;
+      }
+      socket.write(
+        `${JSON.stringify({
+          type: "accepted",
+          requestId: request.requestId,
+        })}\n`,
+      );
+      socket.end();
+    });
+
+    await listenServer(server, socketPath);
+
+    try {
+      await assert.rejects(
+        async () =>
+          await trySubmitToRunningOwner({
+            sessionId,
+            message: "hello",
+            permissionMode: "approve-reads",
+            outputFormatter: NOOP_OUTPUT_FORMATTER,
+            waitForCompletion: false,
+          }),
+        (error: unknown) => {
+          assert(error instanceof QueueConnectionError);
+          assert.equal(error.detailCode, "QUEUE_OWNER_CHANGED_DURING_REQUEST");
+          assert.equal(error.retryable, false);
+          assert.match(error.message, /may already have been accepted/);
+          return true;
+        },
+      );
+      assert.equal(requestCount, 1);
+      const owner = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
+        ownerGeneration: number;
+      };
+      assert.equal(owner.ownerGeneration, 42);
+      assert.equal(keeper.exitCode, null);
+      assert.equal(keeper.signalCode, null);
     } finally {
       await closeServer(server);
       await cleanupOwnerArtifacts({ socketPath, lockPath });

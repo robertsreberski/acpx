@@ -70,11 +70,13 @@ export type AcpRuntimeEnsureInput = {
   cwd?: string;
   /**
    * Per-session agent options applied when a fresh ACP session is created.
-   * Threaded into `_meta.systemPrompt` (and `_meta.claudeCode.options.*`)
-   * on the underlying `session/new` request, and persisted onto the new
-   * record. Ignored when an existing persistent session is reused — system
-   * prompts are fixed at `newSession` time, so changing them requires a
-   * different sessionKey or closing the prior record first.
+   * Model and effort are resolved from advertised ACP session config options,
+   * with model applied before its model-specific effort is validated. System
+   * prompts are threaded into `_meta.systemPrompt` (and
+   * `_meta.claudeCode.options.*`) on `session/new`. Values are persisted onto
+   * the new record. Ignored when an existing persistent session is reused —
+   * changing creation options requires a different sessionKey or closing the
+   * prior record first.
    */
   sessionOptions?: SessionAgentOptions;
 };

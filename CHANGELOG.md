@@ -27,6 +27,8 @@ Repo: https://github.com/openclaw/acpx
   from the design. Inter now ships with the console as a self-hosted variable
   font, so the intended weights render under the console's own CSP.
 
+- CLI/effort: add portable `--effort <level>` selection across one-shot, persistent, queued, compare, flow, and embedded runtime paths; apply model before effort, validate against model-specific ACP config options, and persist explicit effort choices.
+
 ### Breaking
 
 ### Fixes
@@ -44,6 +46,8 @@ Repo: https://github.com/openclaw/acpx
   workspace-root and symlink boundaries.
 
 - Runtime/embedding: settle turn results only after lifecycle persistence and client cleanup attempts finish, including unexpected finalization failures.
+
+- Effort/queue recovery: preserve live turn updates during active controls, close accepted tasks promptly when shutdown interrupts turn startup, and clean up inactive retirement-marker sockets.
 
 ## 2026.7.27 (v0.13.0)
 

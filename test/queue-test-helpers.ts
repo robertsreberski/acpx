@@ -198,6 +198,10 @@ export async function nextJsonLine(
  */
 export const noParkedRequestControlHandlers = {
   cancelQueuedPrompt: async (): Promise<void> => {},
+  applySessionPreferences: async () => ({
+    effortConfigId: "reasoning_effort",
+    response: { configOptions: [] },
+  }),
   listPendingRequests: async (): Promise<PendingRequest[]> => [],
   respondToPendingRequest: async (pendingRequestId: string): Promise<PendingRequest> => {
     throw new PendingRequestNotAnswerableError(

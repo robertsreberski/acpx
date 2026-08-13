@@ -62,7 +62,9 @@ type MockAgentOptions = {
   advertiseConfigOptions: boolean;
   advertiseModels: boolean;
   advertiseLegacyModels: boolean;
+  modelDependentEfforts: boolean;
   modelConfigId: string;
+  omitModelConfigOption: boolean;
   omitReconnectConfigOptions: boolean;
   omitReconnectModelId?: string;
   reportModelAs?: string;
@@ -420,7 +422,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let advertiseConfigOptions = false;
   let advertiseModels = false;
   let advertiseLegacyModels = false;
+  let modelDependentEfforts = false;
   let modelConfigId = "model";
+  let omitModelConfigOption = false;
   let omitReconnectConfigOptions = false;
   let omitReconnectModelId: string | undefined;
   let reportModelAs: string | undefined;
@@ -511,6 +515,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--model-dependent-efforts") {
+      advertiseModels = true;
+      modelDependentEfforts = true;
+      continue;
+    }
+
     if (token === "--advertise-legacy-models") {
       advertiseLegacyModels = true;
       continue;
@@ -520,6 +530,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       modelConfigId = argv[index + 1] ?? "model";
       advertiseModels = true;
       index += 1;
+      continue;
+    }
+
+    if (token === "--omit-model-config-option") {
+      omitModelConfigOption = true;
       continue;
     }
 
@@ -663,7 +678,9 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     advertiseConfigOptions,
     advertiseModels,
     advertiseLegacyModels,
+    modelDependentEfforts,
     modelConfigId,
+    omitModelConfigOption,
     omitReconnectConfigOptions,
     omitReconnectModelId,
     reportModelAs,
@@ -760,6 +777,7 @@ function buildConfigOptions(
   modelConfigId: string,
   omitModelId?: string,
   currentModelId = state.modelId,
+  modelDependentEfforts = false,
 ): SetSessionConfigOptionResponse["configOptions"] {
   const reasoningEffort =
     typeof state.configValues.reasoning_effort === "string"
@@ -773,6 +791,22 @@ function buildConfigOptions(
     { value: "gpt-5.4", name: "gpt-5.4" },
     { value: "gpt-5.2", name: "gpt-5.2" },
   ].filter((option) => option.value !== omitModelId);
+  const effortOptions = modelDependentEfforts
+    ? state.modelId === "smart-model"
+      ? [
+          { value: "high", name: "High" },
+          { value: "xhigh", name: "Xhigh" },
+        ]
+      : [
+          { value: "low", name: "Low" },
+          { value: "medium", name: "Medium" },
+        ]
+    : [
+        { value: "low", name: "Low" },
+        { value: "medium", name: "Medium" },
+        { value: "high", name: "High" },
+        { value: "xhigh", name: "Xhigh" },
+      ];
 
   return [
     {
@@ -803,14 +837,18 @@ function buildConfigOptions(
       category: "thought_level",
       type: "select",
       currentValue: reasoningEffort,
-      options: [
-        { value: "low", name: "Low" },
-        { value: "medium", name: "Medium" },
-        { value: "high", name: "High" },
-        { value: "xhigh", name: "Xhigh" },
-      ],
+      options: effortOptions,
     },
   ];
+}
+
+function filterModelConfigOption(
+  configOptions: SetSessionConfigOptionResponse["configOptions"],
+  omitModelConfigOption: boolean,
+): SetSessionConfigOptionResponse["configOptions"] {
+  return omitModelConfigOption
+    ? configOptions.filter((option) => option.category !== "model")
+    : configOptions;
 }
 
 class MockAgent implements Agent {
@@ -870,10 +908,15 @@ class MockAgent implements Agent {
     }
 
     if (this.options.advertiseModels || this.options.advertiseConfigOptions) {
-      response.configOptions = buildConfigOptions(
-        this.sessions.get(sessionId) ?? createSessionState(false),
-        this.options.modelConfigId,
-        this.options.omitReconnectModelId,
+      response.configOptions = filterModelConfigOption(
+        buildConfigOptions(
+          this.sessions.get(sessionId) ?? createSessionState(false),
+          this.options.modelConfigId,
+          this.options.omitReconnectModelId,
+          undefined,
+          this.options.modelDependentEfforts,
+        ),
+        this.options.omitModelConfigOption,
       );
     }
 
@@ -948,9 +991,15 @@ class MockAgent implements Agent {
       !this.options.omitReconnectConfigOptions &&
       (this.options.advertiseModels || this.options.advertiseConfigOptions)
     ) {
-      response.configOptions = buildConfigOptions(
-        this.sessions.get(sessionId) ?? createSessionState(false),
-        this.options.modelConfigId,
+      response.configOptions = filterModelConfigOption(
+        buildConfigOptions(
+          this.sessions.get(sessionId) ?? createSessionState(false),
+          this.options.modelConfigId,
+          this.options.omitReconnectModelId,
+          undefined,
+          this.options.modelDependentEfforts,
+        ),
+        this.options.omitModelConfigOption,
       );
     }
 
@@ -1007,6 +1056,8 @@ class MockAgent implements Agent {
       sessionId: params.sessionId,
       text,
       modeId: session.modeId,
+      modelId: session.modelId,
+      effort: session.configValues.reasoning_effort,
     });
 
     if (text === "partial-retryable-error") {
@@ -1156,16 +1207,23 @@ class MockAgent implements Agent {
         throw new Error("setSessionModel failed");
       }
       session.modelId = params.value;
+      if (this.options.modelDependentEfforts) {
+        session.configValues.reasoning_effort = params.value === "smart-model" ? "high" : "medium";
+      }
     } else {
       session.configValues[params.configId] = params.value;
     }
 
     return {
-      configOptions: buildConfigOptions(
-        session,
-        this.options.modelConfigId,
-        this.options.omitReconnectModelId,
-        this.options.reportModelAs,
+      configOptions: filterModelConfigOption(
+        buildConfigOptions(
+          session,
+          this.options.modelConfigId,
+          this.options.omitReconnectModelId,
+          this.options.reportModelAs,
+          this.options.modelDependentEfforts,
+        ),
+        this.options.omitModelConfigOption,
       ),
     };
   }
@@ -1268,7 +1326,10 @@ class MockAgent implements Agent {
       return;
     }
     try {
-      appendFileSync(this.options.callLog, `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
+      appendFileSync(
+        this.options.callLog,
+        `${JSON.stringify({ pid: process.pid, parentPid: process.ppid, ...entry })}\n`,
+      );
     } catch {
       // ignore call-log write failures
     }

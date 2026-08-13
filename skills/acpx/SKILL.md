@@ -191,7 +191,7 @@ Behavior:
 
 - Runs the same temporary-session prompt against each listed agent
 - Runs agents serially in the requested workspace
-- Reuses the global `exec` controls: cwd, timeout, permissions, `--policy`, auth, terminal, retries, model/system options, and output format
+- Reuses the global `exec` controls: cwd, timeout, permissions, `--policy`, auth, terminal, retries, model/effort/system options, and output format
 - `--format text` prints one summary table row per agent
 - `--format json` or `--json` prints `CompareRow[]`
 - `--format quiet` prints `<agent>\t<status>` per row
@@ -205,6 +205,7 @@ acpx codex cancel
 acpx codex set-mode auto
 acpx codex set model gpt-5.6-sol
 acpx codex set reasoning_effort max
+acpx --model gpt-5.6-sol --effort max codex 'review the changed files'
 ```
 
 Behavior:
@@ -215,7 +216,9 @@ Behavior:
 - `set`: calls ACP `session/set_config_option`.
 - Current codex-acp releases expose `model` and `reasoning_effort` as separate config options.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.
+- `--effort <level>`: resolves the adapter's advertised thought-level select option, after applying `--model`; values are model-specific and unsupported values fail before the prompt with the advertised choices.
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
+- Direct effort controls such as `set reasoning_effort max` remain compatible and update the same persisted effort preference as `--effort`.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
 - The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter session (respawned queue owner, dead agent process, `session/resume` that fell back to `session/load`/`session/new`), so it survives owner restarts. A refusal by the adapter does not fail the turn: it is logged as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`.
 - **Set the mode before the session's first prompt.** A warm owner between turns keeps its adapter session and applies `set-mode` to a throwaway connection instead, so the record updates but the next prompt still runs at the old mode. `status` does not show the discrepancy. On an already-warm session, retire the owner (`sessions close`, or let `--ttl` lapse) before prompting again.
@@ -339,6 +342,7 @@ Behavior:
 - `--defer`: park `defer`-matched permission requests for `acpx <agent> respond` instead of denying them for the turn
 - `--defer-max-age <seconds>`: how long a parked request waits before expiring like a rejection (default `86400`, `0` never expires)
 - `--model <id>`: request an agent model during session creation; non-Claude agents must advertise a model config option or legacy `models` metadata
+- `--effort <level>`: request an advertised thought/reasoning level; model is applied first, and valid values may differ per model
 - `--system-prompt <text>`: replace the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt`; persisted in `session_options.system_prompt` so reuse keeps the override. Other agents ignore the field.
 - `--append-system-prompt <text>`: append text to the agent system prompt. Forwarded to claude-agent-acp via ACP `_meta.systemPrompt.append`; same persistence rules as `--system-prompt`.
 - `--allowed-tools <list>`: comma-separated tool whitelist (use `""` for no tools)

@@ -360,6 +360,7 @@ export type AcpClientOptions = {
   verbose?: boolean;
   sessionOptions?: {
     model?: string;
+    effort?: string;
     allowedTools?: string[];
     maxTurns?: number;
     systemPrompt?: string | { append: string };
@@ -524,6 +525,7 @@ export type SessionAcpxState = {
   config_options?: SessionConfigOption[];
   session_options?: {
     model?: string;
+    effort?: string;
     allowed_tools?: string[];
     max_turns?: number;
     system_prompt?: string | { append: string };

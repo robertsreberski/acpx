@@ -111,6 +111,14 @@ export type QueueOwnerControlHandlers = {
     modelId: string,
     timeoutMs?: number,
   ) => Promise<SetSessionConfigOptionResponse | undefined>;
+  applySessionPreferences: (
+    modelId: string | undefined,
+    effort: string,
+    timeoutMs?: number,
+  ) => Promise<{
+    effortConfigId: string;
+    response: SetSessionConfigOptionResponse;
+  }>;
   setSessionConfigOption: (
     configId: string,
     value: string,
@@ -624,6 +632,28 @@ export class SessionQueueOwner {
             request.timeoutMs,
           ),
         }),
+      });
+      return true;
+    }
+    if (request.type === "apply_session_preferences") {
+      this.handleControlRequest({
+        socket,
+        requestId: request.requestId,
+        run: async () => {
+          const result = await this.controlHandlers.applySessionPreferences(
+            request.modelId,
+            request.effort,
+            request.timeoutMs,
+          );
+          return {
+            type: "apply_session_preferences_result",
+            requestId: request.requestId,
+            ...(request.modelId ? { modelId: request.modelId } : {}),
+            effort: request.effort,
+            effortConfigId: result.effortConfigId,
+            response: result.response,
+          };
+        },
       });
       return true;
     }

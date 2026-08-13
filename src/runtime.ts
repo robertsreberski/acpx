@@ -40,6 +40,16 @@ export type {
   RequestedModelUnsupportedReason,
 } from "./acp/model-support.js";
 export {
+  REQUESTED_EFFORT_UNSUPPORTED_ERROR_CODE,
+  REQUESTED_EFFORT_UNSUPPORTED_REASONS,
+  isRequestedEffortUnsupportedError,
+  RequestedEffortUnsupportedError,
+} from "./acp/effort-support.js";
+export type {
+  RequestedEffortUnsupportedErrorCode,
+  RequestedEffortUnsupportedReason,
+} from "./acp/effort-support.js";
+export {
   decodeAcpxRuntimeHandleState,
   encodeAcpxRuntimeHandleState,
 } from "./runtime/public/handle-state.js";

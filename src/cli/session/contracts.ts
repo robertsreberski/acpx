@@ -201,6 +201,20 @@ export type SessionSetModelOptions = {
   verbose?: boolean;
 } & TimedRunOptions;
 
+export type SessionApplyPreferencesOptions = {
+  sessionId: string;
+  modelId?: string;
+  effort: string;
+  mcpServers?: McpServer[];
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  authCredentials?: Record<string, string>;
+  authPolicy?: AuthPolicy;
+  fs?: boolean;
+  terminal?: boolean;
+  verbose?: boolean;
+  onModelWarning?: (message: string) => void;
+} & TimedRunOptions;
+
 export type SessionSetConfigOptionOptions = {
   sessionId: string;
   configId: string;

@@ -60,6 +60,7 @@ export async function handleFlowRun(
     suppressSdkConsoleErrors: outputPolicy.suppressSdkConsoleErrors,
     sessionOptions: {
       model: globalFlags.model,
+      effort: globalFlags.effort,
       allowedTools: globalFlags.allowedTools,
       maxTurns: globalFlags.maxTurns,
     },

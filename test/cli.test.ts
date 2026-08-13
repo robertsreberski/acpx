@@ -328,6 +328,7 @@ test("CLI resolves unknown raw agent commands after newer global flags", async (
     const flagCases = [
       ["--system-prompt", "be precise"],
       ["--append-system-prompt", "be concise"],
+      ["--effort", "high"],
       ["--prompt-retries", "1"],
       ["--no-fs"],
       ["--no-terminal"],
@@ -350,6 +351,7 @@ test("global passthrough flags are present in help output", async () => {
     const result = await runCli(["--help"], homeDir);
     assert.equal(result.code, 0, result.stderr);
     assert.match(result.stdout, /--model <id>/);
+    assert.match(result.stdout, /--effort <level>/);
     assert.match(result.stdout, /--allowed-tools <list>/);
     assert.match(result.stdout, /--max-turns <count>/);
     assert.match(result.stdout, /text, json, quiet/);
@@ -567,7 +569,7 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
         {
           agents: {
             codex: {
-              command: MOCK_AGENT_COMMAND,
+              command: `${MOCK_AGENT_COMMAND} --advertise-config-options --model-dependent-efforts`,
             },
           },
         },
@@ -586,8 +588,34 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
     assert.equal(firstPayload.action, "session_ensured");
     assert.equal(firstPayload.created, true);
 
+    const sessionPath = path.join(
+      homeDir,
+      ".acpx",
+      "sessions",
+      `${encodeURIComponent(String(firstPayload.acpxRecordId))}.json`,
+    );
+    const staleStored = JSON.parse(await fs.readFile(sessionPath, "utf8")) as {
+      acpx?: { config_options?: unknown };
+    };
+    if (staleStored.acpx) {
+      delete staleStored.acpx.config_options;
+    }
+    await fs.writeFile(sessionPath, `${JSON.stringify(staleStored, null, 2)}\n`, "utf8");
+
     const second = await runCli(
-      ["--cwd", cwd, "--format", "json", "codex", "sessions", "ensure"],
+      [
+        "--cwd",
+        cwd,
+        "--format",
+        "json",
+        "--model",
+        "smart-model",
+        "--effort",
+        "high",
+        "codex",
+        "sessions",
+        "ensure",
+      ],
       homeDir,
     );
     assert.equal(second.code, 0, second.stderr);
@@ -595,6 +623,12 @@ test("sessions ensure creates when missing and returns existing on subsequent ca
     assert.equal(secondPayload.action, "session_ensured");
     assert.equal(secondPayload.created, false);
     assert.equal(secondPayload.acpxRecordId, firstPayload.acpxRecordId);
+
+    const stored = JSON.parse(await fs.readFile(sessionPath, "utf8")) as {
+      acpx?: { session_options?: { effort?: string; model?: string } };
+    };
+    assert.equal(stored.acpx?.session_options?.model, "smart-model");
+    assert.equal(stored.acpx?.session_options?.effort, "high");
   });
 });
 

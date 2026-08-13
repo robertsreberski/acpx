@@ -1,7 +1,18 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
+import { effortStateFromConfigOptions } from "../../acp/effort-support.js";
 import { withInterrupt } from "../../async-control.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
+import { cloneSessionAcpxState } from "../../session/conversation-model.js";
+import { setCurrentModelId, setDesiredModelId } from "../../session/mode-preference.js";
+import {
+  applyRequestedModelAndEffortIfAdvertised,
+  applyRequestedModelPreferenceToRecord,
+  applyRequestedPreferencesToRecord,
+  clearDesiredEffortAfterUnrefreshedModelChange,
+  currentModelIdFromSetModelResponse,
+  reapplyDesiredEffortAfterModelChange,
+} from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
@@ -27,6 +38,13 @@ export type FullConnectedSessionController = ConnectedSessionController & {
     configId: string,
     value: string,
   ) => Promise<SetSessionConfigOptionResponse>;
+  applySessionPreferences: (
+    modelId: string | undefined,
+    effort: string,
+  ) => Promise<{
+    effortConfigId: string;
+    response: SetSessionConfigOptionResponse;
+  }>;
 };
 
 type ConnectedSessionContext = {
@@ -86,13 +104,100 @@ function createActiveSessionController(params: {
       await params.client.setSessionMode(getActiveSessionId(), modeId);
     },
     setSessionModel: async (modelId: string) => {
+      const previousState = cloneSessionAcpxState(params.record.acpx);
       const models = advertisedModelState(params.record.acpx);
       const response = await params.client.setSessionModel(getActiveSessionId(), modelId, models);
       applyConfigOptionsToRecord(params.record, response);
-      return response;
+      setDesiredModelId(params.record, modelId, models?.configId);
+      setCurrentModelId(params.record, currentModelIdFromSetModelResponse(response, modelId));
+      if (!response) {
+        params.record.acpx = clearDesiredEffortAfterUnrefreshedModelChange({
+          state: params.record.acpx,
+          modelResponse: response,
+          previousModelId: models?.currentModelId,
+          requestedModelId: modelId,
+          previousEffortConfigId: effortStateFromConfigOptions(previousState?.config_options)
+            ?.configId,
+        });
+        return response;
+      }
+      const effort = await reapplyDesiredEffortAfterModelChange({
+        client: params.client,
+        sessionId: getActiveSessionId(),
+        previousState,
+        nextState: params.record.acpx,
+        onReconciledState: (state) => {
+          params.record.acpx = state;
+        },
+      });
+      params.record.acpx = effort.state;
+      return effort.response ?? response;
     },
     setSessionConfigOption: async (configId: string, value: string) => {
-      return await params.client.setSessionConfigOption(getActiveSessionId(), configId, value);
+      const previousState = cloneSessionAcpxState(params.record.acpx);
+      const modelConfigId = advertisedModelState(params.record.acpx)?.configId;
+      const response = await params.client.setSessionConfigOption(
+        getActiveSessionId(),
+        configId,
+        value,
+      );
+      applyConfigOptionsToRecord(params.record, response);
+      if (configId !== modelConfigId) {
+        return response;
+      }
+      setDesiredModelId(params.record, value, configId);
+      setCurrentModelId(params.record, currentModelIdFromSetModelResponse(response, value));
+      const effort = await reapplyDesiredEffortAfterModelChange({
+        client: params.client,
+        sessionId: getActiveSessionId(),
+        previousState,
+        nextState: params.record.acpx,
+        onReconciledState: (state) => {
+          params.record.acpx = state;
+        },
+      });
+      params.record.acpx = effort.state;
+      return effort.response ?? response;
+    },
+    applySessionPreferences: async (modelId: string | undefined, effort: string) => {
+      const models = advertisedModelState(params.record.acpx);
+      const previousEffortConfigId = effortStateFromConfigOptions(
+        params.record.acpx?.config_options,
+      )?.configId;
+      const application = await applyRequestedModelAndEffortIfAdvertised({
+        client: params.client,
+        sessionId: getActiveSessionId(),
+        requestedModel: modelId,
+        requestedEffort: effort,
+        models,
+        configOptions: params.record.acpx?.config_options,
+        agentCommand: params.record.agentCommand,
+        onModelApplied: (modelApplication) => {
+          applyRequestedModelPreferenceToRecord({
+            record: params.record,
+            application: modelApplication,
+            requestedModel: modelId,
+            initialModels: models,
+            previousEffortConfigId,
+            replacesEffort: true,
+          });
+        },
+      });
+      const effortConfigId = applyRequestedPreferencesToRecord({
+        record: params.record,
+        application,
+        requestedModel: modelId,
+        requestedEffort: effort,
+        initialModels: models,
+        previousEffortConfigId,
+      });
+      return {
+        effortConfigId,
+        response: application.effort.response ??
+          application.model.response ?? {
+            configOptions: structuredClone(params.record.acpx?.config_options ?? []),
+          },
+      };
     },
   };
 }
@@ -137,8 +242,8 @@ export async function withConnectedSession<T>(
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           activeController,
-          onClientAvailable: (controller) => {
-            options.onClientAvailable?.(controller);
+          onClientAvailable: () => {
+            options.onClientAvailable?.(activeController);
             notifiedClientAvailable = true;
           },
           onConnectedRecord: options.onConnectedRecord,

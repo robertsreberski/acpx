@@ -4,7 +4,10 @@ import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
-import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
+import {
+  QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION,
+  QUEUE_PROTOCOL_VERSION,
+} from "../src/cli/queue/lease-store.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { SessionEventWriter } from "../src/session/events.js";
 import {
@@ -971,7 +974,7 @@ test("an online pre-snapshot owner keeps depth but exposes no guessed turn contr
       pid: keeper.pid,
       sessionId: record.acpxRecordId,
       ownerGeneration: 88,
-      queueProtocol: QUEUE_PROTOCOL_VERSION - 1,
+      queueProtocol: QUEUE_PROTOCOL_PROMPT_QUEUE_SNAPSHOT_VERSION - 1,
       queueDepth: 1,
     });
     const requests: string[] = [];
