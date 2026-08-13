@@ -926,6 +926,88 @@ test("a failed listen unsubscribes and disposes the service", async () => {
   }
 });
 
+test("listen cleanup preserves unsubscribe, disposal, and original failures", async () => {
+  const { root, running } = await fixture();
+  const service = new MockSessionService();
+  const unsubscribeError = new Error("unsubscribe failed");
+  const disposeError = new Error("dispose failed");
+  service.subscribe = () => () => {
+    throw unsubscribeError;
+  };
+  service.dispose = () => {
+    throw disposeError;
+  };
+  const occupiedPort = Number(new URL(running.origin).port);
+  try {
+    await assert.rejects(
+      startAcpxConsoleServer({
+        config: {
+          host: "127.0.0.1",
+          port: occupiedPort,
+          trustNetwork: false,
+          allowedHosts: ["127.0.0.1"],
+          workspaceRoots: [root],
+          stateDir: join(root, "other-state"),
+          staticDir: join(root, "web"),
+        },
+        service,
+        logger: { info() {}, warn() {}, error() {} },
+      }),
+      (error: unknown) =>
+        error instanceof AggregateError &&
+        error.message === "ACPX Console startup cleanup failed" &&
+        error.errors[0] === unsubscribeError &&
+        error.errors[1] === disposeError &&
+        error.cause instanceof Error &&
+        (error.cause as NodeJS.ErrnoException).code === "EADDRINUSE",
+    );
+  } finally {
+    await running.close();
+  }
+});
+
+test("listen cleanup preserves a non-Error thrown value", async () => {
+  const { root, running } = await fixture();
+  const service = new MockSessionService();
+  service.subscribe = () => () => {
+    throw undefined;
+  };
+  const occupiedPort = Number(new URL(running.origin).port);
+  try {
+    await assert.rejects(
+      startAcpxConsoleServer({
+        config: {
+          host: "127.0.0.1",
+          port: occupiedPort,
+          trustNetwork: false,
+          allowedHosts: ["127.0.0.1"],
+          workspaceRoots: [root],
+          stateDir: join(root, "other-state"),
+          staticDir: join(root, "web"),
+        },
+        service,
+        logger: { info() {}, warn() {}, error() {} },
+      }),
+      (error: unknown) => {
+        if (
+          !(error instanceof AggregateError) ||
+          error.message !== "ACPX Console startup cleanup failed"
+        ) {
+          return false;
+        }
+        return (
+          error.errors.length === 1 &&
+          error.errors[0] === undefined &&
+          error.cause instanceof Error &&
+          (error.cause as NodeJS.ErrnoException).code === "EADDRINUSE"
+        );
+      },
+    );
+  } finally {
+    await running.close();
+  }
+});
+
 test("a failed service subscription disposes the service before startup returns", async () => {
   const root = await mkdtemp(join(tmpdir(), "acpx-console-subscribe-failure-"));
   const web = join(root, "web");

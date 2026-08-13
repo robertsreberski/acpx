@@ -47,6 +47,19 @@ interface BufferedEvent {
   event: ServiceInvalidation | { type: "reset" };
 }
 
+function startupCleanupFailure(cleanupErrors: unknown[], startupError: unknown): Error {
+  if (cleanupErrors.length === 1 && cleanupErrors[0] instanceof Error) {
+    const [cleanupError] = cleanupErrors;
+    if (cleanupError.cause === undefined) {
+      cleanupError.cause = startupError;
+    }
+    return cleanupError;
+  }
+  return new AggregateError(cleanupErrors, "ACPX Console startup cleanup failed", {
+    cause: startupError,
+  });
+}
+
 export interface AcpxConsoleServerOptions {
   config: ResolvedConsoleConfig;
   service: AcpxConsoleSessionService;
@@ -831,11 +844,11 @@ export async function startAcpxConsoleServer(
       });
     });
   } catch (error) {
-    let cleanupError: unknown;
+    const cleanupErrors: unknown[] = [];
     try {
       unsubscribe?.();
     } catch (unsubscribeError) {
-      cleanupError = unsubscribeError;
+      cleanupErrors.push(unsubscribeError);
     }
     for (const socket of sockets) {
       socket.destroy();
@@ -847,13 +860,10 @@ export async function startAcpxConsoleServer(
     try {
       await disposeServiceOnce();
     } catch (disposeError) {
-      cleanupError ??= disposeError;
+      cleanupErrors.push(disposeError);
     }
-    if (cleanupError !== undefined) {
-      if (cleanupError instanceof Error && cleanupError.cause === undefined) {
-        cleanupError.cause = error;
-      }
-      throw cleanupError;
+    if (cleanupErrors.length > 0) {
+      throw startupCleanupFailure(cleanupErrors, error);
     }
     throw error;
   }
