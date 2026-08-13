@@ -214,3 +214,54 @@ test("an authoritative empty replacement epoch clears stale transcript events", 
   assert.equal(reset.gap?.reason, "corrupt");
   assert.equal(reset.continuityIssue?.reason, "epoch_changed");
 });
+
+test("a completed refresh clears legacy continuation from the previous page", () => {
+  const refreshed = mergeRefreshedTimelinePage(
+    {
+      epoch: "epoch-1",
+      events: [event("epoch-1", 1)],
+      coverage: "legacy_retained",
+      legacyImportPending: true,
+    },
+    {
+      epoch: "epoch-1",
+      events: [event("epoch-1", 1), event("epoch-1", 2)],
+      coverage: "legacy_retained",
+    },
+  );
+  assert.equal(refreshed.legacyImportPending, undefined);
+});
+
+test("an epoch reset carries only the replacement page continuation state", () => {
+  const reset = mergeRefreshedTimelinePage(
+    {
+      epoch: "epoch-old",
+      events: [event("epoch-old", 1)],
+      coverage: "legacy_retained",
+      legacyImportPending: true,
+    },
+    {
+      epoch: "epoch-new",
+      events: [],
+      coverage: "complete",
+    },
+  );
+  assert.equal(reset.legacyImportPending, undefined);
+});
+
+test("loading an older page cannot resurrect finished head continuation", () => {
+  const prepended = prependEarlierTimelinePage(
+    {
+      epoch: "epoch-1",
+      events: [event("epoch-1", 2)],
+      coverage: "legacy_retained",
+    },
+    {
+      epoch: "epoch-1",
+      events: [event("epoch-1", 1)],
+      coverage: "legacy_retained",
+      legacyImportPending: true,
+    },
+  );
+  assert.equal(prepended.legacyImportPending, undefined);
+});

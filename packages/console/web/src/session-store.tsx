@@ -214,15 +214,29 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     }
     const sessionId = selectedSessionId;
     let active = true;
+    let retryWarned = false;
     void continueLegacyTimelineImport({
       active: () => active && selectedSessionIdRef.current === sessionId,
-      wait: async () =>
+      wait: async (delayMs) =>
         await new Promise<void>((resolve) => {
-          window.setTimeout(resolve, 16);
+          window.setTimeout(resolve, delayMs);
         }),
       load: async () => await api.timeline(sessionId),
       apply: (page) => {
+        retryWarned = false;
         setTimeline((current) => mergeRefreshedTimelinePage(current, page));
+      },
+      onError: (error) => {
+        if (error instanceof ApiError && error.status === 404) {
+          setSelectedSessionId(null);
+          window.history.replaceState(null, "", "/");
+          return false;
+        }
+        if (!retryWarned && active && selectedSessionIdRef.current === sessionId) {
+          retryWarned = true;
+          notice(`Transcript restoration will retry: ${errorMessage(error)}`, "info");
+        }
+        return true;
       },
     }).catch((error: unknown) => {
       if (active && selectedSessionIdRef.current === sessionId) {

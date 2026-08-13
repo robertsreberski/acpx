@@ -710,10 +710,15 @@ export class SessionTimelineWriter {
   static async open(record: SessionRecord): Promise<SessionTimelineWriter> {
     return await withSessionTimelineLock(record.acpxRecordId, async () => {
       const writer = await SessionTimelineWriter.openWhileLocked(record);
-      while (await writer.importLegacyCompatibilityMessagesBounded()) {
-        // A mutating writer preserves chronological activation semantics by
-        // finishing retained history before it appends a new live event. Read
-        // paths use the one-pass public refresh and expose continuation.
+      if (writer.metadata.legacy_import_complete !== true) {
+        while (await writer.importLegacyCompatibilityMessagesBounded()) {
+          // A mutating writer preserves chronological activation semantics by
+          // finishing retained history before it appends a new live event.
+          // Once caught up, later compatibility bytes from this same modern
+          // writer already have authoritative timeline twins and must not be
+          // imported again. Read paths force a scan only while a live lease
+          // explicitly identifies a pre-timeline owner.
+        }
       }
       await checkpointTimelineMetadata(record, writer.metadata);
       return writer;

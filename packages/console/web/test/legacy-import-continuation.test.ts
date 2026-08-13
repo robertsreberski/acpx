@@ -60,3 +60,53 @@ test("changing the active selection stops before another transcript request", as
 
   assert.equal(loads, 0);
 });
+
+test("a transient read failure retries and still completes retained history", async () => {
+  const delays: number[] = [];
+  const errors: unknown[] = [];
+  let loads = 0;
+  await continueLegacyTimelineImport({
+    active: () => true,
+    wait: async (delayMs) => {
+      delays.push(delayMs);
+    },
+    load: async () => {
+      loads += 1;
+      if (loads === 1) {
+        throw new Error("offline");
+      }
+      return page(false, 2);
+    },
+    apply: () => undefined,
+    onError: (error) => {
+      errors.push(error);
+      return true;
+    },
+  });
+
+  assert.equal(loads, 2);
+  assert.deepEqual(delays, [16, 250]);
+  assert.equal(errors.length, 1);
+});
+
+test("selection invalidation during an in-flight read ignores the stale page", async () => {
+  let active = true;
+  let release!: (value: TimelinePage) => void;
+  const loaded = new Promise<TimelinePage>((resolve) => {
+    release = resolve;
+  });
+  let applied = 0;
+  const continuation = continueLegacyTimelineImport({
+    active: () => active,
+    wait: async () => undefined,
+    load: async () => await loaded,
+    apply: () => {
+      applied += 1;
+    },
+  });
+  await Promise.resolve();
+  active = false;
+  release(page(false, 2));
+  await continuation;
+  assert.equal(applied, 0);
+});

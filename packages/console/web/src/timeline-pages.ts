@@ -153,6 +153,9 @@ export const prependEarlierTimelinePage = (
     ...normalizedEarlier,
     epoch: normalizedCurrent.epoch,
     events,
+    // Backward pages cannot decide whether the live head still has legacy
+    // import work. Preserve only the current head's continuation state.
+    legacyImportPending: normalizedCurrent.legacyImportPending === true ? true : undefined,
     coverage: mergedCoverage(normalizedCurrent.coverage, normalizedEarlier.coverage),
     gap: normalizedEarlier.gap ?? normalizedCurrent.gap,
     continuityIssue: continuityIssue(

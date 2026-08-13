@@ -514,8 +514,16 @@ export function Transcript() {
             <div className="empty-thread-mark">
               <Icon name="spark" size={25} />
             </div>
-            <h2>Ready for a prompt</h2>
-            <p>This session’s complete ACP transcript will appear here as it happens.</p>
+            <h2>
+              {store.timeline?.legacyImportPending === true
+                ? "Restoring transcript"
+                : "Ready for a prompt"}
+            </h2>
+            <p>
+              {store.timeline?.legacyImportPending === true
+                ? "Loading retained history from before lossless capture. No prompt is required."
+                : "This session’s complete ACP transcript will appear here as it happens."}
+            </p>
           </div>
         </ThreadPrimitive.Empty>
         <ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />

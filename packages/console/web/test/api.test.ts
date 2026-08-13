@@ -228,6 +228,30 @@ test("projects corrupt timeline coverage without claiming complete history", asy
   );
 });
 
+test("only a literal true enables legacy transcript continuation", async () => {
+  const api = client();
+  for (const [raw, expected] of [
+    [true, true],
+    [false, undefined],
+    ["true", undefined],
+    [1, undefined],
+  ] as const) {
+    await withFetch(
+      async () =>
+        response({
+          epoch: "epoch-legacy",
+          items: [],
+          hasMore: false,
+          coverage: "legacy_retained",
+          legacyImportPending: raw,
+        }),
+      async () => {
+        assert.equal((await api.timeline("record-1")).legacyImportPending, expected);
+      },
+    );
+  }
+});
+
 test("sends CSRF, idempotency, wrapped interaction answers, and adoption cwd", async () => {
   const api = client();
   api.setCsrfToken("csrf-1");

@@ -158,6 +158,31 @@ test("authoritative timeline append precedes the bounded compatibility stream", 
   });
 });
 
+test("reopening a modern event writer never imports its compatibility copy", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = sessionRecord("timeline-modern-reopen", cwd);
+    await writeSessionRecord(record);
+
+    const first = await SessionEventWriter.open(record);
+    await first.appendMessage(updateMessage(record.acpSessionId, "one"));
+    await first.close({ checkpoint: true });
+
+    const second = await SessionEventWriter.open(await resolveSessionRecord(record.acpxRecordId));
+    await second.appendMessage(updateMessage(record.acpSessionId, "two"));
+    await second.close({ checkpoint: true });
+
+    const page = await listSessionTimelinePage(record.acpxRecordId, { limit: 20 });
+    assert.deepEqual(
+      page.items.flatMap((item) =>
+        "payload" in item && item.payload.kind === "acp" ? [item.payload.message] : [],
+      ),
+      [updateMessage(record.acpSessionId, "one"), updateMessage(record.acpSessionId, "two")],
+    );
+  });
+});
+
 test("partial timeline failure acknowledges committed events before a retry", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");

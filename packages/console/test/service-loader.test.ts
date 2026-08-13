@@ -90,6 +90,7 @@ function coreFixture(sessionList: "supported" | "unsupported" | "unknown" = "sup
           items: [],
           hasMore: false,
           coverage: "complete",
+          legacyImportPending: true,
           writeError: "EACCES /Users/operator/private/session.ndjson",
         };
       },
@@ -117,6 +118,7 @@ test("adapter unwraps mutation receipts and projects provider and agent inventor
   );
   const timeline = await service.getTranscriptPage({ acpxRecordId: "record-1" });
   assert.equal(timeline.epoch, "epoch-1");
+  assert.equal(timeline.legacyImportPending, true);
   assert.equal(
     timeline.writeError,
     "Authoritative timeline persistence failed; recent history may be incomplete.",

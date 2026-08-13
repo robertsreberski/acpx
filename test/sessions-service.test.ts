@@ -20,6 +20,7 @@ import {
 import { appendSessionTimelineLifecycleEvent } from "../src/session/timeline.js";
 import { sessionsServiceTestInternals } from "../src/sessions-service/service.js";
 import { AcpxTurnNotActiveError, createAcpxSessionService } from "../src/sessions.js";
+import type { AcpJsonRpcMessage } from "../src/types.js";
 import {
   cleanupOwnerArtifacts,
   closeServer,
@@ -32,7 +33,7 @@ import {
 } from "./queue-test-helpers.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
-function retainedMessage(sessionId: string, text: string): Record<string, unknown> {
+function retainedMessage(sessionId: string, text: string): AcpJsonRpcMessage {
   return {
     jsonrpc: "2.0",
     method: "session/update",

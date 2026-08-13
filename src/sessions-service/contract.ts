@@ -3,11 +3,7 @@ import type {
   PendingRequestKind,
   PendingRequestState,
 } from "../session/pending-requests.js";
-import type {
-  SessionTimelineCoverage,
-  SessionTimelineItem,
-  SessionTimelinePage,
-} from "../session/timeline.js";
+import type { SessionTimelineCoverage, SessionTimelineItem } from "../session/timeline.js";
 import type {
   AuthPolicy,
   NonInteractivePermissionPolicy,
@@ -288,7 +284,7 @@ export interface AcpxSessionService {
     acpxRecordId: string;
     before?: string;
     limit?: number;
-  }): Promise<SessionTimelinePage>;
+  }): Promise<AcpxTranscriptPage>;
   subscribe(listener: (event: AcpxSessionInvalidation) => void): () => void;
   dispose(): void;
 }

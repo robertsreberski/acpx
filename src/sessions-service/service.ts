@@ -960,7 +960,7 @@ class SessionService implements AcpxSessionService {
     acpxRecordId: string;
     before?: string;
     limit?: number;
-  }): ReturnType<typeof listSessionTimelinePage> {
+  }): Promise<AcpxTranscriptPage> {
     return await this.getTranscriptPage(input);
   }
 
