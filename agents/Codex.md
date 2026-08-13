@@ -13,3 +13,8 @@
 acpx --model gpt-5.6-sol --effort high codex 'review the changed files'
 acpx --model gpt-5.6-sol --effort max codex exec 'analyze this repository'
 ```
+
+- Codex may compact its context during a turn. ACPX recognizes only exact adapter metadata (`_meta.contextCompaction: true`) and requires a later non-empty agent message with `_meta.codex.phase: "final_answer"` before treating any non-cancel terminal response as complete.
+- If that final-answer evidence never arrives, waited commands exit `6` and JSON output includes `_acpx/turn_incomplete` with reason `context_compaction`. ACPX does not automatically prompt again or replay the request.
+- Persistent prompts preserve and require the same Codex provider session, so submit an explicit follow-up in the same scope. One-shot `exec` and `compare` sessions are reported incomplete and then discarded.
+- Session controls also fail closed if that provider session cannot be restored; run `sessions new` explicitly to replace the conversation.

@@ -106,6 +106,21 @@ class CompareAgent {
 
   async prompt(params) {
     const text = promptText(params.prompt);
+    if (mode === "compact") {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: randomUUID(),
+          title: "Context compaction",
+          kind: "other",
+          status: "completed",
+          _meta: { contextCompaction: true },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+
     if (mode === "lock-a" || mode === "lock-b") {
       let status = "isolated";
       try {
@@ -131,7 +146,7 @@ class CompareAgent {
       return { stopReason: "end_turn" };
     }
 
-    if (mode === "permission" || mode === "permission-mixed") {
+    if (mode === "permission" || mode === "permission-mixed" || mode === "permission-compact") {
       const outcomes = [];
       if (mode === "permission-mixed") {
         const readResponse = await this.connection.requestPermission({
@@ -161,6 +176,19 @@ class CompareAgent {
         ],
       });
       outcomes.push(response.outcome.optionId);
+      if (mode === "permission-compact") {
+        await this.connection.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: randomUUID(),
+            title: "Context compaction",
+            kind: "other",
+            status: "completed",
+            _meta: { contextCompaction: true },
+          },
+        });
+      }
       await this.connection.sessionUpdate({
         sessionId: params.sessionId,
         update: {
@@ -221,8 +249,13 @@ async function writeCompareConfig(homeDir: string, agentPath: string): Promise<v
         agents: {
           fast: { command: process.execPath, args: [agentPath, "fast"] },
           slow: { command: process.execPath, args: [agentPath, "slow"] },
+          compact: { command: process.execPath, args: [agentPath, "compact"] },
           error: { command: process.execPath, args: [agentPath, "error"] },
           permission: { command: process.execPath, args: [agentPath, "permission"] },
+          "permission-compact": {
+            command: process.execPath,
+            args: [agentPath, "permission-compact"],
+          },
           "permission-mixed": { command: process.execPath, args: [agentPath, "permission-mixed"] },
           "lock-a": { command: process.execPath, args: [agentPath, "lock-a"] },
           "lock-b": { command: process.execPath, args: [agentPath, "lock-b"] },
@@ -245,8 +278,9 @@ async function setupCompareFixture(homeDir: string): Promise<string> {
 
 type CompareRow = {
   agent: string;
-  status: "ok" | "cancelled" | "error" | "permission_denied";
+  status: "ok" | "cancelled" | "error" | "permission_denied" | "incomplete";
   stop_reason: string | null;
+  incomplete_reason: "context_compaction" | null;
   input_tokens: number | null;
   output_tokens: number | null;
   total_tokens: number | null;
@@ -331,6 +365,48 @@ test("compare keeps successful rows when one agent errors", async () => {
   });
 });
 
+test("compare reports incomplete compaction with exit 6", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await setupCompareFixture(homeDir);
+    const result = await runCli(
+      ["--format", "json", "compare", "fast", "compact", "summarize"],
+      homeDir,
+      cwd,
+    );
+
+    assert.equal(result.code, 6, result.stderr);
+    const rows = JSON.parse(result.stdout) as CompareRow[];
+    assert.equal(rows.find((row) => row.agent === "fast")?.status, "ok");
+    const compact = rows.find((row) => row.agent === "compact");
+    assert.equal(compact?.status, "incomplete");
+    assert.equal(compact?.stop_reason, "end_turn");
+    assert.equal(compact?.incomplete_reason, "context_compaction");
+  });
+});
+
+test("compare keeps errors and cancellation ahead of incomplete exit status", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await setupCompareFixture(homeDir);
+
+    const withError = await runCli(
+      ["--format", "json", "compare", "compact", "error", "summarize"],
+      homeDir,
+      cwd,
+    );
+    assert.equal(withError.code, 1, withError.stderr);
+
+    const withTimeout = await runCli(
+      ["--format", "json", "compare", "compact", "slow", "--timeout", "0.5", "summarize"],
+      homeDir,
+      cwd,
+    );
+    assert.equal(withTimeout.code, 3, withTimeout.stderr);
+    const rows = JSON.parse(withTimeout.stdout) as CompareRow[];
+    assert.equal(rows.find((row) => row.agent === "compact")?.status, "incomplete");
+    assert.equal(rows.find((row) => row.agent === "slow")?.status, "cancelled");
+  });
+});
+
 test("compare timeout marks slow agents as cancelled", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await setupCompareFixture(homeDir);
@@ -400,6 +476,32 @@ test("compare reports partial permission denial as denied", async () => {
     assert.equal(rows[0]?.permission_requests, 2);
     assert.equal(rows[0]?.permission_denied, 1);
     assert.match(rows[0]?.final_message ?? "", /permission selected:allow,reject/);
+  });
+});
+
+test("compare omits incomplete_reason when permission denial takes precedence", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await setupCompareFixture(homeDir);
+    const result = await runCli(
+      [
+        "--approve-all",
+        "--policy",
+        '{"autoDeny":["execute"]}',
+        "--format",
+        "json",
+        "compare",
+        "permission-compact",
+        "summarize",
+      ],
+      homeDir,
+      cwd,
+    );
+
+    assert.equal(result.code, 5, result.stderr);
+    const rows = JSON.parse(result.stdout) as CompareRow[];
+    assert.equal(rows[0]?.status, "permission_denied");
+    assert.equal(rows[0]?.incomplete_reason, null);
+    assert.equal(rows[0]?.permission_denied, 1);
   });
 });
 

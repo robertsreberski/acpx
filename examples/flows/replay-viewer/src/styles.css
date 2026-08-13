@@ -27,6 +27,7 @@
   --node-failed: #d86b6b;
   --node-timed_out: #d49b45;
   --node-cancelled: #9f84e0;
+  --node-incomplete: #e0b75f;
   --edge-complete: #58bb81;
   --edge-active: #3ea6c6;
   --edge-pending: rgba(133, 146, 166, 0.24);
@@ -469,6 +470,12 @@ code {
   color: var(--warning);
 }
 
+.outcome-pill--incomplete,
+.flow-node-card__status--incomplete {
+  background: rgba(224, 183, 95, 0.14);
+  color: var(--node-incomplete);
+}
+
 .outcome-pill--cancelled,
 .flow-node-card__status--cancelled {
   background: rgba(159, 132, 224, 0.14);
@@ -772,6 +779,11 @@ code {
 .flow-node-card--cancelled {
   --flow-node-selected-ring: rgba(159, 132, 224, 0.24);
   border-top: 3px solid var(--node-cancelled);
+}
+
+.flow-node-card--incomplete {
+  --flow-node-selected-ring: rgba(224, 183, 95, 0.24);
+  border-top: 3px solid var(--node-incomplete);
 }
 
 .flow-node-card--selected {

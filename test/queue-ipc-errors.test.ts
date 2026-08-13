@@ -60,6 +60,10 @@ test("trySubmitToRunningOwner propagates typed queue prompt errors", async () =>
 
     const server = createSingleRequestServer((socket, request) => {
       assert.equal(request.type, "submit_prompt");
+      assert.equal(
+        (request as typeof request & { resumePolicy?: unknown }).resumePolicy,
+        "same-session-only",
+      );
       socket.write(
         `${JSON.stringify({
           type: "accepted",
@@ -96,6 +100,7 @@ test("trySubmitToRunningOwner propagates typed queue prompt errors", async () =>
             sessionId,
             message: "hello",
             permissionMode: "approve-reads",
+            resumePolicy: "same-session-only",
             outputFormatter: NOOP_OUTPUT_FORMATTER,
             waitForCompletion: true,
           }),
@@ -437,6 +442,7 @@ test("trySubmitToRunningOwner streams queued lifecycle and returns result", asyn
           type: "result",
           requestId: request.requestId,
           result: {
+            status: "completed",
             stopReason: "end_turn",
             sessionId: "agent-session",
             permissionStats: {

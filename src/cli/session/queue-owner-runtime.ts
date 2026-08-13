@@ -94,6 +94,7 @@ async function submitToRunningOwner(
     mcpConfigPath: options.mcpConfigPath,
     mcpConfigFingerprint: options.mcpConfigFingerprint,
     permissionMode: options.permissionMode,
+    resumePolicy: options.resumePolicy,
     nonInteractivePermissions: options.nonInteractivePermissions,
     permissionPolicy: options.permissionPolicy,
     ...(options.defer ? { defer: true } : {}),

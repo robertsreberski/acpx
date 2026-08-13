@@ -329,7 +329,7 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
         acpxRecordId: "lifecycle-bridge-test",
         acpSessionId: "lifecycle-bridge-session",
         // Pass --pid-file so the bridge records its PID at startup.
-        agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --pid-file ${JSON.stringify(pidFilePath)}`,
+        agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --pid-file ${JSON.stringify(pidFilePath)}`,
         cwd,
       });
       await writeSessionRecordFile(homeDir, record);
@@ -469,7 +469,7 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
       const record = makeSessionRecord({
         acpxRecordId: "lifecycle-bridge-open-socket-test",
         acpSessionId: "lifecycle-bridge-open-socket-session",
-        agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --pid-file ${JSON.stringify(pidFilePath)} --cancel-delay-ms 500`,
+        agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --pid-file ${JSON.stringify(pidFilePath)} --cancel-delay-ms 500`,
         cwd,
       });
       await writeSessionRecordFile(homeDir, record);

@@ -13,6 +13,7 @@ Human-readable stream:
 - `[thinking]` blocks for reasoning chunks
 - `[tool] <title> (<status>)` blocks with output, diff previews, and plan updates
 - `[done] <stopReason>` at the end
+- `[incomplete] context_compaction …` instead of `[done]` when compaction ends without a final answer
 
 ```bash
 acpx codex 'review the auth module'
@@ -87,6 +88,13 @@ If a quiet prompt fails, `acpx` exits non-zero and emits exactly one single-line
 
 ```text
 [acpx] error: <CODE> [<DETAIL_CODE>] <message>
+```
+
+An incomplete quiet prompt keeps any assistant text on stdout, exits `6`, and
+emits exactly one single-line diagnostic to stderr:
+
+```text
+[acpx] incomplete: context_compaction; no final answer was emitted; explicit follow-up required
 ```
 
 `DETAIL_CODE` is omitted when unavailable. Embedded line endings in the message are replaced with spaces. The diagnostic never goes to stdout; quiet stdout remains reserved for any assistant text the adapter produced. This stderr contract applies to direct and queued prompts; it does not change the `json` or `--json-strict` streams.

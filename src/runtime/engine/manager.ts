@@ -76,6 +76,7 @@ import {
   sessionOptionsFromRecord,
   type SessionAgentOptions,
 } from "./session-options.js";
+import { TurnCompletionTracker } from "./turn-completion.js";
 
 export type AcpRuntimeManagerDeps = {
   clientFactory?: (options: ConstructorParameters<typeof AcpClient>[0]) => AcpClient;
@@ -290,6 +291,14 @@ function legacyTerminalEventFromTurnResult(result: AcpRuntimeTurnResult): AcpRun
       ...(result.error.code ? { code: result.error.code } : {}),
       ...(result.error.detailCode ? { detailCode: result.error.detailCode } : {}),
       ...(result.error.retryable === undefined ? {} : { retryable: result.error.retryable }),
+    };
+  }
+  if (result.status === "incomplete") {
+    return {
+      type: "done",
+      ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+      incomplete: true,
+      reason: result.reason,
     };
   }
   return {
@@ -550,6 +559,7 @@ type RunningRuntimeTurn = {
   pendingClient: AcpClient | undefined;
   promptMessageId: string | undefined;
   activeSessionId: string;
+  completionTracker: TurnCompletionTracker;
 };
 
 function applyConfigOptionResponseToTurn(
@@ -998,12 +1008,17 @@ export class AcpRuntimeManager {
           timeoutMs: task.input.timeoutMs ?? this.options.timeoutMs,
           conversation: turn.conversation,
           promptMessageId: turn.promptMessageId,
+          completionTracker: turn.completionTracker,
         });
         await this.saveCompletedRuntimeTurn(turn, response.stopReason);
-        terminalResult = {
-          status: response.stopReason === "cancelled" ? "cancelled" : "completed",
-          ...(response.stopReason ? { stopReason: response.stopReason } : {}),
-        };
+        terminalResult =
+          response.status === "incomplete"
+            ? {
+                status: response.status,
+                stopReason: response.stopReason,
+                reason: response.reason,
+              }
+            : { status: response.status, stopReason: response.stopReason };
       }
     } catch (error) {
       terminalResult = this.failRuntimeTurn(task, error);
@@ -1042,6 +1057,7 @@ export class AcpRuntimeManager {
       pendingClient,
       promptMessageId,
       activeSessionId: record.acpSessionId,
+      completionTracker: new TurnCompletionTracker(),
     };
     task.state.activeController = this.buildRuntimeTurnController(task, turn);
     this.activeControllers.set(record.acpxRecordId, task.state.activeController);
@@ -1235,6 +1251,7 @@ export class AcpRuntimeManager {
       onAcpMessage: undefined,
       onAcpOutputMessage: undefined,
       onSessionUpdate: (notification) => {
+        turn.completionTracker.observe(notification);
         turn.acpxState = recordSessionUpdate(turn.conversation, turn.acpxState, notification);
         trimConversationForRuntime(turn.conversation);
         turn.liveCheckpoint.request();

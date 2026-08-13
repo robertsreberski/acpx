@@ -39,23 +39,28 @@ const QUEUE_OWNER_RETIREMENT_LIVENESS_TIMEOUT_MS = 250;
  * 3: prompt session options carry `effort`, and clients may send the
  *    `apply_session_preferences` control request. A v2 owner silently drops
  *    effort from prompt options and cannot apply the combined control.
+ * 4: every submit_prompt result carries a discriminated completion status,
+ *    including context-compaction incompleteness. A v1/v2/v3 owner can accept
+ *    the request but cannot report that outcome safely.
  */
-export const QUEUE_PROTOCOL_VERSION = 3;
+export const QUEUE_PROTOCOL_VERSION = 4;
 /** Owners whose lease predates the queueProtocol field. */
 export const LEGACY_QUEUE_PROTOCOL_VERSION = 1;
 /** First protocol version that understands `defer` permission policies. */
 export const QUEUE_PROTOCOL_DEFER_VERSION = 2;
 /** First protocol version that understands effort-bearing requests. */
 export const QUEUE_PROTOCOL_EFFORT_VERSION = 3;
+/** First protocol version with discriminated prompt completion results. */
+export const QUEUE_PROTOCOL_COMPLETION_STATUS_VERSION = 4;
 
 /**
  * Number of permission-policy rule keys this protocol version was decided
  * against. Adding a key to PERMISSION_POLICY_RULE_KEYS means every existing
  * owner silently ignores it — the same failure `defer` had — so a new rule key
- * is a protocol decision, not a local one. When one lands: teach
- * `permissionPolicyNeedsDeferSupport` (src/cli/queue/ipc.ts) about the new key,
- * bump QUEUE_PROTOCOL_VERSION, then update this count. A test pins the two
- * together so the decision cannot be skipped by accident.
+ * is a protocol decision, not a local one. When one lands, bump
+ * QUEUE_PROTOCOL_VERSION, add any required submission compatibility gate,
+ * then update this count. A test pins the two together so the decision cannot
+ * be skipped by accident.
  */
 export const QUEUE_PROTOCOL_RULE_KEY_COUNT = 4;
 

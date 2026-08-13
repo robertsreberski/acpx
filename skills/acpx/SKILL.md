@@ -139,6 +139,7 @@ Behavior:
 - Uses a saved session for the session scope key
 - Auto-resumes prior session when one exists for that scope
 - If no session exists for the scope, exits with `NO_SESSION` and prompts for `sessions new`
+- Requires the exact saved provider session to resume or load. If it cannot, the prompt fails closed; run `sessions new` explicitly only when a fresh conversation is intended.
 - Is queue-aware when another prompt is already running for the same session
 - On interrupt during an active turn, sends ACP `session/cancel` before force-kill fallback
 
@@ -159,6 +160,7 @@ Behavior:
 
 - Runs a single prompt in a temporary ACP session
 - Does not reuse or save persistent session state
+- Exits `6` when exact Codex compaction metadata is not followed by exact final-answer metadata; the temporary session is discarded and any retry is explicit
 
 ### Compare (multi-agent one-shot)
 
@@ -176,6 +178,7 @@ Behavior:
 - `--format json` or `--json` prints `CompareRow[]`
 - `--format quiet` prints `<agent>\t<status>` per row
 - `--json` is a local alias for `--format json`, and `--prompt-file` a local alias for `-f/--file`
+- An unresolved Codex compaction produces status `incomplete`, `incomplete_reason: "context_compaction"`, and exit `6` unless an error, permission denial, or cancellation takes precedence
 - Does not create saved sessions or separate compare transcript directories
 
 ### Cancel / Mode / Config / Model
@@ -200,7 +203,8 @@ Behavior:
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
 - Direct effort controls such as `set reasoning_effort max` remain compatible and update the same persisted effort preference as `--effort`.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
-- The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter session (respawned queue owner, dead agent process, `session/resume` that fell back to `session/load`/`session/new`), so it survives owner restarts. A refusal by the adapter does not fail the turn: it is logged as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`.
+- Direct control reconnects require the exact saved provider session, just like persistent prompts. If `session/resume` or `session/load` cannot restore it, the command fails with `SESSION_RESUME_REQUIRED`; use `sessions new` explicitly only when replacing the conversation is intended.
+- The mode is saved on the session record and re-applied whenever `acpx` binds that record to a fresh adapter process (respawned queue owner, dead agent process, or `session/resume` that fell back to `session/load`), so it survives owner restarts. A refusal by the adapter does not fail the turn: it is logged as an `_acpx/warning` with `code: SESSION_MODE_NOT_REAPPLIED`.
 - **Set the mode before the session's first prompt.** A warm owner between turns keeps its adapter session and applies `set-mode` to a throwaway connection instead, so the record updates but the next prompt still runs at the old mode. `status` does not show the discrepancy. On an already-warm session, retire the owner (`sessions close`, or let `--ttl` lapse) before prompting again.
 
 ### Deferred permission requests
@@ -452,7 +456,8 @@ Persistence:
 Resume behavior:
 
 - Prompt mode attempts to reconnect to saved session.
-- If adapter-side session is invalid/not found, `acpx` creates a fresh session and updates the saved record.
+- If the adapter-side session is invalid, missing, or unsupported, a persistent prompt fails instead of replacing the conversation with a fresh session. The narrow exception is the first prompt after `sessions new` when the untouched record advertises neither `session/resume` nor `session/load`; `acpx` may initialize that empty conversation with `session/new` while preserving its local record identity.
+- `sessions new` is the explicit escape hatch when starting a fresh conversation is intended.
 - explicitly selected session records can still be resumed via `loadSession` even if previously closed.
 - dead saved PIDs are detected and reconnected on the next prompt.
 - each completed prompt stores lightweight turn history previews in the session record.
@@ -472,6 +477,7 @@ Submission behavior:
 
 - Default: enqueue and wait for queued prompt completion, streaming updates back.
 - `--no-wait`: enqueue and return after queue acknowledgement.
+- If a no-wait Codex turn later ends incomplete after context compaction, `_acpx/turn_incomplete` is retained in the durable per-session event stream.
 - `Ctrl+C` during an active turn sends ACP `session/cancel`, waits briefly, then force-kills only if cancellation does not finish in time.
 - `cancel` sends the same cooperative cancellation without requiring terminal signals.
 
@@ -480,8 +486,8 @@ Submission behavior:
 Use `--format <fmt>`:
 
 - `text` (default): human-readable stream with updates/tool status and done line
-- `json`: NDJSON event stream (good for automation)
-- `quiet`: final assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr
+- `json`: ACP NDJSON plus acpx JSON-RPC extension notifications under `_acpx/*` (good for automation)
+- `quiet`: final assistant text on stdout; failed prompts emit one structured `[acpx] error:` line on stderr and incomplete prompts emit one `[acpx] incomplete:` line
 - `--suppress-reads`: replace raw read-file contents with `[read output suppressed]` in `text` and `json` output
 - `--json-strict`: pair with `--format json` to suppress non-JSON stderr noise (logs, banners) for downstream consumers
 
@@ -491,6 +497,16 @@ Example automation:
 acpx --format json codex exec 'review changed files' \
   | jq -r 'select(.type=="tool_call") | [.status, .title] | @tsv'
 ```
+
+### Incomplete Codex turns
+
+Treat `_acpx/turn_incomplete` as a terminal non-success result. `acpx` emits it only when an update has exact `_meta.contextCompaction: true`, the adapter returns a non-cancel stop reason, and no later non-empty `agent_message_chunk` has exact `_meta.codex.phase: "final_answer"` in that prompt attempt. It does not guess from prose or tool titles.
+
+- Waited `prompt`, `exec`, and `compare` exit `6`.
+- Persistent prompt keeps the exact provider session. Continue with another explicit prompt in the same scope; do not assume `acpx` sent a hidden follow-up.
+- `exec` and `compare` discard temporary sessions after reporting incomplete, so rerun explicitly if needed.
+- `--format json` emits `{"jsonrpc":"2.0","method":"_acpx/turn_incomplete","params":{"reason":"context_compaction","stopReason":"end_turn"}}`.
+- The embedding runtime returns status `incomplete` with the adapter's actual stop reason; legacy `runTurn()` emits `done` with `incomplete: true` and reason `context_compaction`.
 
 ## Permission modes
 
@@ -506,6 +522,8 @@ If every permission request is denied/cancelled and none approved, `acpx` exits 
 ## Flows (multi-agent workflows)
 
 Flows let you declare a multi-agent workflow as a graph of typed nodes connected by edges, executed by the `acpx` runtime. The runtime owns persistence, retries, timeouts, and routing — the flow file declares the shape, not the engine.
+
+An unresolved Codex compaction gives the `acp` node outcome `incomplete`. The runtime saves the raw response and `trace.turn`, skips the node's `parse` callback, does not publish partial output, and allows routing on `$result.outcome`.
 
 ### Run a flow
 

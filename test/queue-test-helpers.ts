@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
 import { PendingRequestNotAnswerableError } from "../src/errors.js";
 import type { PendingRequest } from "../src/session/pending-requests.js";
@@ -62,7 +63,8 @@ export async function writeQueueOwnerLock(options: {
   mcpConfigFingerprint?: string;
   createdAt?: string;
   heartbeatAt?: string;
-  queueProtocol?: number;
+  /** null deliberately models a lease written before queueProtocol existed. */
+  queueProtocol?: number | null;
   acpxVersion?: string;
   parking?: boolean;
   parkingMaxAgeMs?: number;
@@ -86,7 +88,9 @@ export async function writeQueueOwnerLock(options: {
       ...(options.mcpConfigFingerprint
         ? { mcpConfigFingerprint: options.mcpConfigFingerprint }
         : {}),
-      ...(options.queueProtocol !== undefined ? { queueProtocol: options.queueProtocol } : {}),
+      ...(options.queueProtocol === null
+        ? {}
+        : { queueProtocol: options.queueProtocol ?? QUEUE_PROTOCOL_VERSION }),
       ...(options.acpxVersion ? { acpxVersion: options.acpxVersion } : {}),
       ...(options.parking ? { parking: true } : {}),
       ...(options.parkingMaxAgeMs === undefined

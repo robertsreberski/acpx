@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { sessionRuntimeTestInternals } from "../src/cli/session/runtime.js";
 
-const { mergeQueuedTaskSessionPreferences } = sessionRuntimeTestInternals;
+const { mergeQueuedTaskSessionPreferences, oneShotInitialDrainIdleMs } =
+  sessionRuntimeTestInternals;
 
 test("queued tasks inherit owner effort as the prompt-time request", () => {
   const preferences = mergeQueuedTaskSessionPreferences(
@@ -15,4 +16,26 @@ test("queued tasks inherit owner effort as the prompt-time request", () => {
     effort: "high",
   });
   assert.equal(preferences.requestedEffort, "high");
+});
+
+test("one-shot Codex turns retain the full late-compaction observation horizon", () => {
+  assert.equal(
+    oneShotInitialDrainIdleMs({
+      agentCommand: "npx -y @agentclientprotocol/codex-acp@^1.1.5",
+    }),
+    undefined,
+  );
+  assert.equal(
+    oneShotInitialDrainIdleMs({
+      agentCommand: "ignored structured identity",
+      agentArgv: ["npx", "-y", "@agentclientprotocol/codex-acp@^1.1.5"],
+    }),
+    undefined,
+  );
+  assert.equal(
+    oneShotInitialDrainIdleMs({
+      agentCommand: "npx -y @agentclientprotocol/claude-agent-acp@^0.66.0",
+    }),
+    100,
+  );
 });

@@ -42,7 +42,7 @@ export type FlowDefinitionSnapshot = {
   edges: FlowEdge[];
 };
 
-export type FlowNodeOutcome = "ok" | "timed_out" | "failed" | "cancelled";
+export type FlowNodeOutcome = "ok" | "timed_out" | "failed" | "cancelled" | "incomplete";
 
 export type FlowArtifactRef = {
   path: string;
@@ -71,6 +71,11 @@ export type FlowActionReceipt = {
 
 export type FlowStepTrace = {
   sessionId?: string;
+  turn?: {
+    status: "completed" | "cancelled" | "incomplete";
+    stopReason: string;
+    reason?: "context_compaction";
+  };
   promptArtifact?: FlowArtifactRef;
   rawResponseArtifact?: FlowArtifactRef;
   outputArtifact?: FlowArtifactRef;

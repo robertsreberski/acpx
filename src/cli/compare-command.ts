@@ -42,8 +42,9 @@ const FINAL_MESSAGE_PREVIEW_CHARS = 200;
 
 export type CompareRow = {
   agent: string;
-  status: "ok" | "cancelled" | "error" | "permission_denied";
+  status: "ok" | "cancelled" | "error" | "permission_denied" | "incomplete";
   stop_reason: string | null;
+  incomplete_reason: "context_compaction" | null;
   wall_ms: number;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -274,6 +275,19 @@ function rowStatusFromPermissionStats(stats: PermissionStats): CompareRow["statu
   return deniedOrCancelled > 0 ? "permission_denied" : "ok";
 }
 
+function compareStatus(
+  result: Awaited<ReturnType<typeof runOnce>>,
+  permissionStats: PermissionStats,
+): CompareRow["status"] {
+  if (result.stopReason === "cancelled") {
+    return "cancelled";
+  }
+  if (rowStatusFromPermissionStats(permissionStats) === "permission_denied") {
+    return "permission_denied";
+  }
+  return result.status === "incomplete" ? "incomplete" : "ok";
+}
+
 function sessionOptionsFromGlobalFlags(globalFlags: ReturnType<typeof resolveGlobalFlags>) {
   return {
     model: globalFlags.model,
@@ -302,13 +316,13 @@ function buildSuccessRow(
   startedAt: number,
 ): CompareRow {
   const permissionStats = result.permissionStats;
+  const status = compareStatus(result, permissionStats);
   return {
     agent: agentName,
-    status:
-      result.stopReason === "cancelled"
-        ? "cancelled"
-        : rowStatusFromPermissionStats(permissionStats),
+    status,
     stop_reason: result.stopReason,
+    incomplete_reason:
+      status === "incomplete" && result.status === "incomplete" ? result.reason : null,
     wall_ms: Math.round(performance.now() - startedAt),
     input_tokens: capture.usage.input_tokens ?? null,
     output_tokens: capture.usage.output_tokens ?? null,
@@ -330,6 +344,7 @@ function buildErrorRow(
     agent: agentName,
     status: caught instanceof TimeoutError ? "cancelled" : "error",
     stop_reason: null,
+    incomplete_reason: null,
     wall_ms: Math.round(performance.now() - startedAt),
     input_tokens: capture.usage.input_tokens ?? null,
     output_tokens: capture.usage.output_tokens ?? null,
@@ -407,6 +422,7 @@ function renderTable(rows: CompareRow[]): string {
     "total",
     "permissions",
     "stop_reason",
+    "incomplete_reason",
     "final_message",
     "error",
   ];
@@ -419,6 +435,7 @@ function renderTable(rows: CompareRow[]): string {
     row.total_tokens,
     `${row.permission_denied}/${row.permission_requests}`,
     row.stop_reason,
+    row.incomplete_reason,
     row.final_message,
     row.error,
   ]);
@@ -467,6 +484,10 @@ function updateCompareExitCode(rows: CompareRow[]): void {
   }
   if (rows.some((row) => row.status === "cancelled")) {
     process.exitCode = EXIT_CODES.TIMEOUT;
+    return;
+  }
+  if (rows.some((row) => row.status === "incomplete")) {
+    process.exitCode = EXIT_CODES.INCOMPLETE;
   }
 }
 
