@@ -75,6 +75,29 @@ function park(
   );
 }
 
+/**
+ * Production expiry timers are intentionally unref'd so a parked request never
+ * keeps an otherwise-idle queue owner alive. Tests awaiting expiry therefore
+ * need their own bounded, referenced deadline: Node 22 correctly terminates a
+ * test whose only remaining handle is the manager's unref'd timer.
+ */
+async function waitForExpiry<T>(decision: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("timed out waiting for pending request expiry")),
+      2_000,
+    );
+  });
+  try {
+    return await Promise.race([decision, deadline]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 test("park writes the entry before returning control to the caller", async () => {
   await withTempHome(async () => {
     const { manager, events } = makeManager();
@@ -174,7 +197,7 @@ test("expiry resolves with the reject option and marks the entry expired", async
     const controller = new AbortController();
     const decision = park(manager, controller);
 
-    assert.deepEqual(await decision, { outcome: "select", optionId: "reject" });
+    assert.deepEqual(await waitForExpiry(decision), { outcome: "select", optionId: "reject" });
     const [stored] = await listPendingRequests(SESSION_ID);
     assert.equal(stored?.state, "expired");
     assert.equal(stored?.resolution?.source, "expiry");
@@ -197,7 +220,7 @@ test("expiry cancels when the agent offered no reject option", async () => {
       makeRequest({ options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }] }),
     );
 
-    assert.deepEqual(await decision, { outcome: "cancel" });
+    assert.deepEqual(await waitForExpiry(decision), { outcome: "cancel" });
     const [stored] = await listPendingRequests(SESSION_ID);
     assert.equal(stored?.state, "expired");
     assert.equal(stored?.resolution?.optionId, undefined);
@@ -628,7 +651,7 @@ test("expiry declines an elicitation and never accepts one", async () => {
 
     // Nobody filled the form in, so the only truthful answer is that it was
     // skipped. Synthesizing content would put words in the operator's mouth.
-    assert.deepEqual(await decision, { outcome: "decline" });
+    assert.deepEqual(await waitForExpiry(decision), { outcome: "decline" });
 
     const [pending] = await listPendingRequests(SESSION_ID);
     assert.equal(pending?.state, "expired");
