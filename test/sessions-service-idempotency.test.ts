@@ -155,7 +155,7 @@ test("a fresh idempotency key recovers a checkpointed mutation in the same scope
   });
 });
 
-test("legacy receipts rebuild recovery and session indexes before accepting a fresh key", async () => {
+test("legacy receipts rebuild recovery and ledger indexes before accepting a fresh key", async () => {
   await withTempHome("acpx-sessions-idempotency-", async () => {
     const recoveryScope = { agentId: "mock", cwd: "/legacy" };
     const scopeHash = idempotencyTestInternals.fingerprint(recoveryScope);
@@ -198,10 +198,13 @@ test("legacy receipts rebuild recovery and session indexes before accepting a fr
     assert.equal(recovered.replayed, true);
     assert.equal(runs, 0);
     await fs.access(idempotencyTestInternals.migrationMarkerPath());
-    const sessionIndex = JSON.parse(
-      await fs.readFile(idempotencyTestInternals.sessionIndexPath("legacy-record"), "utf8"),
-    ) as { keys: string[] };
-    assert.deepEqual(sessionIndex.keys.toSorted(), ["legacy-first", "legacy-second"]);
+    const ledger = JSON.parse(
+      await fs.readFile(idempotencyTestInternals.ledgerIndexPath(), "utf8"),
+    ) as { entries: Array<{ key: string }> };
+    assert.deepEqual(ledger.entries.map((entry) => entry.key).toSorted(), [
+      "legacy-first",
+      "legacy-second",
+    ]);
   });
 });
 
@@ -331,6 +334,69 @@ test("terminal receipts compact to a bounded ledger and retired keys fail closed
       AcpxIdempotencyRetiredError,
     );
     assert.equal(reran, false);
+  });
+});
+
+test("exact replay repairs missing and stale ledger membership after a crash", async () => {
+  await withTempHome("acpx-sessions-idempotency-", async () => {
+    const key = "crash-healed-replay";
+    const input = { acpxRecordId: "session-1" };
+    const now = new Date().toISOString();
+    const receiptPath = idempotencyTestInternals.mutationPath(key);
+    await fs.mkdir(path.dirname(receiptPath), { recursive: true });
+    await fs.writeFile(
+      receiptPath,
+      `${JSON.stringify({
+        schema: "acpx.session_mutation.v1",
+        idempotency_key: key,
+        operation: "close_session",
+        fingerprint: idempotencyTestInternals.fingerprint(input),
+        state: "succeeded",
+        created_at: now,
+        updated_at: now,
+        pid: process.pid,
+        result: { closed: true },
+      })}\n`,
+      "utf8",
+    );
+    await fs.writeFile(idempotencyTestInternals.migrationMarkerPath(), "v1\n", "utf8");
+    await fs.writeFile(
+      idempotencyTestInternals.ledgerIndexPath(),
+      `${JSON.stringify({ schema: "acpx.session_mutation_ledger.v1", entries: [] })}\n`,
+      "utf8",
+    );
+    let runs = 0;
+    const replay = async () =>
+      await runIdempotentMutation({
+        operation: "close_session",
+        idempotencyKey: key,
+        input,
+        run: async () => ({ closed: ++runs > 0 }),
+      });
+
+    assert.equal((await replay()).replayed, true);
+    let ledger = JSON.parse(
+      await fs.readFile(idempotencyTestInternals.ledgerIndexPath(), "utf8"),
+    ) as { entries: Array<{ key: string; state: string }> };
+    assert.deepEqual(
+      ledger.entries.map(({ key: entryKey, state }) => [entryKey, state]),
+      [[key, "succeeded"]],
+    );
+
+    await fs.writeFile(
+      idempotencyTestInternals.ledgerIndexPath(),
+      `${JSON.stringify({
+        schema: "acpx.session_mutation_ledger.v1",
+        entries: [{ key, state: "started", updated_at: now }],
+      })}\n`,
+      "utf8",
+    );
+    assert.equal((await replay()).replayed, true);
+    ledger = JSON.parse(await fs.readFile(idempotencyTestInternals.ledgerIndexPath(), "utf8")) as {
+      entries: Array<{ key: string; state: string }>;
+    };
+    assert.equal(ledger.entries[0]?.state, "succeeded");
+    assert.equal(runs, 0);
   });
 });
 

@@ -99,12 +99,11 @@ not invent a cancellation target from transcript history. A just-accepted
 browser receipt may bridge projection lag briefly while its owner is online;
 it expires after a bounded grace period if no exact row arrives.
 
-Replayable mutation results are retained for seven days and at least the latest
-512 terminal actions. Compacted key hashes remain exact (not probabilistic)
+A terminal mutation result remains replayable until it is seven days old or is
+displaced from the latest 512 terminal actions. The active receipt ledger is
+bounded at 1,024 entries. Compacted key hashes remain exact (not probabilistic)
 tombstones for 30 more days, so reusing a compacted key fails closed instead of
-repeating the action. Session pruning retires every receipt tied to that record
-before deleting it; an old create or adopt key can never return a phantom
-pruned session.
+repeating the action.
 
 **Cancel turn** cooperatively cancels only the targeted active or queued turn.
 **Close session** is a separate action and does not masquerade as cancel or

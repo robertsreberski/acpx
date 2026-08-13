@@ -5,7 +5,6 @@ import path from "node:path";
 import { SessionNotFoundError, SessionResolutionError } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
-import { retireIdempotencyReceiptsForSession } from "../../sessions-service/idempotency.js";
 import type { SessionRecord } from "../../types.js";
 import { deletePendingRequestsForSession } from "../pending-requests.js";
 import { deleteSessionTimeline } from "../timeline.js";
@@ -468,10 +467,6 @@ async function pruneSessionFiles(
   dirEntries: string[],
   includeHistory: boolean,
 ): Promise<number> {
-  // Retire replayable create/adopt and mutation receipts before deleting the
-  // record. Otherwise an old idempotency key could return a phantom session
-  // that pruning has made impossible to address.
-  await retireIdempotencyReceiptsForSession(record.acpxRecordId);
   const safeId = encodeURIComponent(record.acpxRecordId);
   let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
   if (includeHistory) {

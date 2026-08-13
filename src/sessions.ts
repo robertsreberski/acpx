@@ -14,7 +14,6 @@ export {
   AcpxIdempotencyInDoubtError,
   AcpxIdempotencyLedgerFullError,
   AcpxIdempotencyRetiredError,
-  AcpxIdempotencySessionPrunedError,
   AcpxIdempotentMutationError,
 } from "./sessions-service/idempotency.js";
 export type {

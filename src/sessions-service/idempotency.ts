@@ -7,17 +7,15 @@ import type { AcpxMutationOperation, AcpxMutationReceipt } from "./contract.js";
 
 const IDEMPOTENCY_SCHEMA = "acpx.session_mutation.v1" as const;
 const RECOVERY_INDEX_SCHEMA = "acpx.session_mutation_recovery.v1" as const;
-const SESSION_INDEX_SCHEMA = "acpx.session_mutation_session.v1" as const;
 const RETIRED_KEYS_SCHEMA = "acpx.session_mutation_retired.v1" as const;
 const LOCK_RETRY_MS = 20;
 const DEFAULT_MAX_RECEIPTS = 1_024;
 const DEFAULT_MAX_TERMINAL_RECEIPTS = 512;
 const DEFAULT_TERMINAL_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_RECOVERY_CANDIDATES = 32;
-// Replayable result receipts live for seven days (or the latest 512 terminal
-// actions). Compacted keys then remain exact tombstones for another 30 days.
-// This explicit retention contract gives callers at least 30 days of exact
-// idempotency without an unbounded ledger or probabilistic false positives.
+// A terminal result remains replayable until it is seven days old or displaced
+// from the latest 512 terminal actions. Compacted keys then remain exact
+// tombstones for 30 days, without an unbounded or probabilistic ledger.
 const RETIRED_KEY_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_RETIRED_KEYS_PER_SHARD = 1_024;
 const MUTATION_OPERATIONS = new Set<AcpxMutationOperation>([
@@ -34,11 +32,10 @@ type StoredMutation = {
   idempotency_key: string;
   operation: AcpxMutationOperation;
   fingerprint: string;
-  state: "started" | "succeeded" | "failed" | "pruned";
+  state: "started" | "succeeded" | "failed";
   created_at: string;
   updated_at: string;
   pid: number;
-  acpx_record_id?: string;
   recovery_scope?: string;
   recovery_result?: unknown;
   result?: unknown;
@@ -49,12 +46,6 @@ type RecoveryIndex = {
   schema: typeof RECOVERY_INDEX_SCHEMA;
   operation: AcpxMutationOperation;
   scope_hash: string;
-  keys: string[];
-};
-
-type SessionReceiptIndex = {
-  schema: typeof SESSION_INDEX_SCHEMA;
-  acpx_record_id: string;
   keys: string[];
 };
 
@@ -138,18 +129,6 @@ export class AcpxIdempotencyRetiredError extends Error {
   }
 }
 
-export class AcpxIdempotencySessionPrunedError extends Error {
-  readonly code = "IDEMPOTENCY_SESSION_PRUNED";
-
-  constructor(idempotencyKey: string, acpxRecordId: string) {
-    super(
-      `Idempotency key ${JSON.stringify(idempotencyKey)} belongs to pruned session ` +
-        `${JSON.stringify(acpxRecordId)}; the old session result will not be replayed`,
-    );
-    this.name = "AcpxIdempotencySessionPrunedError";
-  }
-}
-
 export class AcpxIdempotencyLedgerFullError extends Error {
   readonly code = "IDEMPOTENCY_LEDGER_FULL";
 
@@ -184,10 +163,6 @@ function recoveryLockPath(scopeHash: string): string {
 
 function recoveryIndexPath(scopeHash: string): string {
   return path.join(baseDir(), "recovery", `${scopeHash}.json`);
-}
-
-function sessionIndexPath(acpxRecordId: string): string {
-  return path.join(baseDir(), "sessions", `${keyHash(acpxRecordId)}.json`);
 }
 
 function retiredKeysPath(prefix: string): string {
@@ -249,12 +224,8 @@ async function readStored(idempotencyKey: string): Promise<StoredMutation | unde
       typeof record.created_at !== "string" ||
       typeof record.updated_at !== "string" ||
       typeof record.pid !== "number" ||
-      (record.acpx_record_id !== undefined && typeof record.acpx_record_id !== "string") ||
       (record.recovery_scope !== undefined && typeof record.recovery_scope !== "string") ||
-      (record.state !== "started" &&
-        record.state !== "succeeded" &&
-        record.state !== "failed" &&
-        record.state !== "pruned")
+      (record.state !== "started" && record.state !== "succeeded" && record.state !== "failed")
     ) {
       throw new AcpxIdempotencyCorruptError(idempotencyKey);
     }
@@ -388,20 +359,6 @@ async function assertKeyNotRetired(idempotencyKey: string): Promise<void> {
   }
 }
 
-function extractAcpxRecordId(value: unknown): string | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return undefined;
-  }
-  const record = value as Record<string, unknown>;
-  if (typeof record.acpxRecordId === "string") {
-    return record.acpxRecordId;
-  }
-  if (typeof record.recordId === "string") {
-    return record.recordId;
-  }
-  return extractAcpxRecordId(record.session);
-}
-
 async function readStringIndex<T>(
   filePath: string,
   validate: (value: unknown) => value is T,
@@ -489,57 +446,6 @@ async function removeRecoveryCandidates(
   }
 }
 
-function isSessionReceiptIndex(value: unknown, acpxRecordId: string): value is SessionReceiptIndex {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  return (
-    record.schema === SESSION_INDEX_SCHEMA &&
-    record.acpx_record_id === acpxRecordId &&
-    Array.isArray(record.keys) &&
-    record.keys.every((key) => typeof key === "string")
-  );
-}
-
-async function addSessionReceipt(acpxRecordId: string, idempotencyKey: string): Promise<void> {
-  const filePath = sessionIndexPath(acpxRecordId);
-  const lock = await acquireLockAt(`${filePath}.lock`);
-  try {
-    const current = await readStringIndex(filePath, (value): value is SessionReceiptIndex =>
-      isSessionReceiptIndex(value, acpxRecordId),
-    );
-    await writeJsonAtomic(filePath, {
-      schema: SESSION_INDEX_SCHEMA,
-      acpx_record_id: acpxRecordId,
-      keys: [...new Set([...(current?.keys ?? []), idempotencyKey])],
-    } satisfies SessionReceiptIndex);
-  } finally {
-    await releaseLock(lock);
-  }
-}
-
-async function removeSessionReceipt(acpxRecordId: string, idempotencyKey: string): Promise<void> {
-  const filePath = sessionIndexPath(acpxRecordId);
-  const lock = await acquireLockAt(`${filePath}.lock`);
-  try {
-    const current = await readStringIndex(filePath, (value): value is SessionReceiptIndex =>
-      isSessionReceiptIndex(value, acpxRecordId),
-    );
-    if (!current) {
-      return;
-    }
-    const keys = current.keys.filter((key) => key !== idempotencyKey);
-    if (keys.length === 0) {
-      await fs.unlink(filePath).catch(() => undefined);
-    } else {
-      await writeJsonAtomic(filePath, { ...current, keys });
-    }
-  } finally {
-    await releaseLock(lock);
-  }
-}
-
 function isLedgerIndex(value: unknown): value is LedgerIndex {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -590,8 +496,8 @@ async function readLegacyStoredFile(filePath: string): Promise<StoredMutation> {
   return value as StoredMutation;
 }
 
-/** Rebuild exact lookup indexes once for fork.3 receipts written before indexes existed. */
-// oxlint-disable-next-line eslint/complexity -- One-time migration separates marker races, directory I/O, recovery conflicts, and session binding.
+/** Rebuild the bounded ledger and recovery indexes once for legacy receipts. */
+// oxlint-disable-next-line eslint/complexity -- One-time migration separates marker races, directory I/O, and recovery conflicts.
 async function migrateLegacyReceiptsIfNeeded(): Promise<void> {
   try {
     await fs.access(migrationMarkerPath());
@@ -626,7 +532,6 @@ async function migrateLegacyReceiptsIfNeeded(): Promise<void> {
       receipts.push(await readLegacyStoredFile(path.join(baseDir(), file)));
     }
     const recovery = new Map<string, RecoveryIndex>();
-    const sessions = new Map<string, SessionReceiptIndex>();
     for (const receipt of receipts) {
       if (receipt.state === "started" && receipt.recovery_scope) {
         const current = recovery.get(receipt.recovery_scope);
@@ -640,32 +545,15 @@ async function migrateLegacyReceiptsIfNeeded(): Promise<void> {
           keys: [...new Set([...(current?.keys ?? []), receipt.idempotency_key])],
         });
       }
-      const acpxRecordId =
-        receipt.acpx_record_id ??
-        extractAcpxRecordId(receipt.recovery_result) ??
-        extractAcpxRecordId(receipt.result);
-      if (acpxRecordId) {
-        receipt.acpx_record_id = acpxRecordId;
-        await writeStored(receipt.idempotency_key, receipt);
-        const current = sessions.get(acpxRecordId);
-        sessions.set(acpxRecordId, {
-          schema: SESSION_INDEX_SCHEMA,
-          acpx_record_id: acpxRecordId,
-          keys: [...new Set([...(current?.keys ?? []), receipt.idempotency_key])],
-        });
-      }
     }
     for (const [scopeHash, index] of recovery) {
       await writeJsonAtomic(recoveryIndexPath(scopeHash), index);
-    }
-    for (const [acpxRecordId, index] of sessions) {
-      await writeJsonAtomic(sessionIndexPath(acpxRecordId), index);
     }
     await writeJsonAtomic(ledgerIndexPath(), {
       schema: "acpx.session_mutation_ledger.v1",
       entries: receipts.map((receipt) => ({
         key: receipt.idempotency_key,
-        state: receipt.state as "started" | "succeeded" | "failed",
+        state: receipt.state,
         updated_at: receipt.updated_at,
       })),
     } satisfies LedgerIndex);
@@ -729,82 +617,6 @@ async function updateLedgerEntry(
     await writeJsonAtomic(ledgerIndexPath(), { ...ledger, entries: retained });
   } finally {
     await releaseLock(lock);
-  }
-}
-
-async function removeLedgerEntries(keys: string[]): Promise<void> {
-  const lock = await acquireLockAt(maintenanceLockPath());
-  try {
-    const ledger = await readLedgerIndex();
-    const removed = new Set(keys);
-    await assertRetirementCapacity(keys);
-    await persistRetiredKeys(keys);
-    await unlinkReceipts(keys);
-    await writeJsonAtomic(ledgerIndexPath(), {
-      ...ledger,
-      entries: ledger.entries.filter((entry) => !removed.has(entry.key)),
-    });
-  } finally {
-    await releaseLock(lock);
-  }
-}
-
-async function bindStoredMutationToSession(
-  stored: StoredMutation,
-  idempotencyKey: string,
-  value: unknown,
-): Promise<void> {
-  const acpxRecordId = stored.acpx_record_id ?? extractAcpxRecordId(value);
-  if (!acpxRecordId || stored.acpx_record_id === acpxRecordId) {
-    return;
-  }
-  // Index first: a crash can leave a harmless index entry for an incomplete
-  // receipt, but must never leave a replayable session receipt invisible to
-  // pruning.
-  await addSessionReceipt(acpxRecordId, idempotencyKey);
-  stored.acpx_record_id = acpxRecordId;
-  await writeStored(idempotencyKey, stored);
-}
-
-/**
- * Retire every mutation receipt tied to a session before its durable record is
- * pruned. Retired keys remain in a fixed-size fail-closed membership filter, so
- * an old create/adopt request can never replay a phantom deleted session.
- */
-export async function retireIdempotencyReceiptsForSession(acpxRecordId: string): Promise<void> {
-  await migrateLegacyReceiptsIfNeeded();
-  const filePath = sessionIndexPath(acpxRecordId);
-  const lock = await acquireLockAt(`${filePath}.lock`);
-  let keys: string[];
-  try {
-    const index = await readStringIndex(filePath, (value): value is SessionReceiptIndex =>
-      isSessionReceiptIndex(value, acpxRecordId),
-    );
-    if (!index) {
-      return;
-    }
-    keys = index.keys;
-  } finally {
-    await releaseLock(lock);
-  }
-  // Session pruning runs only for closed records, so no new mutation can bind
-  // after this snapshot. Acquire all receipt locks in deterministic order and
-  // hold them through tombstone persistence and receipt unlinking: replay of a
-  // soon-pruned result must not race the prune boundary.
-  const receiptLocks: MutationLock[] = [];
-  try {
-    for (const key of keys.toSorted()) {
-      const receiptLock = await acquireLock(key);
-      receiptLocks.push(receiptLock);
-      const stored = await readStored(key);
-      await removeRecoveryCandidates(stored?.recovery_scope, [key]);
-    }
-    await removeLedgerEntries(keys);
-    await fs.unlink(filePath).catch(() => undefined);
-  } finally {
-    for (const receiptLock of receiptLocks.toReversed()) {
-      await releaseLock(receiptLock);
-    }
   }
 }
 
@@ -953,7 +765,6 @@ async function completeRecovery<T>(
 ): Promise<AcpxMutationReceipt<T>> {
   const result = await recover(stored.recovery_result);
   const updatedAt = new Date().toISOString();
-  await bindStoredMutationToSession(stored, idempotencyKey, result);
   await writeStored(idempotencyKey, {
     ...stored,
     idempotency_key: idempotencyKey,
@@ -977,7 +788,6 @@ async function retireScopedRecoveries(
 ): Promise<void> {
   const updatedAt = new Date().toISOString();
   for (const candidate of candidates) {
-    await bindStoredMutationToSession(candidate, candidate.idempotency_key, result);
     await writeStored(candidate.idempotency_key, {
       ...candidate,
       state: "succeeded",
@@ -1025,6 +835,9 @@ export async function runIdempotentMutation<T>(options: {
       if (!matches(stored, options.operation, inputHash)) {
         throw new AcpxIdempotencyConflictError(options.idempotencyKey);
       }
+      // A crash may land the receipt before its ledger update. Exact-key replay
+      // repairs membership and the durable state before returning or failing.
+      await updateLedgerEntry(options.idempotencyKey, stored.state, stored.updated_at);
       if (stored.state === "succeeded") {
         return {
           operation: options.operation,
@@ -1032,12 +845,6 @@ export async function runIdempotentMutation<T>(options: {
           replayed: true,
           result: stored.result as T,
         };
-      }
-      if (stored.state === "pruned") {
-        throw new AcpxIdempotencySessionPrunedError(
-          options.idempotencyKey,
-          stored.acpx_record_id ?? "unknown",
-        );
       }
       if (stored.state === "failed" && stored.error) {
         throw new AcpxIdempotentMutationError(
@@ -1093,19 +900,12 @@ export async function runIdempotentMutation<T>(options: {
       pid: process.pid,
       recovery_scope: scopeHash,
       recovery_result: prior?.recovery_result ?? options.recoveryResult,
-      acpx_record_id: extractAcpxRecordId(options.input),
     };
-    if (started.acpx_record_id) {
-      await addSessionReceipt(started.acpx_record_id, options.idempotencyKey);
-    }
     await writeStored(options.idempotencyKey, started);
     try {
       await updateLedgerEntry(options.idempotencyKey, "started", now);
     } catch (error) {
       await fs.unlink(mutationPath(options.idempotencyKey)).catch(() => undefined);
-      if (started.acpx_record_id) {
-        await removeSessionReceipt(started.acpx_record_id, options.idempotencyKey);
-      }
       throw error;
     }
     if (scopeHash && started.recovery_result !== undefined) {
@@ -1142,10 +942,8 @@ export async function runIdempotentMutation<T>(options: {
         started.recovery_result = value;
         started.updated_at = new Date().toISOString();
         await writeStored(options.idempotencyKey, started);
-        await bindStoredMutationToSession(started, options.idempotencyKey, value);
       };
       const result = await options.run(checkpoint);
-      await bindStoredMutationToSession(started, options.idempotencyKey, result);
       const updatedAt = new Date().toISOString();
       await writeStored(options.idempotencyKey, {
         ...started,
@@ -1208,7 +1006,6 @@ export const idempotencyTestInternals = {
   recoveryLockPath,
   retiredKeyHash,
   retiredKeysPath,
-  sessionIndexPath,
   mutationPath,
   removeStaleLock,
 };

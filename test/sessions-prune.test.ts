@@ -3,10 +3,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import {
-  AcpxIdempotencyRetiredError,
-  runIdempotentMutation,
-} from "../src/sessions-service/idempotency.js";
-import {
   fileExists,
   makeSessionRecord as makeSessionRecordFixture,
   sessionFilePath,
@@ -82,47 +78,6 @@ test("pruneSessions deletes closed session files and removes them from the index
     assert.ok(result.bytesFreed > 0);
     assert.equal(result.dryRun, false);
     assert.ok(!(await fileExists(filePath)));
-  });
-});
-
-test("pruning retires session mutation receipts so an old key cannot replay a phantom", async () => {
-  await withTempHome(async (homeDir) => {
-    const session = await loadSessionModule();
-    const cwd = path.join(homeDir, "workspace");
-    const input = { cwd, idempotencyKey: "pruned-create-key" };
-    let calls = 0;
-    const first = await runIdempotentMutation({
-      operation: "create_session",
-      idempotencyKey: input.idempotencyKey,
-      input,
-      run: async () => ({ acpxRecordId: "pruned-receipt-session", calls: ++calls }),
-    });
-    assert.equal(first.result.calls, 1);
-    await writeSessionRecord(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: "pruned-receipt-session",
-        acpSessionId: "pruned-receipt-session",
-        agentCommand: "agent-a",
-        cwd,
-        closed: true,
-        closedAt: "2026-01-01T00:00:00.000Z",
-      }),
-    );
-
-    await session.pruneSessions({ agentCommand: "agent-a" });
-    await assert.rejects(
-      async () =>
-        await runIdempotentMutation({
-          operation: "create_session",
-          idempotencyKey: input.idempotencyKey,
-          input,
-          run: async () => ({ acpxRecordId: "duplicate", calls: ++calls }),
-        }),
-      AcpxIdempotencyRetiredError,
-    );
-    assert.equal(calls, 1);
-    assert.ok(!(await fileExists(sessionFilePath(homeDir, "pruned-receipt-session"))));
   });
 });
 
