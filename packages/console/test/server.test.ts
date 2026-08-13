@@ -677,11 +677,6 @@ test("durable idempotency retention failures preserve their typed HTTP contract"
       message: "Idempotency receipt was retired; reconcile before choosing a new key",
     },
     {
-      code: "IDEMPOTENCY_SESSION_PRUNED",
-      status: 410,
-      message: "The session recorded by this mutation was pruned",
-    },
-    {
       code: "IDEMPOTENCY_LEDGER_FULL",
       status: 507,
       message: "The durable mutation ledger is full",

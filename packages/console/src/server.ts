@@ -126,10 +126,6 @@ const SAFE_SERVICE_ERRORS: Readonly<
     statusCode: 409,
     message: "Idempotency receipt was retired; reconcile before choosing a new key",
   },
-  IDEMPOTENCY_SESSION_PRUNED: {
-    statusCode: 410,
-    message: "The session recorded by this mutation was pruned",
-  },
   IDEMPOTENCY_LEDGER_FULL: {
     statusCode: 507,
     message: "The durable mutation ledger is full",

@@ -588,7 +588,7 @@ async function updateLedgerEntry(
   key: string,
   state: "started" | "succeeded" | "failed",
   updatedAt: string,
-): Promise<void> {
+): Promise<boolean> {
   const lock = await acquireLockAt(maintenanceLockPath());
   try {
     await ensureMigrationMarker();
@@ -615,6 +615,7 @@ async function updateLedgerEntry(
       await unlinkReceipts(retire.map((entry) => entry.key));
     }
     await writeJsonAtomic(ledgerIndexPath(), { ...ledger, entries: retained });
+    return !retiringKeys.has(key);
   } finally {
     await releaseLock(lock);
   }
@@ -837,7 +838,14 @@ export async function runIdempotentMutation<T>(options: {
       }
       // A crash may land the receipt before its ledger update. Exact-key replay
       // repairs membership and the durable state before returning or failing.
-      await updateLedgerEntry(options.idempotencyKey, stored.state, stored.updated_at);
+      const retained = await updateLedgerEntry(
+        options.idempotencyKey,
+        stored.state,
+        stored.updated_at,
+      );
+      if (!retained) {
+        throw new AcpxIdempotencyRetiredError(options.idempotencyKey);
+      }
       if (stored.state === "succeeded") {
         return {
           operation: options.operation,
