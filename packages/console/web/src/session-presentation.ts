@@ -25,7 +25,12 @@ const PROPOSE_ONLY_MODES = new Set([
 export const displayRepo = (session: SessionSummary): string =>
   session.repo ?? session.cwd.split("/").findLast(Boolean) ?? session.cwd;
 
-/** The mode actually in force, preferring what the adapter reported over what was requested. */
+/**
+ * The adapter's most recent report of the session mode, falling back to what was
+ * requested. This is the best evidence the session list has — it is not proof
+ * the mode is in force, which only `SessionDetail.modeState` can speak to, and
+ * session details shows that separately.
+ */
 export const sessionMode = (session: SessionSummary): string | undefined =>
   session.effectiveMode ?? session.mode ?? session.desiredMode;
 
@@ -91,9 +96,10 @@ export const sessionStatus = (session: SessionSummary): SessionStatus => {
 };
 
 /**
- * Repo-grouped sessions in a stable order: repos that need you first, then repos
- * with live work, then the rest alphabetically. Regrouping on every turn change
- * would make rows jump, so the sort key is the repo's best row, not the turn.
+ * Repo-grouped sessions, projects ordered alphabetically and rows within a
+ * project by recency. The order deliberately ignores turn state: sorting by
+ * urgency would make a project jump the moment a turn ended, and the design
+ * asks for the opposite — "nothing jumps groups when a turn ends".
  */
 export const groupSessionsByRepo = (
   sessions: readonly SessionSummary[],

@@ -10,8 +10,27 @@ interface EscapeKeyEvent {
 
 interface FocusTarget {
   readonly isConnected?: boolean;
+  readonly offsetParent?: unknown;
+  checkVisibility?: () => boolean;
   focus(): void;
 }
+
+/**
+ * A control the stylesheet has hidden at this viewport cannot take focus, so
+ * offering it as the layer's first or last stop strands the user: focusing it is
+ * a no-op and the opener is already inert. Anything that cannot report its
+ * visibility — a test double, or a host without `checkVisibility` — is treated
+ * as visible rather than silently dropped.
+ */
+const isFocusable = (target: FocusTarget): boolean => {
+  if (target.isConnected === false) {
+    return false;
+  }
+  if (typeof target.checkVisibility === "function") {
+    return target.checkVisibility();
+  }
+  return target.offsetParent !== null;
+};
 
 interface TabKeyEvent extends EscapeKeyEvent {
   readonly shiftKey?: boolean;
@@ -62,7 +81,7 @@ export const trapLayerTab = (
     return false;
   }
   const targets = Array.from(layer.querySelectorAll<FocusTarget>(FOCUSABLE_SELECTOR)).filter(
-    (target) => target.isConnected !== false,
+    (target) => isFocusable(target),
   );
   const first = targets[0];
   const last = targets.at(-1);
@@ -148,7 +167,9 @@ export const useDismissibleLayer = (
     document.addEventListener("keydown", onKeyDown);
     queueMicrotask(() => {
       if (layer && !layer.contains(document.activeElement)) {
-        layer.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)?.focus();
+        Array.from(layer.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+          .find((target) => isFocusable(target))
+          ?.focus();
       }
     });
     return () => {

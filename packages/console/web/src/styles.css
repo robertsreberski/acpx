@@ -33,8 +33,14 @@
 
   /* Colour */
   --ink: #18211d;
-  --muted: #67716b;
-  --faint: #8c958f;
+  /*
+   * The design's greys (#67716b muted, #8c958f faint) read 2.7:1–4.5:1 on these
+   * light surfaces, so secondary text and timestamps would fail WCAG AA. These
+   * are the nearest values that clear 4.5:1 on every background they land on,
+   * selected rows included.
+   */
+  --muted: #5b6660;
+  --faint: #5f6a63;
   --line: #e4e9e4;
   --edge: #cfd6d0;
   --canvas: #eef2ee;
@@ -317,6 +323,8 @@ button:disabled {
 }
 .session-search input {
   min-width: 0;
+  /* Stretch so the caret target matches the 44px row the label already draws. */
+  align-self: stretch;
   flex: 1;
   border: 0;
   outline: 0;
@@ -753,7 +761,7 @@ button:disabled {
   justify-content: center;
   gap: 8px;
   padding-bottom: 20px;
-  color: var(--faint);
+  color: var(--muted);
   font-size: var(--text-id);
 }
 .timeline-loading i {
@@ -1174,6 +1182,11 @@ fieldset.elicitation-field {
   flex: 0 0 auto;
   align-items: center;
   gap: 10px;
+}
+/* The primary answer is first in the DOM for keyboard order; on desktop the
+   design places it at the end of the row. */
+.request-dock-actions .approve-button {
+  order: 1;
 }
 .request-dock-secondary {
   min-height: var(--tap);
@@ -1789,9 +1802,9 @@ fieldset.elicitation-field {
     gap: 0;
     margin-top: 16px;
   }
-  /* The primary answer leads on a phone; the quieter answers follow it. */
+  /* The primary answer leads on a phone, which is already the DOM order. */
   .request-dock-actions .approve-button {
-    order: -1;
+    order: 0;
     width: 100%;
   }
   .request-dock-secondary-row {

@@ -178,7 +178,10 @@ export function SessionSidebar({
             placeholder="Search sessions"
           />
         </label>
-        {repos.length > 1 && (
+        {/* An active filter always keeps its chip row: with one live project
+            left, hiding the row would strand the user filtered with no way to
+            clear it. */}
+        {(repos.length > 1 || repoFilter !== null) && (
           <div className="repo-filters" role="group" aria-label="Filter by project">
             <button
               type="button"

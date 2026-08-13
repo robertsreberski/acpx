@@ -8,6 +8,7 @@ import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { activityDurations, formatDuration } from "../activity-durations";
 import { shouldSubmitComposerKey } from "../composer-submit";
+import { dockedInteraction } from "../docked-interaction";
 import { booleanElicitationChoices, readElicitationField } from "../elicitation";
 import { interactionAvailability } from "../interaction-availability";
 import { orderPermissionOptions } from "../permission-options";
@@ -212,7 +213,20 @@ function PermissionRequest({ interaction }: { readonly interaction: PendingInter
           </p>
         )}
       </div>
+      {/* The primary answer leads in the DOM so keyboard and screen-reader users
+          reach it first at every width; the desktop layout moves it to the end
+          of the row visually. */}
       <div className="request-dock-actions">
+        {primary && (
+          <button
+            type="button"
+            className="approve-button"
+            disabled={disabled}
+            onClick={() => answer({ type: "select", option_id: primary.id })}
+          >
+            {primary.label}
+          </button>
+        )}
         <div className="request-dock-secondary-row">
           {secondary.map((option) => (
             <button
@@ -244,16 +258,6 @@ function PermissionRequest({ interaction }: { readonly interaction: PendingInter
             Cancel
           </button>
         </div>
-        {primary && (
-          <button
-            type="button"
-            className="approve-button"
-            disabled={disabled}
-            onClick={() => answer({ type: "select", option_id: primary.id })}
-          >
-            {primary.label}
-          </button>
-        )}
       </div>
     </div>
   );
@@ -333,6 +337,13 @@ function ElicitationRequest({ interaction }: { readonly interaction: PendingInte
             </p>
           )}
           <div className="request-dock-actions">
+            <button
+              type="submit"
+              className="approve-button"
+              disabled={disabled || unsupported !== undefined}
+            >
+              Accept
+            </button>
             <div className="request-dock-secondary-row">
               <button
                 type="button"
@@ -355,13 +366,6 @@ function ElicitationRequest({ interaction }: { readonly interaction: PendingInte
                 Cancel
               </button>
             </div>
-            <button
-              type="submit"
-              className="approve-button"
-              disabled={disabled || unsupported !== undefined}
-            >
-              Accept
-            </button>
           </div>
         </form>
       </div>
@@ -371,25 +375,32 @@ function ElicitationRequest({ interaction }: { readonly interaction: PendingInte
 
 /**
  * A turn stalls until the request is answered, so the pending card leaves the
- * scroll and docks above the composer. Older pending requests keep their place
- * in the count; the oldest is the one actually blocking the turn.
+ * scroll and docks above the composer. Only one request is docked — the design
+ * treats it as the thing to deal with — and any others stay answerable in the
+ * transcript rather than disappearing behind a count.
  */
 function RequestDock() {
-  const { pending } = useSessionStore();
-  const waiting = pending.filter((interaction) => interaction.state === "pending");
-  const blocking = waiting[0];
-  if (!blocking) {
+  const { pending, selectedSession } = useSessionStore();
+  const docked = dockedInteraction(pending, selectedSession?.ownerState);
+  if (!docked) {
     return null;
   }
+  const others = pending.filter(
+    (interaction) => interaction.state === "pending" && interaction.id !== docked.id,
+  ).length;
   return (
     <section className="request-dock" aria-label="Waiting request">
-      {blocking.kind === "permission" ? (
-        <PermissionRequest interaction={blocking} />
+      {/* Keyed so a following request cannot inherit the previous form's local
+          error state or uncontrolled field values. */}
+      {docked.kind === "permission" ? (
+        <PermissionRequest key={docked.id} interaction={docked} />
       ) : (
-        <ElicitationRequest interaction={blocking} />
+        <ElicitationRequest key={docked.id} interaction={docked} />
       )}
-      {waiting.length > 1 && (
-        <p className="request-dock-count">{waiting.length - 1} more waiting after this one.</p>
+      {others > 0 && (
+        <p className="request-dock-count">
+          {others} more waiting, {others === 1 ? "it is" : "they are"} in the transcript above.
+        </p>
       )}
     </section>
   );
@@ -482,19 +493,34 @@ function ToolActivity({
 }
 
 const useTranscriptActivity = () => {
-  const { pending, timeline } = useSessionStore();
+  const { pending, timeline, selectedSession } = useSessionStore();
   const durations = useMemo(() => activityDurations(timeline?.events ?? []), [timeline?.events]);
-  return { pending, durations };
+  return {
+    pending,
+    durations,
+    dockedId: dockedInteraction(pending, selectedSession?.ownerState)?.id,
+  };
 };
 
 function ActivityPart(props: ToolCallMessagePartProps) {
-  const { pending, durations } = useTranscriptActivity();
+  const { pending, durations, dockedId } = useTranscriptActivity();
   const interactionId = interactionIdFromToolName(props.toolName);
   const interaction = interactionId ? pending.find((item) => item.id === interactionId) : undefined;
   if (interaction) {
-    // The dock owns the pending card; rendering it here too would duplicate it.
-    return interaction.state === "pending" ? null : (
-      <AnsweredInteraction interaction={interaction} />
+    if (interaction.state !== "pending") {
+      return <AnsweredInteraction interaction={interaction} />;
+    }
+    // Only the docked request leaves the scroll. Any other waiting request stays
+    // here and stays answerable — the service takes responses by request id, so
+    // hiding them behind the dock would make them unreachable.
+    return interaction.id === dockedId ? null : (
+      <section className="interaction-card is-pending" aria-label="Waiting request">
+        {interaction.kind === "permission" ? (
+          <PermissionRequest interaction={interaction} />
+        ) : (
+          <ElicitationRequest interaction={interaction} />
+        )}
+      </section>
     );
   }
   const durationMs = durations.get(props.toolCallId);
@@ -533,6 +559,9 @@ function AssistantMessage() {
  * There is no Load earlier button by design; the viewport says quietly that it
  * is fetching and holds the reader's place across the prepend.
  */
+/** Frames to wait for a prepended page to reach the DOM before giving up on it. */
+const ANCHOR_FRAME_BUDGET = 90;
+
 function useAutoLoadEarlier(
   sentinel: HTMLDivElement | null,
   canLoadEarlier: boolean,
@@ -540,6 +569,24 @@ function useAutoLoadEarlier(
 ): boolean {
   const loadingRef = useRef(false);
   const [loading, setLoading] = useState(false);
+
+  /*
+   * The store rebuilds `loadEarlier` whenever the timeline changes, so keeping
+   * it in the effect's dependencies tears the observer down at the exact moment
+   * a page lands — cancelling the anchor loop that was waiting for it. Hold the
+   * latest callback in a ref instead and let the effect depend only on what it
+   * actually observes.
+   */
+  const loadEarlierRef = useRef(loadEarlier);
+  loadEarlierRef.current = loadEarlier;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (!sentinel || !canLoadEarlier) {
       return undefined;
@@ -548,33 +595,103 @@ function useAutoLoadEarlier(
     if (!scroller) {
       return undefined;
     }
-    let cancelled = false;
-    const observer = new IntersectionObserver(
+    const cancelled = () => !mountedRef.current;
+    let observer: IntersectionObserver;
+    /*
+     * IntersectionObserver reports changes, not state. A page that failed leaves
+     * the sentinel exactly where it was, so no further callback arrives and — with
+     * the Load earlier button gone — earlier history becomes unreachable until the
+     * reader scrolls away and back, which a short transcript may not allow.
+     * Re-observing re-delivers the current intersection, after a pause so a
+     * persistently failing endpoint is retried rather than hammered.
+     */
+    const rearm = () => {
+      window.setTimeout(() => {
+        if (!cancelled()) {
+          observer.unobserve(sentinel);
+          observer.observe(sentinel);
+        }
+      }, 1_000);
+    };
+    const settle = (landed: boolean) => {
+      loadingRef.current = false;
+      if (!cancelled()) {
+        setLoading(false);
+      }
+      if (!landed) {
+        rearm();
+      }
+    };
+
+    /*
+     * Hold the reader's distance from the bottom while the prepended page
+     * arrives. Every growth happens above the reader, so that distance is the
+     * invariant; it is re-pinned each frame rather than restored once because
+     * the page does not land in a single commit. The store commits the events,
+     * assistant-ui re-renders the thread from its own runtime in a later pass,
+     * and the rows then grow over several frames — so both a plain
+     * requestAnimationFrame and a layout effect on the timeline fire while
+     * scrollHeight is still short. Anchoring against a partial height resolves
+     * near the top of the transcript, which leaves the sentinel on screen and
+     * pages the whole history in one burst.
+     */
+    const renderedRows = () => scroller.querySelectorAll(".message-row").length;
+
+    const holdAnchor = (distance: number, rowsBefore: number) => {
+      let frames = 0;
+      let lastHeight = scroller.scrollHeight;
+      let stableFrames = 0;
+      const step = () => {
+        if (cancelled()) {
+          return;
+        }
+        // Row count, not scrollHeight, decides whether the page has landed: the
+        // "Loading earlier turns" line grows the container on its own, and
+        // treating that as the page arriving settles the anchor a few pixels
+        // from the top, which is what makes it burst.
+        const landed = renderedRows() > rowsBefore;
+        const height = scroller.scrollHeight;
+        if (landed) {
+          restoreScrollAnchor(scroller, distance);
+        }
+        if (height === lastHeight) {
+          stableFrames += 1;
+        } else {
+          lastHeight = height;
+          stableFrames = 0;
+        }
+        frames += 1;
+        // Settle once the page has landed and stopped growing, or give up so a
+        // request that resolved without adding anything — a rejection, or an
+        // expired cursor that reloaded the head instead — cannot wedge paging.
+        if ((landed && stableFrames >= 3) || frames >= ANCHOR_FRAME_BUDGET) {
+          settle(landed);
+          return;
+        }
+        requestAnimationFrame(step);
+      };
+      requestAnimationFrame(step);
+    };
+
+    observer = new IntersectionObserver(
       (entries) => {
         if (loadingRef.current || !entries.some((entry) => entry.isIntersecting)) {
           return;
         }
         loadingRef.current = true;
         setLoading(true);
-        const anchor = distanceFromBottom(scroller);
-        void loadEarlier().finally(() => {
-          requestAnimationFrame(() => {
-            restoreScrollAnchor(scroller, anchor);
-            loadingRef.current = false;
-            if (!cancelled) {
-              setLoading(false);
-            }
-          });
-        });
+        const distance = distanceFromBottom(scroller);
+        const rowsBefore = renderedRows();
+        void loadEarlierRef.current().finally(() => holdAnchor(distance, rowsBefore));
       },
       { root: scroller, rootMargin: "240px 0px 0px 0px" },
     );
     observer.observe(sentinel);
     return () => {
-      cancelled = true;
+      loadingRef.current = false;
       observer.disconnect();
     };
-  }, [sentinel, canLoadEarlier, loadEarlier]);
+  }, [sentinel, canLoadEarlier]);
   return loading;
 }
 
