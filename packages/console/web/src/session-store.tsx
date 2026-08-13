@@ -18,6 +18,7 @@ import {
 } from "./composer-drafts";
 import { listenForLiveInvalidations } from "./live-events";
 import {
+  mergeSessionQueuedProjection,
   reconcileSessionQueuedPrompts,
   removeQueuedPrompt,
   type QueuedPrompt,
@@ -138,6 +139,9 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
           return;
         }
         setSelectedSession(detail);
+        setQueuedPrompts((current) =>
+          mergeSessionQueuedProjection(current, id, detail.queuedCount, detail.queuedTurns),
+        );
         setTimeline((current) =>
           preserveLoadedHistory
             ? mergeRefreshedTimelinePage(current, page)

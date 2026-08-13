@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  mergeSessionQueuedProjection,
   reconcileQueuedPrompts,
   reconcileSessionQueuedPrompts,
   removeQueuedPrompt,
+  replaceSessionQueuedPrompts,
 } from "../src/queued-prompts";
 import type { TranscriptEvent } from "../src/types";
 
@@ -54,4 +56,19 @@ test("removes only the exact queued receipt requested by the operator", () => {
     removeQueuedPrompt([prompt, sameSession, sameTurnOtherSession], "session-1", prompt.id),
     [sameSession, sameTurnOtherSession],
   );
+});
+
+test("rebuilds exact queued controls from the durable session projection after reload", () => {
+  const other = { id: "turn-other", sessionId: "session-2", text: "Other session" };
+  assert.deepEqual(
+    replaceSessionQueuedPrompts([prompt, other], "session-1", [
+      { id: "turn-durable", text: "Recovered after reload" },
+    ]),
+    [other, { id: "turn-durable", sessionId: "session-1", text: "Recovered after reload" }],
+  );
+});
+
+test("keeps an optimistic receipt while the owner lease projection catches up", () => {
+  assert.deepEqual(mergeSessionQueuedProjection([prompt], "session-1", 0, []), [prompt]);
+  assert.deepEqual(mergeSessionQueuedProjection([prompt], "session-1", 1, []), []);
 });

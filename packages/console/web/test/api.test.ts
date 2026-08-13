@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ConsoleApi } from "../src/api";
+import { ConsoleApi, MutationTransportUnknownError } from "../src/api";
 
 const response = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -29,7 +29,16 @@ const SESSION = {
   sessionState: "open",
   ownerState: "online",
   turnState: "running",
-  queue: { depth: 2 },
+  queue: {
+    depth: 2,
+    turns: [
+      {
+        turnId: "turn-queued",
+        submittedAt: "2026-08-12T09:59:00.000Z",
+        promptText: "Run the focused tests",
+      },
+    ],
+  },
   pendingCount: 1,
   updatedAt: "2026-08-12T10:00:00.000Z",
 };
@@ -61,6 +70,13 @@ test("unwraps session and pending routes while preserving exact record identity"
       const session = await client.session("record-1");
       assert.equal(session.id, "record-1");
       assert.equal(session.queuedCount, 2);
+      assert.deepEqual(session.queuedTurns, [
+        {
+          id: "turn-queued",
+          submittedAt: "2026-08-12T09:59:00.000Z",
+          text: "Run the focused tests",
+        },
+      ]);
       const pending = await client.pending("record-1");
       assert.deepEqual(pending[0]?.options, [{ id: "allow", label: "Allow", kind: "allow_once" }]);
     },
@@ -261,6 +277,63 @@ test("a network retry reuses the same idempotency key", async () => {
   assert.equal(attempts, 2);
   assert.ok(keys[0]);
   assert.equal(keys[1], keys[0]);
+});
+
+test("an explicit retry after two lost responses retains the original idempotency key", async () => {
+  const client = new ConsoleApi();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (attempts <= 2) {
+        throw new TypeError("response lost");
+      }
+      return response({ turnId: "turn-1", admission: "started" });
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client.sendPrompt("record-1", "hello"),
+        MutationTransportUnknownError,
+      );
+      assert.deepEqual(await client.sendPrompt("record-1", "hello"), {
+        accepted: true,
+        sessionId: "record-1",
+        turnId: "turn-1",
+        state: "started",
+      });
+    },
+  );
+  assert.equal(attempts, 3);
+  assert.ok(keys[0]);
+  assert.deepEqual(keys, [keys[0], keys[0], keys[0]]);
+});
+
+test("changing an ambiguously completed mutation creates a distinct action identity", async () => {
+  const client = new ConsoleApi();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (attempts <= 2) {
+        throw new TypeError("response lost");
+      }
+      return response({ turnId: "turn-2", admission: "started" });
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client.sendPrompt("record-1", "first"),
+        MutationTransportUnknownError,
+      );
+      await client.sendPrompt("record-1", "second");
+    },
+  );
+  assert.equal(attempts, 3);
+  assert.equal(keys[0], keys[1]);
+  assert.notEqual(keys[2], keys[0]);
 });
 
 test("an HTTP failure is not retried", async () => {

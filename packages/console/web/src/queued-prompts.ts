@@ -45,3 +45,26 @@ export const reconcileSessionQueuedPrompts = (
   );
   return [...prompts.filter((prompt) => prompt.sessionId !== sessionId), ...selected];
 };
+
+/** Replace one session's optimistic receipts with the durable service projection. */
+export const replaceSessionQueuedPrompts = (
+  prompts: readonly QueuedPrompt[],
+  sessionId: string,
+  durable: readonly { readonly id: string; readonly text: string }[],
+): readonly QueuedPrompt[] => [
+  ...prompts.filter((prompt) => prompt.sessionId !== sessionId),
+  ...durable.map((prompt) => ({ ...prompt, sessionId })),
+];
+
+/** Preserve a just-accepted optimistic row while the owner lease depth catches up. */
+export const mergeSessionQueuedProjection = (
+  prompts: readonly QueuedPrompt[],
+  sessionId: string,
+  queueDepth: number,
+  durable: readonly { readonly id: string; readonly text: string }[],
+): readonly QueuedPrompt[] => {
+  const optimistic = prompts.filter((prompt) => prompt.sessionId === sessionId);
+  return durable.length === 0 && queueDepth < optimistic.length
+    ? prompts
+    : replaceSessionQueuedPrompts(prompts, sessionId, durable);
+};

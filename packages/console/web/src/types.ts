@@ -40,6 +40,11 @@ export interface SessionSummary {
   readonly turnState: TurnState;
   readonly pendingCount: number;
   readonly queuedCount: number;
+  readonly queuedTurns: readonly {
+    readonly id: string;
+    readonly text: string;
+    readonly submittedAt: string;
+  }[];
   readonly activeTurnId?: string;
   readonly createdAt: string;
   readonly updatedAt: string;

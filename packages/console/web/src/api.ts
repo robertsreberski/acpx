@@ -28,6 +28,16 @@ export class ApiError extends Error {
   }
 }
 
+export class MutationTransportUnknownError extends Error {
+  constructor(cause: unknown) {
+    super(
+      "The mutation response was lost. Retry the same action to reconcile it without creating a duplicate.",
+      { cause },
+    );
+    this.name = "MutationTransportUnknownError";
+  }
+}
+
 const json = async <T>(response: Response): Promise<T> => {
   const body = (await response.json().catch(() => undefined)) as
     | {
@@ -53,9 +63,14 @@ const json = async <T>(response: Response): Promise<T> => {
 };
 
 const idempotencyKey = (): string => crypto.randomUUID();
+const MAX_AMBIGUOUS_MUTATIONS = 64;
+
+const isAbortError = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === "AbortError";
 
 export class ConsoleApi {
   #csrfToken: string | undefined;
+  readonly #ambiguousMutationKeys = new Map<string, string>();
 
   setCsrfToken(value: string | undefined): void {
     this.#csrfToken = value;
@@ -69,13 +84,16 @@ export class ConsoleApi {
     path: string,
     body: unknown,
     method: "DELETE" | "PATCH" | "POST" | "PUT" = "POST",
-    key = idempotencyKey(),
+    key?: string,
     allowCsrfRefresh = true,
   ): Promise<T> {
+    const serializedBody = JSON.stringify(body);
+    const fingerprint = `${method}\n${path}\n${serializedBody}`;
+    const requestKey = key ?? this.#ambiguousMutationKeys.get(fingerprint) ?? idempotencyKey();
     const headers: Record<string, string> = {
       Accept: "application/json",
       "Content-Type": "application/json",
-      "Idempotency-Key": key,
+      "Idempotency-Key": requestKey,
     };
     if (this.#csrfToken) {
       headers["X-CSRF-Token"] = this.#csrfToken;
@@ -84,23 +102,43 @@ export class ConsoleApi {
       await fetch(path, {
         method,
         headers,
-        body: JSON.stringify(body),
+        body: serializedBody,
       });
     let response: Response;
     try {
-      response = await request();
+      try {
+        response = await request();
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          throw error;
+        }
+        response = await request();
+      }
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
+      if (isAbortError(error)) {
         throw error;
       }
-      response = await request();
+      if (!this.#ambiguousMutationKeys.has(fingerprint)) {
+        if (this.#ambiguousMutationKeys.size >= MAX_AMBIGUOUS_MUTATIONS) {
+          const oldest = this.#ambiguousMutationKeys.keys().next().value;
+          if (oldest !== undefined) {
+            this.#ambiguousMutationKeys.delete(oldest);
+          }
+        }
+      }
+      this.#ambiguousMutationKeys.set(fingerprint, requestKey);
+      throw new MutationTransportUnknownError(error);
     }
     if (response.status === 403 && allowCsrfRefresh) {
       const snapshot = await this.bootstrap();
       this.setCsrfToken(snapshot.csrfToken);
-      return await this.mutate<T>(path, body, method, key, false);
+      return await this.mutate<T>(path, body, method, requestKey, false);
     }
-    return await json<T>(response);
+    const result = await json<T>(response);
+    if (this.#ambiguousMutationKeys.get(fingerprint) === requestKey) {
+      this.#ambiguousMutationKeys.delete(fingerprint);
+    }
+    return result;
   }
 
   bootstrap(): Promise<BootstrapSnapshot> {
@@ -269,7 +307,14 @@ interface WireSession {
   readonly sessionState: SessionSummary["sessionState"];
   readonly ownerState: SessionSummary["ownerState"];
   readonly turnState: SessionSummary["turnState"];
-  readonly queue: { readonly depth: number };
+  readonly queue: {
+    readonly depth: number;
+    readonly turns?: readonly {
+      readonly turnId: string;
+      readonly submittedAt: string;
+      readonly promptText?: string;
+    }[];
+  };
   readonly updatedAt: string;
   readonly createdAt?: string;
   readonly model?: string;
@@ -334,6 +379,11 @@ const sessionSummary = (session: WireSession): SessionSummary => ({
   turnState: session.turnState,
   pendingCount: session.pendingCount ?? 0,
   queuedCount: session.queue.depth,
+  queuedTurns: (session.queue.turns ?? []).map((turn) => ({
+    id: turn.turnId,
+    text: turn.promptText ?? "Queued follow-up",
+    submittedAt: turn.submittedAt,
+  })),
   activeTurnId: session.activeTurnId,
   createdAt: session.createdAt ?? session.updatedAt,
   updatedAt: session.updatedAt,
