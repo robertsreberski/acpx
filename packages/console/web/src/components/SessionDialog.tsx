@@ -4,7 +4,8 @@ import { useDismissibleLayer } from "../dismissible-layer";
 import { reconcileDialogOptions } from "../session-dialog-options";
 import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
-import type { ProviderSession } from "../types";
+import type { AgentSummary, ProviderSession } from "../types";
+import { loadWorkspaceAgents } from "../workspace-agent-inventory";
 import { Icon } from "./Icon";
 
 interface DialogProps {
@@ -24,13 +25,17 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [providerCursor, setProviderCursor] = useState<string | undefined>(undefined);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [loadingProviders, setLoadingProviders] = useState(false);
+  const [workspaceAgents, setWorkspaceAgents] = useState<readonly AgentSummary[]>([]);
+  const [agentError, setAgentError] = useState<string | null>(null);
+  const [loadingAgents, setLoadingAgents] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const dialogModeRef = useRef<DialogProps["mode"]>(null);
+  const agentGeneration = useRef(0);
   const providerGeneration = useRef(0);
   useDismissibleLayer(mode !== null, onClose, dialogRef);
 
-  const agent = store.bootstrap.agents.find((item) => item.id === agentId);
+  const agent = workspaceAgents.find((item) => item.id === agentId);
   const modeRequired = requiresExplicitMode(agent);
   const defaultMode = safeDefaultMode(agent);
   const normalizedMode = normalizeExactId(sessionMode);
@@ -46,7 +51,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
     const options = reconcileDialogOptions(
       opening ? "" : agentId,
       opening ? "" : cwd,
-      store.bootstrap.agents,
+      workspaceAgents,
       store.bootstrap.workspaceRoots,
     );
     if (opening) {
@@ -59,6 +64,8 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
       setProviderSessions([]);
       setProviderCursor(undefined);
       setProviderError(null);
+      setWorkspaceAgents([]);
+      setAgentError(null);
       setError(null);
       return;
     }
@@ -70,9 +77,54 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
     }
     if (options.workspaceChanged) {
       setCwd(options.cwd);
+      setAgentId("");
+      setWorkspaceAgents([]);
+      setAgentError(null);
       setProviderSessionId("");
     }
-  }, [agentId, cwd, mode, store.bootstrap.agents, store.bootstrap.workspaceRoots]);
+  }, [agentId, cwd, mode, store.bootstrap.workspaceRoots, workspaceAgents]);
+
+  useEffect(() => {
+    const generation = ++agentGeneration.current;
+    if (!mode || !cwd) {
+      setWorkspaceAgents([]);
+      setAgentId("");
+      setAgentError(null);
+      setLoadingAgents(false);
+      return undefined;
+    }
+    setLoadingAgents(true);
+    setAgentError(null);
+    void loadWorkspaceAgents(cwd).then(
+      (agents) => {
+        if (generation !== agentGeneration.current) {
+          return;
+        }
+        setWorkspaceAgents(agents);
+        setAgentId(agents[0]?.id ?? "");
+        setSessionMode("");
+        setModel("");
+        setProviderSessionId("");
+        setLoadingAgents(false);
+      },
+      (reason: unknown) => {
+        if (generation !== agentGeneration.current) {
+          return;
+        }
+        setWorkspaceAgents([]);
+        setAgentId("");
+        setAgentError(
+          reason instanceof Error ? reason.message : "Workspace agents could not be loaded.",
+        );
+        setLoadingAgents(false);
+      },
+    );
+    return () => {
+      if (generation === agentGeneration.current) {
+        agentGeneration.current += 1;
+      }
+    };
+  }, [cwd, mode]);
 
   const loadProviderSessions = useCallback(
     async (cursor?: string) => {
@@ -109,7 +161,13 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   );
 
   useEffect(() => {
-    if (mode !== "adopt" || !agentId || !cwd || agent?.canBrowseSessions === false) {
+    if (
+      mode !== "adopt" ||
+      loadingAgents ||
+      !agentId ||
+      !cwd ||
+      agent?.canBrowseSessions === false
+    ) {
       providerGeneration.current += 1;
       setProviderSessions([]);
       setProviderCursor(undefined);
@@ -124,7 +182,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
     return () => {
       providerGeneration.current += 1;
     };
-  }, [agent?.canBrowseSessions, agentId, cwd, loadProviderSessions, mode]);
+  }, [agent?.canBrowseSessions, agentId, cwd, loadProviderSessions, loadingAgents, mode]);
 
   if (!mode) {
     return null;
@@ -188,6 +246,12 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
         <form onSubmit={submit}>
           <label className="form-field">
             <span>Agent</span>
+            {loadingAgents && <small>Loading agents for this workspace…</small>}
+            {agentError && (
+              <small className="form-error" role="alert">
+                {agentError}
+              </small>
+            )}
             <select
               value={agentId}
               onChange={(event) => {
@@ -196,9 +260,15 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
                 setModel("");
                 setProviderSessionId("");
               }}
+              disabled={loadingAgents || workspaceAgents.length === 0}
               required
             >
-              {store.bootstrap.agents.map((item) => (
+              {workspaceAgents.length === 0 && (
+                <option value="">
+                  {loadingAgents ? "Loading agents…" : "No agents registered"}
+                </option>
+              )}
+              {workspaceAgents.map((item) => (
                 <option value={item.id} key={item.id}>
                   {item.label}
                 </option>
@@ -207,7 +277,20 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
           </label>
           <label className="form-field">
             <span>Workspace</span>
-            <select value={cwd} onChange={(event) => setCwd(event.target.value)} required>
+            <select
+              value={cwd}
+              onChange={(event) => {
+                setCwd(event.target.value);
+                setAgentId("");
+                setWorkspaceAgents([]);
+                setAgentError(null);
+                setLoadingAgents(true);
+                setSessionMode("");
+                setModel("");
+                setProviderSessionId("");
+              }}
+              required
+            >
               {store.bootstrap.workspaceRoots.map((root) => (
                 <option value={root.path} key={root.id}>
                   {root.label} — {root.path}
@@ -342,6 +425,7 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
               className="primary-button"
               disabled={
                 store.actionBusy ||
+                loadingAgents ||
                 !agentId ||
                 !cwd ||
                 (modeRequired && !normalizedMode) ||
