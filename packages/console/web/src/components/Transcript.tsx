@@ -488,7 +488,18 @@ export function Transcript() {
           <section className="queued-prompts" aria-label="Queued follow-ups">
             <strong>Queued follow-ups</strong>
             {store.queuedPrompts.map((prompt) => (
-              <p key={prompt.id}>{prompt.text}</p>
+              <div className="queued-prompt" key={prompt.id}>
+                <p>{prompt.text}</p>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  aria-label={`Cancel queued follow-up: ${prompt.text}`}
+                  disabled={store.actionBusy}
+                  onClick={() => consumeUiAction(store.cancelQueuedTurn(prompt.id))}
+                >
+                  Cancel
+                </button>
+              </div>
             ))}
             <small>
               Accepted by ACPX; they will appear in the transcript when execution starts.

@@ -25,7 +25,7 @@ export class MockSessionService implements AcpxConsoleSessionService {
   readonly calls: Array<{ method: string; input: unknown }> = [];
   private listener?: (event: ServiceInvalidation) => void;
 
-  async listAgents() {
+  async listAgents(_input: { cwd: string }) {
     return this.agents;
   }
   async listSessions() {
@@ -34,9 +34,11 @@ export class MockSessionService implements AcpxConsoleSessionService {
   async getSession(input: { acpxRecordId: string }) {
     return input.acpxRecordId === session.acpxRecordId ? session : undefined;
   }
-  async listProviderSessions(input: { agentId: string; cwd?: string; cursor?: string }) {
+  async listProviderSessions(input: { agentId: string; cwd: string; cursor?: string }) {
     this.calls.push({ method: "listProviderSessions", input });
-    return { sessions: [{ providerSessionId: "provider-1", title: "Existing" }] };
+    return {
+      sessions: [{ providerSessionId: "provider-1", title: "Existing", cwd: input.cwd }],
+    };
   }
   async createSession(input: Parameters<AcpxConsoleSessionService["createSession"]>[0]) {
     this.calls.push({ method: "createSession", input });

@@ -290,6 +290,7 @@ test("SessionQueueOwner serves the parked-request verbs in the persisted wire sh
 
     const owner = await SessionQueueOwner.start(lease, {
       cancelPrompt: async () => false,
+      cancelQueuedPrompt: async () => {},
       closeSession: async () => false,
       setSessionMode: async () => {
         // no-op
@@ -361,6 +362,201 @@ test("SessionQueueOwner serves the parked-request verbs in the persisted wire sh
     }
   });
 });
+
+test("SessionQueueOwner cancels exactly one queued prompt and preserves FIFO order", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-cancel-queued");
+    assert(lease);
+
+    const cancelledQueued: string[] = [];
+    let activeCancelCalls = 0;
+    const handlers = {
+      ...noParkedRequestControlHandlers,
+      cancelQueuedPrompt: async (turnId: string) => {
+        cancelledQueued.push(turnId);
+      },
+      cancelPrompt: async () => {
+        activeCancelCalls += 1;
+        return false;
+      },
+      closeSession: async () => false,
+      setSessionMode: async () => {},
+      setSessionModel: async (): Promise<undefined> => undefined,
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+    const owner = await SessionQueueOwner.start(lease, handlers, { maxQueueDepth: 4 });
+
+    try {
+      await enqueuePrompt(lease.socketPath, "turn-a", false);
+      await enqueuePrompt(lease.socketPath, "turn-b", false);
+      await enqueuePrompt(lease.socketPath, "turn-c", false);
+
+      const result = (await sendQueueRequest(lease.socketPath, {
+        type: "cancel_prompt",
+        requestId: "cancel-b",
+        ownerGeneration: lease.ownerGeneration,
+        targetTurnId: "turn-b",
+      })) as { type: string; cancelled: boolean; outcome?: string };
+
+      assert.deepEqual(result, {
+        type: "cancel_result",
+        requestId: "cancel-b",
+        ownerGeneration: lease.ownerGeneration,
+        cancelled: true,
+        outcome: "queued",
+      });
+      assert.deepEqual(cancelledQueued, ["turn-b"]);
+      assert.equal(activeCancelCalls, 0);
+      assert.equal(owner.queueDepth(), 2);
+
+      const missing = (await sendQueueRequest(lease.socketPath, {
+        type: "cancel_prompt",
+        requestId: "cancel-missing",
+        ownerGeneration: lease.ownerGeneration,
+        targetTurnId: "turn-missing",
+      })) as { type: string; cancelled: boolean; outcome?: string };
+      assert.equal(missing.cancelled, false);
+      assert.equal(missing.outcome, "not_found");
+      assert.equal(activeCancelCalls, 1);
+      assert.equal(owner.queueDepth(), 2);
+      assert.equal((await owner.nextTask())?.requestId, "turn-a");
+      assert.equal((await owner.nextTask())?.requestId, "turn-c");
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
+test("SessionQueueOwner restores a queued prompt when durable cancellation fails", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-cancel-queued-fails");
+    assert(lease);
+
+    const handlers = {
+      ...noParkedRequestControlHandlers,
+      cancelQueuedPrompt: async (turnId: string) => {
+        if (turnId === "turn-b") {
+          throw new Error("timeline unavailable");
+        }
+      },
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {},
+      setSessionModel: async (): Promise<undefined> => undefined,
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+    const owner = await SessionQueueOwner.start(lease, handlers, { maxQueueDepth: 4 });
+
+    try {
+      await enqueuePrompt(lease.socketPath, "turn-a", false);
+      await enqueuePrompt(lease.socketPath, "turn-b", false);
+      await enqueuePrompt(lease.socketPath, "turn-c", false);
+
+      const result = (await sendQueueRequest(lease.socketPath, {
+        type: "cancel_prompt",
+        requestId: "cancel-b-fails",
+        ownerGeneration: lease.ownerGeneration,
+        targetTurnId: "turn-b",
+      })) as { type: string; detailCode?: string; message?: string };
+
+      assert.equal(result.type, "error");
+      assert.equal(result.detailCode, "QUEUE_CONTROL_REQUEST_FAILED");
+      assert.match(result.message ?? "", /timeline unavailable/);
+      assert.equal(owner.queueDepth(), 3);
+      assert.equal((await owner.nextTask())?.requestId, "turn-a");
+      assert.equal((await owner.nextTask())?.requestId, "turn-b");
+      assert.equal((await owner.nextTask())?.requestId, "turn-c");
+    } finally {
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
+test("SessionQueueOwner tells a waiting queued caller when its prompt is cancelled", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("owner-cancel-queued-waiting");
+    assert(lease);
+
+    const handlers = {
+      ...noParkedRequestControlHandlers,
+      cancelQueuedPrompt: async () => {},
+      cancelPrompt: async () => false,
+      closeSession: async () => false,
+      setSessionMode: async () => {},
+      setSessionModel: async (): Promise<undefined> => undefined,
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+    const owner = await SessionQueueOwner.start(lease, handlers, { maxQueueDepth: 4 });
+    const taskSocket = await connectSocket(lease.socketPath);
+    const taskLines = readline.createInterface({ input: taskSocket });
+    const taskIterator = taskLines[Symbol.asyncIterator]();
+
+    try {
+      taskSocket.write(
+        `${JSON.stringify({
+          type: "submit_prompt",
+          requestId: "turn-waiting",
+          ownerGeneration: lease.ownerGeneration,
+          message: "wait for me",
+          permissionMode: "approve-reads",
+          waitForCompletion: true,
+        })}\n`,
+      );
+      assert.equal(((await nextJsonLine(taskIterator)) as { type: string }).type, "accepted");
+
+      const result = (await sendQueueRequest(lease.socketPath, {
+        type: "cancel_prompt",
+        requestId: "cancel-waiting",
+        ownerGeneration: lease.ownerGeneration,
+        targetTurnId: "turn-waiting",
+      })) as { type: string; outcome?: string };
+      assert.equal(result.type, "cancel_result");
+      assert.equal(result.outcome, "queued");
+
+      const cancelled = (await nextJsonLine(taskIterator)) as {
+        type: string;
+        detailCode?: string;
+        retryable?: boolean;
+      };
+      assert.equal(cancelled.type, "error");
+      assert.equal(cancelled.detailCode, "QUEUE_PROMPT_CANCELLED");
+      assert.equal(cancelled.retryable, false);
+      assert.equal(owner.queueDepth(), 0);
+    } finally {
+      taskLines.close();
+      taskSocket.destroy();
+      await owner.close();
+      await releaseQueueOwnerLease(lease);
+    }
+  });
+});
+
+async function enqueuePrompt(
+  socketPath: string,
+  requestId: string,
+  waitForCompletion: boolean,
+): Promise<void> {
+  const socket = await connectSocket(socketPath);
+  const lines = readline.createInterface({ input: socket });
+  const iterator = lines[Symbol.asyncIterator]();
+  try {
+    socket.write(
+      `${JSON.stringify({
+        type: "submit_prompt",
+        requestId,
+        message: requestId,
+        permissionMode: "approve-reads",
+        waitForCompletion,
+      })}\n`,
+    );
+    assert.equal(((await nextJsonLine(iterator)) as { type: string }).type, "accepted");
+  } finally {
+    lines.close();
+    socket.destroy();
+  }
+}
 
 async function sendQueueRequest(socketPath: string, request: unknown): Promise<unknown> {
   const socket = await connectSocket(socketPath);

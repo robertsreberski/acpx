@@ -195,6 +195,7 @@ export async function nextJsonLine(
  * real owner rather than one per test.
  */
 export const noParkedRequestControlHandlers = {
+  cancelQueuedPrompt: async (): Promise<void> => {},
   listPendingRequests: async (): Promise<PendingRequest[]> => [],
   respondToPendingRequest: async (pendingRequestId: string): Promise<PendingRequest> => {
     throw new PendingRequestNotAnswerableError(

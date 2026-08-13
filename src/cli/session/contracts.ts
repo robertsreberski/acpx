@@ -18,6 +18,7 @@ import type {
   SessionResumePolicy,
   SessionRecord,
 } from "../../types.js";
+import type { QueueCancelOutcome } from "../queue/messages.js";
 
 type TimedRunOptions = {
   timeoutMs?: number;
@@ -173,6 +174,7 @@ export type SessionCancelOptions = {
 export type SessionCancelResult = {
   sessionId: string;
   cancelled: boolean;
+  outcome: QueueCancelOutcome;
 };
 
 export type SessionSetModeOptions = {

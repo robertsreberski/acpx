@@ -59,6 +59,9 @@ export type QueueCancelRequest = {
   targetTurnId?: string;
 };
 
+export const QUEUE_CANCEL_OUTCOMES = ["active", "queued", "not_found"] as const;
+export type QueueCancelOutcome = (typeof QUEUE_CANCEL_OUTCOMES)[number];
+
 export type QueueSetModeRequest = {
   type: "set_mode";
   requestId: string;
@@ -149,6 +152,8 @@ export type QueueOwnerCancelResultMessage = {
   requestId: string;
   ownerGeneration?: number;
   cancelled: boolean;
+  /** Present from queue protocol v4 onward; omitted by older owners. */
+  outcome?: QueueCancelOutcome;
 };
 
 export type QueueOwnerSetModeResultMessage = {
@@ -774,8 +779,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   event: parseEventOwnerMessage,
   permission_escalation: parsePermissionEscalationOwnerMessage,
   result: parseResultOwnerMessage,
-  cancel_result: (message, context) =>
-    parseBooleanResultOwnerMessage(message, context, "cancel_result", "cancelled"),
+  cancel_result: parseCancelResultOwnerMessage,
   close_session_result: (message, context) =>
     parseBooleanResultOwnerMessage(message, context, "close_session_result", "closed"),
   set_mode_result: (message, context) =>
@@ -824,7 +828,7 @@ function parseResultOwnerMessage(
   return { type: "result", ...context, result };
 }
 
-function parseBooleanResultOwnerMessage<TType extends "cancel_result" | "close_session_result">(
+function parseBooleanResultOwnerMessage<TType extends "close_session_result">(
   message: Record<string, unknown>,
   context: QueueOwnerMessageContext,
   type: TType,
@@ -837,6 +841,31 @@ function parseBooleanResultOwnerMessage<TType extends "cancel_result" | "close_s
     QueueOwnerMessage,
     { type: TType }
   >;
+}
+
+function parseCancelResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerCancelResultMessage | null {
+  if (typeof message.cancelled !== "boolean") {
+    return null;
+  }
+  if (message.outcome !== undefined && !isQueueCancelOutcome(message.outcome)) {
+    return null;
+  }
+  if (message.outcome !== undefined && message.cancelled !== (message.outcome !== "not_found")) {
+    return null;
+  }
+  return {
+    type: "cancel_result",
+    ...context,
+    cancelled: message.cancelled,
+    ...(message.outcome === undefined ? {} : { outcome: message.outcome }),
+  };
+}
+
+function isQueueCancelOutcome(value: unknown): value is QueueCancelOutcome {
+  return typeof value === "string" && QUEUE_CANCEL_OUTCOMES.includes(value as QueueCancelOutcome);
 }
 
 function parseStringResultOwnerMessage<TType extends "set_mode_result" | "set_model_result">(

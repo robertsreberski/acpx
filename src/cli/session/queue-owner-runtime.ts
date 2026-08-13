@@ -13,7 +13,10 @@ import {
 } from "../../runtime/engine/session-options.js";
 import { sweepPendingRequests } from "../../session/pending-requests.js";
 import { absolutePath, resolveSessionRecord } from "../../session/persistence.js";
-import { writeSessionRecordWithLatestTimeline } from "../../session/timeline.js";
+import {
+  appendSessionTimelineLifecycleEvent,
+  writeSessionRecordWithLatestTimeline,
+} from "../../session/timeline.js";
 import type { AcpClientOptions, SessionSendOutcome } from "../../types.js";
 import {
   QUEUE_CONNECT_RETRY_MS,
@@ -366,6 +369,15 @@ async function writeQueueOwnerLifecycleSnapshot(
   }
 }
 
+async function cancelQueuedTimelineTurn(sessionId: string, turnId: string): Promise<void> {
+  const record = await resolveSessionRecord(sessionId);
+  await appendSessionTimelineLifecycleEvent(
+    record,
+    { type: "turn_cancelled" },
+    { turnId, requestId: turnId },
+  );
+}
+
 async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<false>((resolve) => {
@@ -634,6 +646,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           await applyPendingCancel();
           return true;
         },
+        cancelQueuedPrompt: async (turnId: string) => {
+          await cancelQueuedTimelineTurn(options.sessionId, turnId);
+        },
         closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
         setSessionMode: async (modeId: string, timeoutMs?: number) => {
           await turnController.setSessionMode(modeId, timeoutMs);
@@ -783,4 +798,7 @@ export async function sendSession(options: SessionSendOptions): Promise<SessionS
 
 export type { QueueOwnerRuntimeOptions };
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
-export const queueOwnerRuntimeTestInternals = { queueOwnerExitIsFatal };
+export const queueOwnerRuntimeTestInternals = {
+  cancelQueuedTimelineTurn,
+  queueOwnerExitIsFatal,
+};

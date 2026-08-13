@@ -87,6 +87,7 @@ summary:focus-visible {
 }
 .app-body {
   display: flex;
+  min-width: 0;
   min-height: 0;
 }
 .session-sidebar {
@@ -345,6 +346,7 @@ button:disabled {
 
 .session-workspace {
   display: flex;
+  width: 100%;
   min-width: 0;
   min-height: 0;
   flex: 1;
@@ -472,12 +474,16 @@ button:disabled {
 
 .thread-root {
   display: flex;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   flex: 1;
   flex-direction: column;
 }
 .thread-viewport {
   position: relative;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   flex: 1;
   overflow-y: auto;
@@ -788,6 +794,7 @@ fieldset.elicitation-field {
 
 .composer-shell {
   width: min(800px, 100%);
+  min-width: 0;
   margin: 0 auto;
   padding: 10px 22px max(15px, env(safe-area-inset-bottom));
 }
@@ -801,9 +808,21 @@ fieldset.elicitation-field {
   background: var(--panel);
 }
 
-.queued-prompts p {
+.queued-prompt {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0;
+}
+
+.queued-prompt p {
   margin: 6px 0;
   white-space: pre-wrap;
+}
+
+.queued-prompt button {
+  flex: 0 0 auto;
 }
 
 .queued-prompts small {
@@ -1155,8 +1174,12 @@ fieldset.elicitation-field {
     max-width: 165px;
   }
   .session-status {
+    max-width: 86px;
+    overflow: hidden;
     padding: 4px 6px;
     font-size: 8px !important;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .message-row {
     grid-template-columns: 1fr;
@@ -1176,6 +1199,7 @@ fieldset.elicitation-field {
     padding: 8px 8px max(8px, env(safe-area-inset-bottom));
   }
   .composer {
+    min-width: 0;
     border-radius: 12px;
   }
   .composer-send span {
@@ -1234,8 +1258,9 @@ fieldset.elicitation-field {
     --panel: #171e1a;
     --canvas: #111713;
     --surface: #1d2520;
-    --accent: #3b9565;
+    --accent: #26734b;
     --accent-strong: #52ad79;
+    --faint: #a9b7ae;
   }
   .session-sidebar,
   .workspace-header {
@@ -1274,6 +1299,16 @@ fieldset.elicitation-field {
     border-color: #5c4930;
     background: #2a2319;
   }
+  .interaction-kicker {
+    color: #d9b77b;
+  }
+  .interaction-state {
+    color: #c9d5cd;
+    background: #493b29;
+  }
+  .interaction-card p {
+    color: #c9d5cd;
+  }
   .interaction-card:not(.is-pending) {
     background: #19201c;
   }
@@ -1283,5 +1318,8 @@ fieldset.elicitation-field {
   .composer-stop,
   .danger-button {
     background: #2b1d1c;
+  }
+  .notice.is-success {
+    color: #b8cfbf;
   }
 }

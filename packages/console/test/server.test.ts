@@ -180,10 +180,11 @@ test("mutations reject cross-origin and cross-site browser requests", async () =
 });
 
 test("costly reads and event streams reject hostile browser requests before service work", async () => {
-  const { running, service } = await fixture();
+  const { running, service, workspace } = await fixture();
+  const providerUrl = `${running.origin}/api/v1/agents/codex/sessions?cwd=${encodeURIComponent(workspace)}`;
   try {
     const hostileHeaders = { "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Site": "cross-site" };
-    const provider = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const provider = await fetch(providerUrl, {
       headers: hostileHeaders,
     });
     assert.equal(provider.status, 403);
@@ -195,23 +196,23 @@ test("costly reads and event streams reject hostile browser requests before serv
     const events = await fetch(`${running.origin}/api/v1/events`, { headers: hostileHeaders });
     assert.equal(events.status, 403);
 
-    const proxiedHttps = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const proxiedHttps = await fetch(providerUrl, {
       headers: { Origin: running.origin.replace(/^http:/, "https:") },
     });
     assert.equal(proxiedHttps.status, 200);
     assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
 
-    const unsupportedScheme = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const unsupportedScheme = await fetch(providerUrl, {
       headers: { Origin: running.origin.replace(/^http:/, "ftp:") },
     });
     assert.equal(unsupportedScheme.status, 403);
-    const mismatchedAuthority = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const mismatchedAuthority = await fetch(providerUrl, {
       headers: { Origin: "https://evil.example" },
     });
     assert.equal(mismatchedAuthority.status, 403);
     assert.equal(service.calls.filter((call) => call.method === "listProviderSessions").length, 1);
 
-    const legitimate = await fetch(`${running.origin}/api/v1/agents/codex/sessions`, {
+    const legitimate = await fetch(providerUrl, {
       headers: { "Sec-Fetch-Site": "same-origin", Origin: running.origin },
     });
     assert.equal(legitimate.status, 200);
@@ -222,9 +223,10 @@ test("costly reads and event streams reject hostile browser requests before serv
 });
 
 test("provider-session enumeration rejects excess in-flight work per client", async () => {
-  const { running, service } = await fixture({
+  const { running, service, workspace } = await fixture({
     providerEnumerationLimit: { global: 1, perClient: 1 },
   });
+  const providerUrl = `${running.origin}/api/v1/agents/codex/sessions?cwd=${encodeURIComponent(workspace)}`;
   let markEntered!: () => void;
   const entered = new Promise<void>((resolve) => {
     markEntered = resolve;
@@ -239,9 +241,9 @@ test("provider-session enumeration rejects excess in-flight work per client", as
     return { sessions: [] };
   };
   try {
-    const first = fetch(`${running.origin}/api/v1/agents/codex/sessions`);
+    const first = fetch(providerUrl);
     await entered;
-    const refused = await fetch(`${running.origin}/api/v1/agents/codex/sessions`);
+    const refused = await fetch(providerUrl);
     assert.equal(refused.status, 429);
     assert.equal(
       ((await refused.json()) as { error: { code: string } }).error.code,
@@ -251,6 +253,24 @@ test("provider-session enumeration rejects excess in-flight work per client", as
     assert.equal((await first).status, 200);
   } finally {
     release();
+    await running.close();
+  }
+});
+
+test("provider-session enumeration requires an explicit allowed workspace", async () => {
+  const { running, service } = await fixture();
+  try {
+    const response = await fetch(`${running.origin}/api/v1/agents/codex/sessions`);
+    assert.equal(response.status, 400);
+    assert.equal(
+      ((await response.json()) as { error: { code: string } }).error.code,
+      "INVALID_INPUT",
+    );
+    assert.equal(
+      service.calls.some((call) => call.method === "listProviderSessions"),
+      false,
+    );
+  } finally {
     await running.close();
   }
 });
@@ -751,7 +771,7 @@ test("a failed service subscription disposes the service before startup returns"
 });
 
 test("session detail, provider inventory, timeline, pending, cancellation, response and close routes keep exact ids", async () => {
-  const { running, service } = await fixture();
+  const { running, service, workspace } = await fixture();
   try {
     const auth = await bootstrap(running.origin);
     const detail = await fetch(`${running.origin}/api/v1/sessions/record-1`);
@@ -760,7 +780,9 @@ test("session detail, provider inventory, timeline, pending, cancellation, respo
       ((await detail.json()) as { session: { acpxRecordId: string } }).session.acpxRecordId,
       "record-1",
     );
-    const provider = await fetch(`${running.origin}/api/v1/agents/codex/sessions?cursor=next`);
+    const provider = await fetch(
+      `${running.origin}/api/v1/agents/codex/sessions?cwd=${encodeURIComponent(workspace)}&cursor=next`,
+    );
     assert.equal(provider.status, 200);
     assert.equal(((await provider.json()) as { sessions: unknown[] }).sessions.length, 1);
     assert.equal(service.calls.at(-1)?.method, "listProviderSessions");
@@ -791,6 +813,11 @@ test("session detail, provider inventory, timeline, pending, cancellation, respo
     );
     assert.equal(cancelled.status, 202);
     assert.equal(service.calls.at(-1)?.method, "cancelTurn");
+    assert.deepEqual(service.calls.at(-1)?.input, {
+      acpxRecordId: "record-1",
+      turnId: "turn-1",
+      idempotencyKey: "cancel-key-123",
+    });
 
     const closed = await fetch(`${running.origin}/api/v1/sessions/record-1/close`, {
       method: "POST",

@@ -6,6 +6,14 @@ export interface QueuedPrompt {
   readonly text: string;
 }
 
+/** Remove exactly one optimistic receipt without disturbing another session or turn. */
+export const removeQueuedPrompt = (
+  prompts: readonly QueuedPrompt[],
+  sessionId: string,
+  turnId: string,
+): readonly QueuedPrompt[] =>
+  prompts.filter((prompt) => prompt.sessionId !== sessionId || prompt.id !== turnId);
+
 const TERMINAL_TURN_STATES = new Set(["cancelled", "completed", "failed", "interrupted"]);
 
 /** Keep optimistic queue receipts until the durable transcript starts or terminates that turn. */

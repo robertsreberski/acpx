@@ -230,12 +230,12 @@ export type AcpxSessionsServiceOptions = {
 };
 
 export interface AcpxSessionService {
-  listAgents(): Promise<AcpxRegisteredAgent[]>;
+  listAgents(input: { cwd: string }): Promise<AcpxRegisteredAgent[]>;
   listSessions(): Promise<AcpxSessionSummary[]>;
   getSession(input: { acpxRecordId: string }): Promise<AcpxSessionDetail | undefined>;
   listProviderSessions(input: {
     agentId: string;
-    cwd?: string;
+    cwd: string;
     cursor?: string;
   }): Promise<AcpxProviderSessionPage>;
   createSession(input: AcpxCreateSessionInput): Promise<AcpxMutationReceipt<AcpxSessionDetail>>;

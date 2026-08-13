@@ -84,7 +84,7 @@ test("session service creates without prompting, replays idempotently, and lists
     assert.equal(first.result.ownerState, "absent");
     assert.equal(first.result.turnState, "idle");
     assert.equal(first.result.agentId, "mock");
-    assert.ok((await service.listAgents()).some((agent) => agent.agentId === "mock"));
+    assert.ok((await service.listAgents({ cwd })).some((agent) => agent.agentId === "mock"));
     const calls = (await fs.readFile(callLog, "utf8"))
       .trim()
       .split("\n")

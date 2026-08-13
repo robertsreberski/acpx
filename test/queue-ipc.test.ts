@@ -54,6 +54,7 @@ test("cancelSessionPrompt sends cancel request to active queue owner", async () 
     try {
       const result = await session.cancelSessionPrompt({ sessionId });
       assert.equal(result.cancelled, true);
+      assert.equal(result.outcome, "active");
       assert.equal(result.sessionId, sessionId);
     } finally {
       await closeServer(server);

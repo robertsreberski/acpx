@@ -186,9 +186,9 @@ test("a pre-defer queue owner still serves policies that do not use defer", asyn
   });
 });
 
-test("a pre-v3 queue owner cannot receive an exact-turn cancellation", async () => {
+test("a pre-v4 queue owner cannot receive an exact-turn cancellation", async () => {
   await withTempHome(async (homeDir) => {
-    await withFakeOwner(homeDir, "owner-legacy-cancel", { queueProtocol: 2 }, async () => {
+    await withFakeOwner(homeDir, "owner-legacy-cancel", { queueProtocol: 3 }, async () => {
       await assert.rejects(
         async () =>
           await tryCancelOnRunningOwner({

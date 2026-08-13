@@ -48,10 +48,11 @@ const execFileAsync = promisify(execFile);
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
 ): Promise<SessionCancelResult> {
-  const cancelled = await tryCancelOnRunningOwner(options);
+  const outcome = (await tryCancelOnRunningOwner(options)) ?? "not_found";
   return {
     sessionId: options.sessionId,
-    cancelled: cancelled === true,
+    cancelled: outcome !== "not_found",
+    outcome,
   };
 }
 

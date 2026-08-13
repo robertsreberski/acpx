@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { reconcileQueuedPrompts, reconcileSessionQueuedPrompts } from "../src/queued-prompts";
+import {
+  reconcileQueuedPrompts,
+  reconcileSessionQueuedPrompts,
+  removeQueuedPrompt,
+} from "../src/queued-prompts";
 import type { TranscriptEvent } from "../src/types";
 
 const prompt = { id: "turn-2", sessionId: "session-1", text: "Run tests next" };
@@ -35,5 +39,19 @@ test("keeps an accepted queue receipt until durable execution or termination", (
     reconcileQueuedPrompts([prompt], [event({ kind: "message", role: "user" })]),
     [],
   );
+  assert.deepEqual(reconcileQueuedPrompts([prompt], [event({ status: "cancelled" })]), []);
   assert.deepEqual(reconcileQueuedPrompts([prompt], [event({ status: "failed" })]), []);
+});
+
+test("removes only the exact queued receipt requested by the operator", () => {
+  const sameSession = { id: "turn-3", sessionId: "session-1", text: "Keep this one" };
+  const sameTurnOtherSession = {
+    id: prompt.id,
+    sessionId: "session-2",
+    text: "Same id, different session",
+  };
+  assert.deepEqual(
+    removeQueuedPrompt([prompt, sameSession, sameTurnOtherSession], "session-1", prompt.id),
+    [sameSession, sameTurnOtherSession],
+  );
 });

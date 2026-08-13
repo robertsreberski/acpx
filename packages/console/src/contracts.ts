@@ -96,12 +96,12 @@ export interface ServiceInvalidation {
 }
 
 export interface AcpxConsoleSessionService {
-  listAgents(): Promise<ConsoleAgent[]>;
+  listAgents(input: { cwd: string }): Promise<ConsoleAgent[]>;
   listSessions(): Promise<ConsoleSession[]>;
   getSession(input: { acpxRecordId: string }): Promise<ConsoleSession | undefined>;
   listProviderSessions(input: {
     agentId: string;
-    cwd?: string;
+    cwd: string;
     cursor?: string;
   }): Promise<{ sessions: ProviderSession[]; nextCursor?: string }>;
   createSession(input: {

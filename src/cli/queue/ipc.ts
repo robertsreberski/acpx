@@ -37,6 +37,7 @@ import {
 } from "./lease-store.js";
 import {
   parseQueueOwnerMessage,
+  type QueueCancelOutcome,
   type QueueCancelRequest,
   type QueueCloseSessionRequest,
   type QueueListRequestsRequest,
@@ -672,7 +673,7 @@ async function submitControlToQueueOwner<TResponse extends QueueOwnerMessage>(
 async function submitCancelToQueueOwner(
   owner: QueueOwnerRecord,
   targetTurnId?: string,
-): Promise<boolean | undefined> {
+): Promise<QueueCancelOutcome | undefined> {
   const request: QueueCancelRequest = {
     type: "cancel_prompt",
     requestId: randomUUID(),
@@ -694,7 +695,7 @@ async function submitCancelToQueueOwner(
       retryable: true,
     });
   }
-  return response.cancelled;
+  return response.outcome ?? (response.cancelled ? "active" : "not_found");
 }
 
 async function submitSetModeToQueueOwner(
@@ -1033,7 +1034,7 @@ export async function tryCancelOnRunningOwner(options: {
   sessionId: string;
   turnId?: string;
   verbose?: boolean;
-}): Promise<boolean | undefined> {
+}): Promise<QueueCancelOutcome | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
     return undefined;
@@ -1053,14 +1054,14 @@ export async function tryCancelOnRunningOwner(options: {
     );
   }
 
-  const cancelled = await submitCancelToQueueOwner(owner, options.turnId);
-  if (cancelled !== undefined) {
+  const outcome = await submitCancelToQueueOwner(owner, options.turnId);
+  if (outcome !== undefined) {
     if (options.verbose) {
       process.stderr.write(
         `[acpx] requested cancel on active owner pid ${owner.pid} for session ${options.sessionId}\n`,
       );
     }
-    return cancelled;
+    return outcome;
   }
 
   const health = await probeQueueOwnerHealth(options.sessionId);

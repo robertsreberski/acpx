@@ -336,7 +336,7 @@ async function handleApi(
       `acpx_console_csrf=${encodeURIComponent(context.csrfToken)}; Path=/; HttpOnly; SameSite=Strict`,
     );
     const [agents, sessions] = await Promise.all([
-      context.service.listAgents(),
+      context.service.listAgents({ cwd: context.config.workspaceRoots[0]! }),
       context.service.listSessions(),
     ]);
     const body: ConsoleBootstrap = {
@@ -408,10 +408,11 @@ async function handleApi(
 
   const provider = routeMatch(path, /^\/api\/v1\/agents\/([^/]+)\/sessions$/);
   if (method === "GET" && provider) {
-    const cwdParam = url.searchParams.get("cwd") ?? undefined;
-    const cwd = cwdParam
-      ? await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots)
-      : undefined;
+    const cwdParam = url.searchParams.get("cwd");
+    if (!cwdParam) {
+      throw new ConsoleInputError("Provider session inventory requires an explicit cwd");
+    }
+    const cwd = await assertWorkspaceAllowed(cwdParam, context.config.workspaceRoots);
     const client = request.socket.remoteAddress ?? "unknown";
     sendJson(
       response,

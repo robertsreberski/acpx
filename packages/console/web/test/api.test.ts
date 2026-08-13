@@ -305,3 +305,21 @@ test("preserves an unknown prompt admission for reconciliation", async () => {
     },
   );
 });
+
+test("targets cancellation to the exact queued turn receipt", async () => {
+  const client = new ConsoleApi();
+  let captured: { url: string; init?: RequestInit } | undefined;
+  await withFetch(
+    async (input, init) => {
+      captured = { url: requestUrl(input), init };
+      return response({ turnId: "turn/queued", state: "cancelled" }, 202);
+    },
+    async () => {
+      await client.cancelTurn("record/one", "turn/queued");
+    },
+  );
+  assert.equal(captured?.url, "/api/v1/sessions/record%2Fone/turns/turn%2Fqueued/cancel");
+  assert.equal(captured?.init?.method, "POST");
+  assert.equal(captured?.init?.body, "{}");
+  assert.ok(new Headers(captured?.init?.headers).get("Idempotency-Key"));
+});

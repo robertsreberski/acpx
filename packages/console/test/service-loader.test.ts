@@ -99,16 +99,17 @@ function coreFixture() {
 test("adapter unwraps mutation receipts and projects provider and agent inventory", async () => {
   const fixture = coreFixture();
   const service = adaptAcpxSessionService(fixture.core);
-  assert.deepEqual(await service.listAgents(), [
+  assert.deepEqual(await service.listAgents({ cwd: "/workspace" }), [
     {
       agentId: "codex",
       label: "Codex",
       supportsSessionList: true,
     },
   ]);
-  assert.deepEqual((await service.listProviderSessions({ agentId: "codex" })).sessions, [
-    { providerSessionId: "native-1", title: "Native", cwd: undefined, updatedAt: undefined },
-  ]);
+  assert.deepEqual(
+    (await service.listProviderSessions({ agentId: "codex", cwd: "/workspace" })).sessions,
+    [{ providerSessionId: "native-1", title: "Native", cwd: undefined, updatedAt: undefined }],
+  );
   assert.equal(
     (await service.getTranscriptPage({ acpxRecordId: "record-1" })).writeError,
     "Authoritative timeline persistence failed; recent history may be incomplete.",

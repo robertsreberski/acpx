@@ -14,6 +14,7 @@ import type {
 import {
   parseQueueRequest,
   toQueueOwnerWireMessage,
+  type QueueCancelOutcome,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
   type QueueRequest,
@@ -100,6 +101,8 @@ export type QueueTask = {
 
 export type QueueOwnerControlHandlers = {
   cancelPrompt: (targetTurnId?: string) => Promise<boolean>;
+  /** Persist terminal cancellation for a prompt removed from this owner's FIFO. */
+  cancelQueuedPrompt: (turnId: string) => Promise<void>;
   closeSession: (timeoutMs?: number) => Promise<boolean>;
   setSessionMode: (modeId: string, timeoutMs?: number) => Promise<void>;
   setSessionModel: (
@@ -136,6 +139,8 @@ export class SessionQueueOwner {
   private readonly sockets = new Set<net.Socket>();
   private readonly taskSockets = new Set<net.Socket>();
   private readonly drainingSockets = new Set<net.Socket>();
+  private cancellingQueuedCount = 0;
+  private pendingMutation: Promise<void> = Promise.resolve();
   private closed = false;
 
   private constructor(
@@ -233,6 +238,7 @@ export class SessionQueueOwner {
   }
 
   async nextTask(timeoutMs?: number): Promise<QueueTask | undefined> {
+    await this.pendingMutation;
     if (this.pending.length > 0) {
       const task = this.pending.shift();
       this.emitQueueDepth();
@@ -272,11 +278,80 @@ export class SessionQueueOwner {
   }
 
   queueDepth(): number {
-    return this.pending.length;
+    return this.pending.length + this.cancellingQueuedCount;
   }
 
   private emitQueueDepth(): void {
-    this.onQueueDepthChanged?.(this.pending.length);
+    this.onQueueDepthChanged?.(this.queueDepth());
+  }
+
+  private async runPendingMutation<TResult>(run: () => Promise<TResult>): Promise<TResult> {
+    const result = this.pendingMutation.then(run);
+    this.pendingMutation = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await result;
+  }
+
+  private async cancelQueuedPrompt(targetTurnId: string): Promise<boolean> {
+    return await this.runPendingMutation(async () => {
+      const index = this.pending.findIndex((task) => task.requestId === targetTurnId);
+      if (index < 0) {
+        return false;
+      }
+
+      const [task] = this.pending.splice(index, 1);
+      if (!task) {
+        return false;
+      }
+      this.cancellingQueuedCount += 1;
+
+      try {
+        await this.controlHandlers.cancelQueuedPrompt(targetTurnId);
+      } catch (error) {
+        this.cancellingQueuedCount -= 1;
+        if (this.closed) {
+          if (task.waitForCompletion) {
+            task.send(
+              makeQueueOwnerError(
+                task.requestId,
+                "Queue owner shutting down before prompt execution",
+                "QUEUE_OWNER_SHUTTING_DOWN",
+                { retryable: true },
+              ),
+            );
+          }
+          task.close();
+        } else {
+          this.pending.splice(Math.min(index, this.pending.length), 0, task);
+        }
+        this.emitQueueDepth();
+        throw error;
+      }
+
+      this.cancellingQueuedCount -= 1;
+      this.emitQueueDepth();
+      if (task.waitForCompletion) {
+        task.send(
+          makeQueueOwnerError(
+            task.requestId,
+            "Queued prompt was cancelled before execution",
+            "QUEUE_PROMPT_CANCELLED",
+            { retryable: false },
+          ),
+        );
+      }
+      task.close();
+      return true;
+    });
+  }
+
+  private async cancelPrompt(targetTurnId?: string): Promise<QueueCancelOutcome> {
+    if (targetTurnId !== undefined && (await this.cancelQueuedPrompt(targetTurnId))) {
+      return "queued";
+    }
+    return (await this.controlHandlers.cancelPrompt(targetTurnId)) ? "active" : "not_found";
   }
 
   private enqueue(task: QueueTask): boolean {
@@ -301,7 +376,7 @@ export class SessionQueueOwner {
       return true;
     }
 
-    if (this.pending.length >= this.maxQueueDepth) {
+    if (this.queueDepth() >= this.maxQueueDepth) {
       task.send({
         ...makeQueueOwnerError(
           task.requestId,
@@ -444,11 +519,15 @@ export class SessionQueueOwner {
       this.handleControlRequest({
         socket,
         requestId: request.requestId,
-        run: async () => ({
-          type: "cancel_result",
-          requestId: request.requestId,
-          cancelled: await this.controlHandlers.cancelPrompt(request.targetTurnId),
-        }),
+        run: async () => {
+          const outcome = await this.cancelPrompt(request.targetTurnId);
+          return {
+            type: "cancel_result",
+            requestId: request.requestId,
+            cancelled: outcome !== "not_found",
+            outcome,
+          };
+        },
       });
       return true;
     }

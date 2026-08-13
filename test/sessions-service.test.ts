@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
 import { MAX_MESSAGE_BUFFER_SIZE } from "../src/cli/queue/ipc.js";
+import { QUEUE_PROTOCOL_VERSION } from "../src/cli/queue/lease-store.js";
 import { SessionEventWriter } from "../src/session/events.js";
 import {
   PENDING_REQUEST_SCHEMA,
@@ -56,6 +57,139 @@ test("session lookup requires an exact acpx record id and returns browser-safe D
       listSessions: false,
     });
     service.dispose();
+  });
+});
+
+test("a malformed retained workspace config cannot break session projections", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const healthyCwd = path.join(homeDir, "healthy-workspace");
+    const malformedCwd = path.join(homeDir, "malformed-workspace");
+    await Promise.all([
+      fs.mkdir(healthyCwd, { recursive: true }),
+      fs.mkdir(malformedCwd, { recursive: true }),
+    ]);
+    await fs.writeFile(path.join(malformedCwd, ".acpxrc.json"), "{ invalid json", "utf8");
+
+    const healthy = makeSessionRecord({
+      acpxRecordId: "session-healthy-config",
+      acpSessionId: "provider-healthy-config",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: healthyCwd,
+      acpx: { agent_id: "codex" },
+    });
+    const retained = makeSessionRecord({
+      acpxRecordId: "session-malformed-config",
+      acpSessionId: "provider-malformed-config",
+      agentCommand: "custom-agent --stdio",
+      cwd: malformedCwd,
+      acpx: { agent_id: "custom-agent" },
+    });
+    await Promise.all([
+      writeSessionRecordFile(homeDir, healthy),
+      writeSessionRecordFile(homeDir, retained),
+    ]);
+    const service = createAcpxSessionService({ cwd: healthyCwd });
+
+    try {
+      const sessions = await service.listSessions();
+      assert.deepEqual(
+        sessions
+          .map(({ acpxRecordId, agentId }) => ({ acpxRecordId, agentId }))
+          .toSorted((left, right) => left.acpxRecordId.localeCompare(right.acpxRecordId)),
+        [
+          { acpxRecordId: "session-healthy-config", agentId: "codex" },
+          { acpxRecordId: "session-malformed-config", agentId: "custom-agent" },
+        ],
+      );
+      const detail = await service.getSession({ acpxRecordId: retained.acpxRecordId });
+      assert.equal(detail?.agentId, "custom-agent");
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+test("agent inventory is loaded from the exact requested workspace", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const firstCwd = path.join(homeDir, "first-workspace");
+    const secondCwd = path.join(homeDir, "second-workspace");
+    await Promise.all([
+      fs.mkdir(firstCwd, { recursive: true }),
+      fs.mkdir(secondCwd, { recursive: true }),
+    ]);
+    await Promise.all([
+      fs.writeFile(
+        path.join(firstCwd, ".acpxrc.json"),
+        `${JSON.stringify({ agents: { first: { command: "first-agent" } } })}\n`,
+        "utf8",
+      ),
+      fs.writeFile(
+        path.join(secondCwd, ".acpxrc.json"),
+        `${JSON.stringify({ agents: { second: { command: "second-agent" } } })}\n`,
+        "utf8",
+      ),
+    ]);
+    const service = createAcpxSessionService({ cwd: firstCwd });
+
+    try {
+      const secondAgents = await service.listAgents({ cwd: secondCwd });
+      assert.equal(
+        secondAgents.some((agent) => agent.agentId === "second"),
+        true,
+      );
+      assert.equal(
+        secondAgents.some((agent) => agent.agentId === "first"),
+        false,
+      );
+    } finally {
+      service.dispose();
+    }
+  });
+});
+
+test("adoption cannot reuse a provider record from another workspace", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const existingCwd = path.join(homeDir, "existing-workspace");
+    const requestedCwd = path.join(homeDir, "requested-workspace");
+    await Promise.all([
+      fs.mkdir(existingCwd, { recursive: true }),
+      fs.mkdir(requestedCwd, { recursive: true }),
+    ]);
+    const existing = makeSessionRecord({
+      acpxRecordId: "session-provider-cross-workspace",
+      acpSessionId: "provider-cross-workspace",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd: existingCwd,
+      acpx: {
+        agent_id: "codex",
+        desired_mode_id: "read-only",
+        current_mode_id: "read-only",
+      },
+    });
+    await writeSessionRecordFile(homeDir, existing);
+    const service = createAcpxSessionService({ cwd: requestedCwd });
+
+    try {
+      await assert.rejects(
+        async () =>
+          await service.adoptSession({
+            agentId: "codex",
+            cwd: requestedCwd,
+            providerSessionId: existing.acpSessionId,
+            idempotencyKey: "cross-workspace-adoption",
+          }),
+        (error: unknown) => {
+          assert.equal((error as { code?: string }).code, "SESSION_ADOPTION_FAILED");
+          assert.match((error as Error).message, /already adopted in workspace/u);
+          return true;
+        },
+      );
+      const retained = await resolveSessionRecord(existing.acpxRecordId);
+      assert.equal(retained.cwd, path.resolve(existingCwd));
+      assert.equal(retained.acpx?.desired_mode_id, "read-only");
+    } finally {
+      service.dispose();
+    }
   });
 });
 
@@ -218,7 +352,7 @@ test("ambiguous queue transport loss is replayed without a duplicate turn or fal
       pid: keeper.pid,
       sessionId: initial.acpxRecordId,
       ownerGeneration: 78,
-      queueProtocol: 3,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
       parking: true,
       parkingMaxAgeMs: 86_400_000,
     });
@@ -294,7 +428,7 @@ test("follow-up prompts are admitted promptly and FIFO while an active turn writ
       pid: keeper.pid,
       sessionId: initial.acpxRecordId,
       ownerGeneration: 82,
-      queueProtocol: 3,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
       parking: true,
       parkingMaxAgeMs: 86_400_000,
     });
@@ -388,7 +522,7 @@ test("service cancellation uses the CLI queue wire with the exact active turn id
       pid: keeper.pid,
       sessionId: initial.acpxRecordId,
       ownerGeneration: 79,
-      queueProtocol: 3,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
     });
     let targetTurnId: string | undefined;
     const server = createSingleRequestServer((socket, request) => {
@@ -400,6 +534,7 @@ test("service cancellation uses the CLI queue wire with the exact active turn id
           type: "cancel_result",
           requestId: request.requestId,
           cancelled: true,
+          outcome: "active",
         })}\n`,
       );
     });
@@ -422,7 +557,72 @@ test("service cancellation uses the CLI queue wire with the exact active turn id
   });
 });
 
-test("queued and stale turn ids cannot cancel the active turn", async () => {
+test("ambiguous cancellation is replayed without sending a second cancel", async () => {
+  await withTempHome("acpx-sessions-service-", async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const initial = makeSessionRecord({
+      acpxRecordId: "session-cancel-ambiguous",
+      acpSessionId: "provider-cancel-ambiguous",
+      agentCommand: AGENT_REGISTRY.codex,
+      cwd,
+    });
+    await writeSessionRecordFile(homeDir, initial);
+    const record = await resolveSessionRecord(initial.acpxRecordId);
+    await appendSessionTimelineLifecycleEvent(
+      record,
+      { type: "turn_started" },
+      { turnId: "turn-ambiguous" },
+    );
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 81,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+    });
+    let cancellations = 0;
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "cancel_prompt");
+      cancellations += 1;
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(`${"x".repeat(MAX_MESSAGE_BUFFER_SIZE + 1)}\n`);
+    });
+    await listenServer(server, paths.socketPath);
+    const service = createAcpxSessionService({ cwd });
+    const input = {
+      acpxRecordId: initial.acpxRecordId,
+      turnId: "turn-ambiguous",
+      idempotencyKey: "cancel-ambiguous",
+    };
+
+    try {
+      await assert.rejects(
+        async () => await service.cancelTurn(input),
+        (error: unknown) => {
+          assert.equal(
+            (error as { detailCode?: string }).detailCode,
+            "QUEUE_RESPONSE_TOO_LARGE_AFTER_WRITE",
+          );
+          return true;
+        },
+      );
+      const replay = await service.cancelTurn(input);
+      assert.equal(replay.replayed, true);
+      assert.deepEqual(replay.result, { turnId: "turn-ambiguous", state: "unknown" });
+      assert.equal(cancellations, 1);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
+    }
+  });
+});
+
+test("service cancels queued turns exactly and leaves stale ids alone", async () => {
   await withTempHome("acpx-sessions-service-", async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -444,18 +644,50 @@ test("queued and stale turn ids cannot cancel the active turn", async () => {
       { type: "turn_submitted" },
       { turnId: "turn-queued" },
     );
+    const keeper = await startKeeperProcess();
+    const paths = queuePaths(homeDir, initial.acpxRecordId);
+    await writeQueueOwnerLock({
+      ...paths,
+      pid: keeper.pid,
+      sessionId: initial.acpxRecordId,
+      ownerGeneration: 80,
+      queueProtocol: QUEUE_PROTOCOL_VERSION,
+    });
+    const targeted: string[] = [];
+    const server = createSingleRequestServer((socket, request) => {
+      assert.equal(request.type, "cancel_prompt");
+      const targetTurnId = (request as typeof request & { targetTurnId?: string }).targetTurnId;
+      if (targetTurnId) {
+        targeted.push(targetTurnId);
+      }
+      const outcome = targetTurnId === "turn-queued" ? "queued" : "not_found";
+      socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          type: "cancel_result",
+          requestId: request.requestId,
+          cancelled: outcome !== "not_found",
+          outcome,
+        })}\n`,
+      );
+    });
+    await listenServer(server, paths.socketPath);
     const service = createAcpxSessionService({ cwd });
 
-    for (const [turnId, key] of [
-      ["turn-queued", "cancel-queued"],
-      ["turn-stale", "cancel-stale"],
-    ] as const) {
+    try {
+      const queued = await service.cancelTurn({
+        acpxRecordId: record.acpxRecordId,
+        turnId: "turn-queued",
+        idempotencyKey: "cancel-queued",
+      });
+      assert.equal(queued.result.state, "cancelled");
+
       await assert.rejects(
         async () =>
           await service.cancelTurn({
             acpxRecordId: record.acpxRecordId,
-            turnId,
-            idempotencyKey: key,
+            turnId: "turn-stale",
+            idempotencyKey: "cancel-stale",
           }),
         (error: unknown) => {
           assert.ok(error instanceof AcpxTurnNotActiveError);
@@ -463,8 +695,13 @@ test("queued and stale turn ids cannot cancel the active turn", async () => {
           return true;
         },
       );
+      assert.deepEqual(targeted, ["turn-queued", "turn-stale"]);
+    } finally {
+      service.dispose();
+      await closeServer(server);
+      await cleanupOwnerArtifacts(paths);
+      stopProcess(keeper);
     }
-    service.dispose();
   });
 });
 

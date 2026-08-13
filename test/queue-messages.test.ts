@@ -359,6 +359,22 @@ test("parseQueueOwnerMessage accepts structured non-error owner messages", () =>
 
   assert.deepEqual(
     parseQueueOwnerMessage({
+      type: "cancel_result",
+      requestId: "req-cancel-queued",
+      cancelled: true,
+      outcome: "queued",
+    }),
+    {
+      type: "cancel_result",
+      requestId: "req-cancel-queued",
+      ownerGeneration: undefined,
+      cancelled: true,
+      outcome: "queued",
+    },
+  );
+
+  assert.deepEqual(
+    parseQueueOwnerMessage({
       type: "close_session_result",
       requestId: "req-close",
       closed: true,
@@ -544,6 +560,24 @@ test("parseQueueOwnerMessage rejects invalid structured owner message payloads",
       type: "cancel_result",
       requestId: "req-cancel",
       cancelled: "yes",
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "cancel_result",
+      requestId: "req-cancel",
+      cancelled: true,
+      outcome: "everything",
+    }),
+    null,
+  );
+  assert.equal(
+    parseQueueOwnerMessage({
+      type: "cancel_result",
+      requestId: "req-cancel",
+      cancelled: false,
+      outcome: "queued",
     }),
     null,
   );

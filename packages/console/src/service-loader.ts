@@ -40,12 +40,12 @@ type CorePermissionPolicy = {
   defaultAction?: "approve" | "deny" | "escalate" | "defer";
 };
 interface CoreSessionsService {
-  listAgents(): Promise<CoreAgent[]>;
+  listAgents(input: { cwd: string }): Promise<CoreAgent[]>;
   listSessions(): Promise<CoreSession[]>;
   getSession(input: { acpxRecordId: string }): Promise<CoreSession | undefined>;
   listProviderSessions(input: {
     agentId: string;
-    cwd?: string;
+    cwd: string;
     cursor?: string;
   }): Promise<{ sessions: CoreProviderSession[]; nextCursor?: string }>;
   createSession(input: {
@@ -194,8 +194,8 @@ function projectPending(request: CorePending): PendingInteraction {
 
 export function adaptAcpxSessionService(core: CoreSessionsService): AcpxConsoleSessionService {
   return {
-    async listAgents() {
-      return (await core.listAgents()).map(projectAgent);
+    async listAgents(input) {
+      return (await core.listAgents(input)).map(projectAgent);
     },
     listSessions: () => core.listSessions(),
     getSession: (input) => core.getSession(input),

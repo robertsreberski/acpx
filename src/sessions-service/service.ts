@@ -338,16 +338,30 @@ class SessionService implements AcpxSessionService {
     return mergeAgentRegistry(customCommands(await this.config(cwd)));
   }
 
+  private async projectionRegistry(record: SessionRecord): Promise<Record<string, string>> {
+    try {
+      return await this.registry(record.cwd);
+    } catch {
+      // Read projections must remain available when one retained workspace has
+      // since acquired a malformed config. Preserve the durable agent identity
+      // without weakening config validation on mutations for that workspace.
+      const persistedAgentId = record.acpx?.agent_id;
+      return mergeAgentRegistry(
+        persistedAgentId ? { [persistedAgentId]: record.agentCommand } : undefined,
+      );
+    }
+  }
+
   private adapterTimeout(config: ResolvedAcpxConfig): number {
     return adapterOperationTimeout(this.options, config);
   }
 
   private async projectDetail(record: SessionRecord): Promise<AcpxSessionDetail> {
-    return await projectSession(record, true, await this.registry(record.cwd));
+    return await projectSession(record, true, await this.projectionRegistry(record));
   }
 
   private async projectSummary(record: SessionRecord): Promise<AcpxSessionSummary> {
-    return await projectSession(record, false, await this.registry(record.cwd));
+    return await projectSession(record, false, await this.projectionRegistry(record));
   }
 
   // oxlint-disable-next-line eslint/complexity -- Recovery must validate each durable identity axis before reconnecting.
@@ -405,9 +419,8 @@ class SessionService implements AcpxSessionService {
     }
   }
 
-  async listAgents(): Promise<AcpxRegisteredAgent[]> {
-    const cwd = this.options.cwd ?? process.cwd();
-    const [config, records] = await Promise.all([this.config(cwd), listSessions()]);
+  async listAgents(input: { cwd: string }): Promise<AcpxRegisteredAgent[]> {
+    const [config, records] = await Promise.all([this.config(input.cwd), listSessions()]);
     return projectRegisteredAgents(mergeAgentRegistry(customCommands(config)), records);
   }
 
@@ -469,6 +482,15 @@ class SessionService implements AcpxSessionService {
             record.acpx?.agent_id === undefined && record.agentCommand === agent.agentCommand,
         );
       if (existing) {
+        if (path.resolve(existing.cwd) !== path.resolve(input.cwd)) {
+          throw new AcpxSessionAdoptionError(
+            agent.agentId,
+            providerSessionId,
+            new Error(
+              `provider session is already adopted in workspace ${JSON.stringify(path.resolve(existing.cwd))}`,
+            ),
+          );
+        }
         if (existing.acpx?.agent_id === undefined) {
           existing.acpx = { ...existing.acpx, agent_id: agent.agentId };
           await writeSessionRecord(existing);
@@ -692,27 +714,33 @@ class SessionService implements AcpxSessionService {
   }
 
   async cancelTurn(input: AcpxCancelTurnInput): Promise<AcpxMutationReceipt<AcpxCancelTurnResult>> {
-    const receipt = await runIdempotentMutation({
+    const receipt = await runIdempotentMutation<AcpxCancelTurnResult>({
       operation: "cancel_turn",
       idempotencyKey: input.idempotencyKey,
       input,
+      recoveryResult: {
+        turnId: input.turnId,
+        state: "unknown",
+      } satisfies AcpxCancelTurnResult,
+      outcomeUnknown: isQueueAdmissionOutcomeUnknown,
       run: async () => {
         await this.requireExactRecord(input.acpxRecordId);
-        const activeTurn = await getActiveSessionTimelineTurn(input.acpxRecordId);
-        if (activeTurn?.turn_id !== input.turnId) {
-          throw new AcpxTurnNotActiveError(input.turnId, activeTurn?.turn_id);
-        }
         const cancelled = await cancelSessionPrompt({
           sessionId: input.acpxRecordId,
           turnId: input.turnId,
         });
-        return {
-          turnId: input.turnId,
-          state: cancelled.cancelled ? "cancelling" : "unknown",
-        } satisfies AcpxCancelTurnResult;
+        if (cancelled.outcome === "queued") {
+          return { turnId: input.turnId, state: "cancelled" } satisfies AcpxCancelTurnResult;
+        }
+        if (cancelled.outcome === "active") {
+          return { turnId: input.turnId, state: "cancelling" } satisfies AcpxCancelTurnResult;
+        }
+        const activeTurn = await getActiveSessionTimelineTurn(input.acpxRecordId);
+        throw new AcpxTurnNotActiveError(input.turnId, activeTurn?.turn_id);
       },
     });
     this.emit({ type: "session", acpxRecordId: input.acpxRecordId });
+    this.emit({ type: "timeline", acpxRecordId: input.acpxRecordId });
     return receipt;
   }
 

@@ -10,8 +10,13 @@ import {
 } from "react";
 import { api, ApiError } from "./api";
 import { listenForLiveInvalidations } from "./live-events";
-import { reconcileSessionQueuedPrompts, type QueuedPrompt } from "./queued-prompts";
+import {
+  reconcileSessionQueuedPrompts,
+  removeQueuedPrompt,
+  type QueuedPrompt,
+} from "./queued-prompts";
 import { RequestGeneration } from "./request-generation";
+import { sessionIdFromPath } from "./selection-route";
 import {
   mergeRefreshedTimelinePage,
   normalizeTimelinePage,
@@ -31,10 +36,8 @@ import type {
 
 const EMPTY_BOOTSTRAP: BootstrapSnapshot = { agents: [], workspaceRoots: [], sessions: [] };
 
-const selectedSessionFromLocation = (): string | null => {
-  const match = /^\/sessions\/([^/]+)\/?$/u.exec(window.location.pathname);
-  return match ? decodeURIComponent(match[1] ?? "") : null;
-};
+const selectedSessionFromLocation = (): string | null =>
+  sessionIdFromPath(window.location.pathname);
 
 interface SessionStoreValue {
   readonly bootstrap: BootstrapSnapshot;
@@ -52,6 +55,7 @@ interface SessionStoreValue {
   readonly loadEarlier: () => Promise<void>;
   readonly sendPrompt: (text: string) => Promise<MutationReceipt>;
   readonly cancelTurn: () => Promise<void>;
+  readonly cancelQueuedTurn: (turnId: string) => Promise<void>;
   readonly closeSession: () => Promise<void>;
   readonly answerInteraction: (requestId: string, answer: unknown) => Promise<void>;
   readonly createSession: (input: CreateSessionInput) => Promise<SessionDetail>;
@@ -326,6 +330,23 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     );
   }, [runAction, selectedSession, selectedSessionId]);
 
+  const cancelQueuedTurn = useCallback(
+    async (turnId: string) => {
+      if (!selectedSessionId) {
+        return;
+      }
+      const sessionId = selectedSessionId;
+      await runAction(
+        () => api.cancelTurn(sessionId, turnId),
+        "Queued follow-up cancelled.",
+        () => {
+          setQueuedPrompts((current) => removeQueuedPrompt(current, sessionId, turnId));
+        },
+      );
+    },
+    [runAction, selectedSessionId],
+  );
+
   const closeSession = useCallback(async () => {
     if (!selectedSessionId) {
       return;
@@ -381,6 +402,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       loadEarlier,
       sendPrompt,
       cancelTurn,
+      cancelQueuedTurn,
       closeSession,
       answerInteraction,
       createSession,
@@ -394,6 +416,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       answerInteraction,
       bootstrap,
       cancelTurn,
+      cancelQueuedTurn,
       closeSession,
       createSession,
       loadEarlier,
