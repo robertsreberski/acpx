@@ -155,9 +155,6 @@ const persistedMutationKey = (value: unknown): PersistedMutationKey => {
   };
 };
 
-const isAbortError = (error: unknown): boolean =>
-  error instanceof DOMException && error.name === "AbortError";
-
 export class ConsoleApi {
   #csrfToken: string | undefined;
   readonly #ambiguousMutationKeys = new Map<string, PersistedMutationKey>();
@@ -332,10 +329,6 @@ export class ConsoleApi {
         response = await request();
       }
     } catch (error) {
-      if (isAbortError(error)) {
-        this.#releaseMutationKey(fingerprint, requestKey);
-        throw error;
-      }
       throw new MutationTransportUnknownError(error);
     }
     if (response.status === 403 && allowCsrfRefresh) {

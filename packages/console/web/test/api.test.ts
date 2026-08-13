@@ -387,6 +387,33 @@ test("an ambiguous mutation keeps its exact key across a page reload", async () 
   assert.equal(storage.values().length, 0);
 });
 
+test("an aborted mutation keeps its exact key across a page reload", async () => {
+  const storage = new MemoryStorage();
+  const keys: string[] = [];
+  let attempts = 0;
+  await withFetch(
+    async (_input, init) => {
+      attempts += 1;
+      keys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+      if (attempts === 1) {
+        throw new DOMException("response stream aborted", "AbortError");
+      }
+      return response({ turnId: "turn-after-abort", admission: "started" }, 202);
+    },
+    async () => {
+      await assert.rejects(
+        async () => await client(storage).sendPrompt("record-1", "aborted response"),
+        MutationTransportUnknownError,
+      );
+      await client(storage).sendPrompt("record-1", "aborted response");
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.ok(keys[0]);
+  assert.equal(keys[1], keys[0]);
+  assert.equal(storage.values().length, 0);
+});
+
 test("the durable retry ledger stores only fingerprints, keys, and timestamps", async () => {
   const storage = new MemoryStorage();
   await withFetch(
