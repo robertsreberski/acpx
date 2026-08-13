@@ -71,8 +71,9 @@ async function waitFor(label, read, timeoutMs = DEFAULT_TIMEOUT_MS) {
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  const detail = lastError instanceof Error ? `: ${lastError.message}` : "";
   throw new Error(
-    `Timed out waiting for ${label}${lastError ? `: ${String(lastError)}` : ""}`,
+    `Timed out waiting for ${label}${detail}`,
     lastError ? { cause: lastError } : undefined,
   );
 }

@@ -20,7 +20,9 @@ function Welcome({
 }) {
   return (
     <section className="welcome-panel">
-      <div className="welcome-mark">A</div>
+      <div className="welcome-mark" aria-hidden="true">
+        A
+      </div>
       <h1>Your coding sessions, in one place</h1>
       <p>
         Create an ACPX session or adopt existing agent work. Watch the complete transcript, answer

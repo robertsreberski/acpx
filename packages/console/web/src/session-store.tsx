@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import { api, ApiError } from "./api";
+import { closeSessionFeedback } from "./close-session-feedback";
 import {
   clearComposerDraftIfSent,
   composerDraftForSession,
@@ -381,8 +382,10 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     if (!selectedSessionId) {
       return;
     }
-    await runAction(() => api.closeSession(selectedSessionId), "Session closed.");
-  }, [runAction, selectedSessionId]);
+    const result = await runAction(() => api.closeSession(selectedSessionId));
+    const feedback = closeSessionFeedback(result);
+    notice(feedback.message, feedback.tone);
+  }, [notice, runAction, selectedSessionId]);
 
   const answerInteraction = useCallback(
     async (requestId: string, answer: unknown) => {
