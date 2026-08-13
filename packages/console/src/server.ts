@@ -486,6 +486,30 @@ async function handleApi(
     });
     return true;
   }
+  if (method === "POST" && path === "/api/v1/agents/session-options") {
+    // A POST because discovery opens a provider session: it has side effects
+    // and must carry the CSRF check, and it must never be retried
+    // automatically, since each attempt creates another session.
+    const body = await readJsonBody(request);
+    const cwd = await assertWorkspaceUsable(
+      requiredString(body, "cwd"),
+      context.config.workspaceRoots,
+      context.config.stateDir,
+    );
+    if (!context.service.probeSessionOptions) {
+      sendJson(response, 200, { status: "unsupported", reason: "older_acpx" });
+      return true;
+    }
+    sendJson(
+      response,
+      200,
+      await context.service.probeSessionOptions({
+        agentId: requiredString(body, "agentId"),
+        cwd,
+      }),
+    );
+    return true;
+  }
   if (method === "GET" && path === "/api/v1/workspaces/suggestions") {
     sendJson(response, 200, {
       suggestions: await suggestWorkspaces(

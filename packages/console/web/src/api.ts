@@ -12,6 +12,7 @@ import type {
   PendingInteraction,
   ProviderSession,
   SessionDetail,
+  SessionOptionsProbe,
   SessionSummary,
   TimelinePage,
   WorkspaceSuggestion,
@@ -576,6 +577,38 @@ export class ConsoleApi {
         acpxRecordId: session.acpxRecordId,
       })),
     }));
+  }
+
+  /**
+   * Discovery opens a provider session, so it must not ride the retrying
+   * mutation helper: a transport retry would open another one. It carries the
+   * CSRF token by hand and is sent exactly once.
+   */
+  async probeSessionOptions(
+    agentId: string,
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<SessionOptionsProbe> {
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      // Satisfies the mutation gate. Deliberately fresh every time and never
+      // replayed: each probe is a new discovery, and reusing a key would either
+      // return a stale catalog or, worse, invite a retry that opens a second
+      // provider session.
+      "Idempotency-Key": `probe-${crypto.randomUUID()}`,
+    };
+    if (this.#csrfToken) {
+      headers["X-CSRF-Token"] = this.#csrfToken;
+    }
+    return await json<SessionOptionsProbe>(
+      await fetch("/api/v1/agents/session-options", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ agentId, cwd }),
+        signal,
+      }),
+    );
   }
 
   workspaceSuggestions(prefix: string): Promise<readonly WorkspaceSuggestion[]> {

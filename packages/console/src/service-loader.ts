@@ -9,6 +9,7 @@ import type {
   ServiceInvalidation,
   TimelinePage,
   TurnState,
+  ProbeSessionOptionsResult,
 } from "./contracts.js";
 
 type PendingAnswer =
@@ -50,6 +51,12 @@ interface CoreSessionsService {
     cwd: string;
     cursor?: string;
   }): Promise<{ sessions: CoreProviderSession[]; nextCursor?: string }>;
+  /** Absent on an older installed acpx, which the console must keep working against. */
+  probeSessionOptions?(input: {
+    agentId: string;
+    cwd: string;
+    signal?: AbortSignal;
+  }): Promise<ProbeSessionOptionsResult>;
   createSession(input: {
     agentId: string;
     cwd: string;
@@ -207,6 +214,14 @@ export function adaptAcpxSessionService(core: CoreSessionsService): AcpxConsoleS
     async listProviderSessions(input) {
       const page = await core.listProviderSessions(input);
       return { sessions: page.sessions.map(projectProviderSession), nextCursor: page.nextCursor };
+    },
+    async probeSessionOptions(input) {
+      // An older installed acpx simply cannot discover options; that is a
+      // supported outcome, not a load failure or a broken console.
+      if (typeof core.probeSessionOptions !== "function") {
+        return { status: "unsupported", reason: "older_acpx" };
+      }
+      return await core.probeSessionOptions(input);
     },
     async createSession(input) {
       return (

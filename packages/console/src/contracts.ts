@@ -96,6 +96,39 @@ export interface PendingInteraction {
   schema?: unknown;
 }
 
+export interface ProbeOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export type ProbeCatalog =
+  | { advertised: false }
+  | { advertised: true; currentValue?: string; options: ProbeOption[] };
+
+/**
+ * Discovering an agent's modes and models is best-effort: an older installed
+ * acpx cannot do it, and an adapter can refuse. Every outcome is a normal
+ * answer the dialog can act on, so none of them is an HTTP failure.
+ */
+export type ProbeSessionOptionsResult =
+  | {
+      status: "ready";
+      modes: ProbeCatalog;
+      models: ProbeCatalog;
+      cleanup: "closed" | "unsupported" | "failed";
+      strandedSessionId?: string;
+    }
+  | { status: "unsupported"; reason: "older_acpx" }
+  | {
+      status: "failed";
+      phase: "start" | "session_new";
+      code: "auth_required" | "timeout" | "spawn_failed" | "protocol_error";
+      message: string;
+      cleanup: "closed" | "unsupported" | "failed";
+      strandedSessionId?: string;
+    };
+
 export interface ServiceInvalidation {
   type: "sessions" | "session" | "timeline" | "pending";
   acpxRecordId?: string;
@@ -111,6 +144,11 @@ export interface AcpxConsoleSessionService {
     cwd: string;
     cursor?: string;
   }): Promise<{ sessions: ProviderSession[]; nextCursor?: string }>;
+  probeSessionOptions?(input: {
+    agentId: string;
+    cwd: string;
+    signal?: AbortSignal;
+  }): Promise<ProbeSessionOptionsResult>;
   createSession(input: {
     agentId: string;
     cwd: string;

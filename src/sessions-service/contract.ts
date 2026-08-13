@@ -1,3 +1,4 @@
+import type { ProbeSessionOptionsResult } from "../cli/session/probe-session-options.js";
 import type {
   PendingRequestAnswer,
   PendingRequestKind,
@@ -11,6 +12,11 @@ import type {
   PermissionPolicy,
   PromptInput,
 } from "../types.js";
+export type {
+  ProbeCatalog as AcpxProbeCatalog,
+  ProbeOption as AcpxProbeOption,
+  ProbeSessionOptionsResult as AcpxProbeSessionOptionsResult,
+} from "../cli/session/probe-session-options.js";
 
 export type AcpxSessionState = "open" | "closed";
 export type AcpxOwnerState = "absent" | "starting" | "online" | "unreachable" | "dead";
@@ -263,6 +269,17 @@ export interface AcpxSessionService {
     cwd: string;
     cursor?: string;
   }): Promise<AcpxProviderSessionPage>;
+  /**
+   * Discover the modes and models an agent advertises for a workspace.
+   *
+   * Optional: a console running against an older installed acpx must keep
+   * working, and every caller can fall back to accepting an exact id.
+   */
+  probeSessionOptions?(input: {
+    agentId: string;
+    cwd: string;
+    signal?: AbortSignal;
+  }): Promise<ProbeSessionOptionsResult>;
   createSession(input: AcpxCreateSessionInput): Promise<AcpxMutationReceipt<AcpxSessionDetail>>;
   adoptSession(input: AcpxAdoptSessionInput): Promise<AcpxMutationReceipt<AcpxSessionDetail>>;
   enqueuePrompt(

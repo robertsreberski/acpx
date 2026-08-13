@@ -21,6 +21,10 @@ import {
   readLiveQueueOwner,
   readQueueOwnerRecord,
 } from "../cli/queue/lease-store.js";
+import {
+  probeSessionOptions,
+  type ProbeSessionOptionsResult,
+} from "../cli/session/probe-session-options.js";
 import { queueOwnerSpawnArgsForModule } from "../cli/session/queue-owner-process.js";
 import { sendSession } from "../cli/session/queue-owner-runtime.js";
 import {
@@ -551,6 +555,29 @@ class SessionService implements AcpxSessionService {
       sessions: response.sessions.map(providerSessionProjection),
       nextCursor: response.nextCursor ?? undefined,
     };
+  }
+
+  async probeSessionOptions(input: {
+    agentId: string;
+    cwd: string;
+    signal?: AbortSignal;
+  }): Promise<ProbeSessionOptionsResult> {
+    const agent = await this.resolveAgent(input.agentId, input.cwd);
+    return await probeSessionOptions({
+      agentCommand: agent.agentCommand,
+      agentArgv: agent.agentArgv,
+      cwd: input.cwd,
+      mcpServers: agent.config.mcpServers,
+      authCredentials: { ...agent.config.auth, ...this.options.authCredentials },
+      // Match how a real session would authenticate, so discovery does not fail
+      // for an agent that manages its own credentials.
+      authPolicy: this.options.authPolicy ?? agent.config.authPolicy,
+      // Discovery is interactive latency, not a background job: bound it well
+      // below the console's own request timeout so the dialog can fall back to
+      // free text rather than hanging on a slow adapter.
+      timeoutMs: 20_000,
+      signal: input.signal,
+    });
   }
 
   // oxlint-disable-next-line eslint/complexity -- This is the create/adopt transaction boundary and keeps teardown in one finally.

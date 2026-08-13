@@ -34,6 +34,38 @@ export interface WorkspaceSuggestion {
   readonly authorized: boolean;
 }
 
+export interface ProbeOption {
+  readonly value: string;
+  readonly label: string;
+  readonly description?: string;
+}
+
+export type ProbeCatalog =
+  | { readonly advertised: false }
+  | {
+      readonly advertised: true;
+      readonly currentValue?: string;
+      readonly options: readonly ProbeOption[];
+    };
+
+export type SessionOptionsProbe =
+  | {
+      readonly status: "ready";
+      readonly modes: ProbeCatalog;
+      readonly models: ProbeCatalog;
+      readonly cleanup: "closed" | "unsupported" | "failed";
+      readonly strandedSessionId?: string;
+    }
+  | { readonly status: "unsupported"; readonly reason: "older_acpx" }
+  | {
+      readonly status: "failed";
+      readonly phase: "start" | "session_new";
+      readonly code: "auth_required" | "timeout" | "spawn_failed" | "protocol_error";
+      readonly message: string;
+      readonly cleanup: "closed" | "unsupported" | "failed";
+      readonly strandedSessionId?: string;
+    };
+
 export interface SessionSummary {
   readonly id: string;
   readonly name: string;

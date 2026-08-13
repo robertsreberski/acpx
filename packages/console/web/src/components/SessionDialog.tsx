@@ -2,10 +2,16 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 import { api, ApiError } from "../api";
 import { DialogSubmission } from "../dialog-submission";
 import { useDismissibleLayer } from "../dismissible-layer";
+import { catalogOptions, preselectedMode, preselectedModel, probeHint } from "../probe-selection";
 import { reconcileDialogOptions } from "../session-dialog-options";
 import { normalizeExactId, requiresExplicitMode, safeDefaultMode } from "../session-mode";
 import { useSessionStore } from "../session-store";
-import type { AgentSummary, ProviderSession, WorkspaceSuggestion } from "../types";
+import type {
+  AgentSummary,
+  ProviderSession,
+  SessionOptionsProbe,
+  WorkspaceSuggestion,
+} from "../types";
 import { loadWorkspaceAgents } from "../workspace-agent-inventory";
 import { Combobox } from "./Combobox";
 import { Icon } from "./Icon";
@@ -34,6 +40,8 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
   const [needsAuthorization, setNeedsAuthorization] = useState<string | null>(null);
   const [authorizing, setAuthorizing] = useState(false);
   const [authorizedGeneration, setAuthorizedGeneration] = useState(0);
+  const [probe, setProbe] = useState<SessionOptionsProbe | undefined>(undefined);
+  const [probing, setProbing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLElement>(null);
@@ -182,6 +190,53 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
       window.clearTimeout(timer);
     };
   }, [cwd, mode]);
+
+  /*
+   * Ask the selected agent what it supports. Discovery opens and discards a
+   * provider session, so it is debounced, aborted when the selection moves on,
+   * and never blocks session creation: a failure leaves both fields as free
+   * text.
+   */
+  useEffect(() => {
+    setProbe(undefined);
+    if (!mode || !agentId || !cwd || loadingAgents) {
+      setProbing(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setProbing(true);
+    const timer = window.setTimeout(() => {
+      void api.probeSessionOptions(agentId, cwd, controller.signal).then(
+        (result) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setProbe(result);
+          setProbing(false);
+          if (result.status === "ready") {
+            setSessionMode((current) =>
+              current === "" ? preselectedMode(result.modes, defaultMode) : current,
+            );
+            setModel((current) => (current === "" ? preselectedModel(result.models) : current));
+          }
+        },
+        () => {
+          if (!controller.signal.aborted) {
+            setProbe(undefined);
+            setProbing(false);
+          }
+        },
+      );
+    }, 300);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [agentId, cwd, mode, loadingAgents, defaultMode]);
+
+  const modeOptions = probe?.status === "ready" ? catalogOptions(probe.modes) : [];
+  const modelOptions = probe?.status === "ready" ? catalogOptions(probe.models) : [];
+  const modeHint = probeHint(probe, probing);
 
   const authorizeWorkspace = () => {
     if (!needsAuthorization) {
@@ -430,50 +485,55 @@ export function SessionDialog({ mode, onClose }: DialogProps) {
           </label>
           {mode === "create" ? (
             <div className="form-columns">
-              <label className="form-field">
+              <div className="form-field">
                 <span>Mode {!modeRequired && <em>optional</em>}</span>
-                <input
+                <Combobox
                   value={sessionMode}
-                  onChange={(event) => setSessionMode(event.target.value)}
+                  onChange={setSessionMode}
+                  options={modeOptions}
                   placeholder={defaultMode ? `Safe default: ${defaultMode}` : "Exact agent mode ID"}
-                  autoComplete="off"
+                  loading={probing}
                   required={modeRequired}
                 />
                 <small>
-                  {defaultMode
-                    ? `Leave blank to use the safe ${defaultMode} default.`
-                    : "Enter an exact mode ID. ACPX will not guess one."}
+                  {modeHint ??
+                    (defaultMode
+                      ? `Leave blank to use the safe ${defaultMode} default.`
+                      : "Pick a mode, or enter an exact ID.")}
                 </small>
-              </label>
-              <label className="form-field">
+              </div>
+              <div className="form-field">
                 <span>
                   Model <em>optional</em>
                 </span>
-                <input
+                <Combobox
                   value={model}
-                  onChange={(event) => setModel(event.target.value)}
+                  onChange={setModel}
+                  options={modelOptions}
                   placeholder="Exact agent model ID"
-                  autoComplete="off"
+                  loading={probing}
                 />
                 <small>Leave blank to use the agent default.</small>
-              </label>
+              </div>
             </div>
           ) : (
-            <label className="form-field">
+            <div className="form-field">
               <span>Mode {!modeRequired && <em>optional</em>}</span>
-              <input
+              <Combobox
                 value={sessionMode}
-                onChange={(event) => setSessionMode(event.target.value)}
+                onChange={setSessionMode}
+                options={modeOptions}
                 placeholder={defaultMode ? `Safe default: ${defaultMode}` : "Exact agent mode ID"}
-                autoComplete="off"
+                loading={probing}
                 required={modeRequired}
               />
               <small>
-                {defaultMode
-                  ? `Leave blank to use the safe ${defaultMode} default.`
-                  : "Enter an exact mode ID. ACPX will not guess one."}
+                {modeHint ??
+                  (defaultMode
+                    ? `Leave blank to use the safe ${defaultMode} default.`
+                    : "Pick a mode, or enter an exact ID.")}
               </small>
-            </label>
+            </div>
           )}
           {mode === "create" && (
             <>
