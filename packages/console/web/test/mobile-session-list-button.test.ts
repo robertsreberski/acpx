@@ -5,14 +5,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 Object.assign(globalThis, { React });
 
-test("the mobile Sessions control directly targets the session drawer", async () => {
+test("the mobile Sessions control exposes its dialog action without a dangling target", async () => {
   const { MobileSessionListButton } = await import("../src/components/MobileSessionListButton");
   const markup = renderToStaticMarkup(
     createElement(MobileSessionListButton, { open: false, onOpen: () => undefined }),
   );
 
   assert.match(markup, /aria-label="Open sessions"/u);
-  assert.match(markup, /aria-controls="session-sidebar"/u);
+  assert.doesNotMatch(markup, /aria-controls=/u);
   assert.match(markup, /aria-haspopup="dialog"/u);
   assert.match(markup, /aria-expanded="false"/u);
   assert.match(markup, /> Sessions<\/button>/u);

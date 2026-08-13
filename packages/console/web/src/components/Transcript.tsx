@@ -1,12 +1,12 @@
 import {
-  ComposerPrimitive,
   MessagePrimitive,
   type TextMessagePartProps,
   ThreadPrimitive,
   type ToolCallMessagePartProps,
 } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { shouldSubmitComposerKey } from "../composer-submit";
 import { booleanElicitationChoices, readElicitationField } from "../elicitation";
 import { interactionAvailability } from "../interaction-availability";
 import { useSessionStore } from "../session-store";
@@ -41,7 +41,7 @@ function PermissionCard({ interaction }: { readonly interaction: PendingInteract
         <span className="interaction-kicker">Permission request</span>
         <span className={`interaction-state is-${interaction.state}`}>{interaction.state}</span>
       </header>
-      <h3>{interaction.title}</h3>
+      <h2>{interaction.title}</h2>
       {interaction.detail && <p>{interaction.detail}</p>}
       {availability.reason && (
         <p className="interaction-unavailable" role="note">
@@ -299,7 +299,7 @@ function ElicitationCard({ interaction }: { readonly interaction: PendingInterac
         <span className="interaction-kicker">Agent question</span>
         <span className={`interaction-state is-${interaction.state}`}>{interaction.state}</span>
       </header>
-      <h3>{elicitation?.message ?? interaction.title}</h3>
+      <h2>{elicitation?.message ?? interaction.title}</h2>
       {availability.reason && (
         <p className="interaction-unavailable" role="note">
           {availability.reason}
@@ -440,6 +440,36 @@ export function Transcript() {
       session.turnState,
     );
   const sendLabel = isBusy ? "Queue follow-up" : "Send prompt";
+  const composerInput = useRef<HTMLTextAreaElement>(null);
+  const composerDraft = session ? store.composerDraftFor(session.id) : "";
+  const resizeComposer = () => {
+    const input = composerInput.current;
+    if (!input) {
+      return;
+    }
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 150)}px`;
+  };
+  useEffect(resizeComposer, [composerDraft]);
+  const submitPrompt = (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (!session) {
+      return;
+    }
+    const rawDraft = composerDraft;
+    if (rawDraft.trim() === "") {
+      return;
+    }
+    consumeUiAction(store.sendPrompt(rawDraft));
+  };
+  const composerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (shouldSubmitComposerKey(event.key, event.shiftKey, event.nativeEvent.isComposing)) {
+      event.preventDefault();
+      if (!store.actionBusy) {
+        submitPrompt();
+      }
+    }
+  };
   return (
     <ThreadPrimitive.Root className="thread-root">
       <ThreadPrimitive.Viewport className="thread-viewport">
@@ -517,9 +547,15 @@ export function Transcript() {
               Answer the waiting request above to unblock this turn.
             </p>
           )}
-          <ComposerPrimitive.Root className="composer">
-            <ComposerPrimitive.Input
+          <form className="composer" onSubmit={submitPrompt}>
+            <textarea
+              ref={composerInput}
               className="composer-input"
+              value={composerDraft}
+              onChange={(event) =>
+                session && store.setComposerDraft(session.id, event.target.value)
+              }
+              onKeyDown={composerKeyDown}
               placeholder={
                 isBusy
                   ? "Queue a follow-up for after the current turn…"
@@ -539,16 +575,17 @@ export function Transcript() {
                   <Icon name="stop" size={15} /> Stop
                 </button>
               )}
-              <ComposerPrimitive.Send
+              <button
+                type="submit"
                 className="composer-send"
-                disabled={store.actionBusy}
+                disabled={store.actionBusy || composerDraft.trim() === ""}
                 aria-label={sendLabel}
               >
                 <span>{sendLabel}</span>
                 <Icon name="send" size={16} />
-              </ComposerPrimitive.Send>
+              </button>
             </div>
-          </ComposerPrimitive.Root>
+          </form>
           {isBusy && (
             <p className="composer-note">
               Queued follow-ups start after the current turn finishes.

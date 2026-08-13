@@ -12,7 +12,6 @@ export function MobileSessionListButton({
       type="button"
       className="mobile-back"
       aria-label="Open sessions"
-      aria-controls="session-sidebar"
       aria-haspopup="dialog"
       aria-expanded={open}
       onClick={onOpen}

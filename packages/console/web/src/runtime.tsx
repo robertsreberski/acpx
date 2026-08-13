@@ -129,6 +129,28 @@ const BUSY_TURN_STATES = new Set([
   "cancelling",
 ]);
 
+export const syntheticPendingInteractionEvents = (
+  interactions: readonly PendingInteraction[],
+  coveredRequestIds: ReadonlySet<string>,
+): readonly TranscriptEvent[] =>
+  interactions
+    .filter(
+      (interaction) => interaction.state === "pending" && !coveredRequestIds.has(interaction.id),
+    )
+    .map(
+      (interaction, index): TranscriptEvent => ({
+        id: `pending:${interaction.id}`,
+        sequence: Number.MAX_SAFE_INTEGER - interactions.length + index,
+        occurredAt: interaction.createdAt,
+        requestId: interaction.id,
+        kind: interaction.kind,
+        role: "assistant",
+        title: interaction.title,
+        status: interaction.state,
+        payload: interaction,
+      }),
+    );
+
 export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode }) {
   const store = useSessionStore();
   const isRunning = store.selectedSession
@@ -143,21 +165,7 @@ export function AcpxRuntimeProvider({ children }: { readonly children: ReactNode
     const covered = new Set(
       timeline.flatMap((event) => (event.requestId ? [event.requestId] : [])),
     );
-    const synthetic = store.pending
-      .filter((interaction) => !covered.has(interaction.id))
-      .map(
-        (interaction, index): TranscriptEvent => ({
-          id: `pending:${interaction.id}`,
-          sequence: Number.MAX_SAFE_INTEGER - store.pending.length + index,
-          occurredAt: interaction.createdAt,
-          requestId: interaction.id,
-          kind: interaction.kind,
-          role: "assistant",
-          title: interaction.title,
-          status: interaction.state,
-          payload: interaction,
-        }),
-      );
+    const synthetic = syntheticPendingInteractionEvents(store.pending, covered);
     const allEvents = [...timeline, ...synthetic].toSorted(
       (left, right) =>
         left.sequence - right.sequence || left.occurredAt.localeCompare(right.occurredAt),

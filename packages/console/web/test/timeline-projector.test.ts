@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { syntheticPendingInteractionEvents } from "../src/runtime";
 import {
   coalesceTranscriptEvents,
   firstInteractionEventIds,
@@ -9,6 +10,7 @@ import {
   timelineEventIsRunning,
   type WireTimelineEvent,
 } from "../src/timeline-projector";
+import type { PendingInteraction } from "../src/types";
 
 const wire = (
   seq: number,
@@ -23,6 +25,30 @@ const wire = (
   turn_id: "turn-1",
   payload,
   ...extra,
+});
+
+const interaction = (id: string, state: PendingInteraction["state"]): PendingInteraction => ({
+  id,
+  sessionId: "session-1",
+  kind: "permission",
+  state,
+  createdAt: "2026-08-12T10:00:00.000Z",
+  title: `Permission ${id}`,
+});
+
+test("only synthesizes still-pending interactions missing from the durable timeline", () => {
+  const events = syntheticPendingInteractionEvents(
+    [interaction("pending-new", "pending"), interaction("answered-old", "answered")],
+    new Set(["covered"]),
+  );
+  assert.deepEqual(
+    events.map((event) => [event.requestId, event.status]),
+    [["pending-new", "pending"]],
+  );
+  assert.deepEqual(
+    syntheticPendingInteractionEvents([interaction("covered", "pending")], new Set(["covered"])),
+    [],
+  );
 });
 
 test("preserves tool identity and only streams activity from the active turn", () => {

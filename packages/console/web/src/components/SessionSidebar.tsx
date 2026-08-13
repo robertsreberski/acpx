@@ -66,7 +66,6 @@ export function SessionSidebar({
   return (
     <div ref={sidebarLayerRef} className="sidebar-layer">
       <aside
-        id="session-sidebar"
         className={`session-sidebar${open ? " is-open" : ""}`}
         role={open ? "dialog" : undefined}
         aria-modal={open ? "true" : undefined}

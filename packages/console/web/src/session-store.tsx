@@ -9,6 +9,12 @@ import {
   useState,
 } from "react";
 import { api, ApiError } from "./api";
+import {
+  clearComposerDraftIfSent,
+  composerDraftForSession,
+  setComposerDraftForSession,
+  type ComposerDrafts,
+} from "./composer-drafts";
 import { listenForLiveInvalidations } from "./live-events";
 import {
   reconcileSessionQueuedPrompts,
@@ -50,6 +56,9 @@ interface SessionStoreValue {
   readonly actionBusy: boolean;
   readonly connectionState: "connecting" | "online" | "offline";
   readonly queuedPrompts: readonly QueuedPrompt[];
+  readonly composerDraft: string;
+  readonly composerDraftFor: (sessionId: string) => string;
+  readonly setComposerDraft: (sessionId: string, value: string) => void;
   readonly selectSession: (id: string | null) => void;
   readonly refresh: () => Promise<void>;
   readonly loadEarlier: () => Promise<void>;
@@ -81,6 +90,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     "connecting",
   );
   const [queuedPrompts, setQueuedPrompts] = useState<readonly QueuedPrompt[]>([]);
+  const [composerDrafts, setComposerDrafts] = useState<ComposerDrafts>({});
   const noticeId = useRef(0);
   const bootstrapGeneration = useRef(new RequestGeneration());
   const selectionGeneration = useRef(0);
@@ -220,11 +230,29 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     };
   }, [refresh]);
 
-  const selectSession = useCallback((id: string | null) => {
-    selectedSessionIdRef.current = id;
-    selectionGeneration.current += 1;
-    setSelectedSessionId(id);
-    window.history.pushState(null, "", id ? `/sessions/${encodeURIComponent(id)}` : "/");
+  const selectSession = useCallback(
+    (id: string | null) => {
+      window.history.pushState(null, "", id ? `/sessions/${encodeURIComponent(id)}` : "/");
+      if (id === selectedSessionIdRef.current) {
+        if (id) {
+          void refreshSelection(id);
+        }
+        return;
+      }
+      selectedSessionIdRef.current = id;
+      selectionGeneration.current += 1;
+      setSelectedSessionId(id);
+    },
+    [refreshSelection],
+  );
+
+  const composerDraftFor = useCallback(
+    (sessionId: string) => composerDraftForSession(composerDrafts, sessionId),
+    [composerDrafts],
+  );
+
+  const setComposerDraft = useCallback((sessionId: string, value: string) => {
+    setComposerDrafts((current) => setComposerDraftForSession(current, sessionId, value));
   }, []);
 
   const loadEarlier = useCallback(async () => {
@@ -289,8 +317,9 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
         throw new Error("Select a session first.");
       }
       const sessionId = selectedSessionId;
+      const submittedText = text.trim();
       const result = await runAction(
-        () => api.sendPrompt(sessionId, text),
+        () => api.sendPrompt(sessionId, submittedText),
         undefined,
         (receipt) => {
           if (
@@ -301,11 +330,12 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
             const turnId = receipt.turnId;
             setQueuedPrompts((current) => [
               ...current.filter((item) => item.id !== turnId),
-              { id: turnId, sessionId, text },
+              { id: turnId, sessionId, text: submittedText },
             ]);
           }
         },
       );
+      setComposerDrafts((current) => clearComposerDraftIfSent(current, sessionId, text));
       notice(
         result.state === "started"
           ? "Prompt started."
@@ -397,6 +427,9 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       actionBusy,
       connectionState,
       queuedPrompts: queuedPrompts.filter((prompt) => prompt.sessionId === selectedSessionId),
+      composerDraft: composerDraftForSession(composerDrafts, selectedSessionId),
+      composerDraftFor,
+      setComposerDraft,
       selectSession,
       refresh,
       loadEarlier,
@@ -412,6 +445,8 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
     [
       actionBusy,
       connectionState,
+      composerDrafts,
+      composerDraftFor,
       adoptSession,
       answerInteraction,
       bootstrap,
@@ -429,6 +464,7 @@ export function SessionStoreProvider({ children }: { readonly children: ReactNod
       selectedSession,
       selectedSessionId,
       sendPrompt,
+      setComposerDraft,
       timeline,
     ],
   );

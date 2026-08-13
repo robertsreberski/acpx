@@ -6,7 +6,7 @@ export function SessionSelectionFallback({
   readonly onOpenSessions: () => void;
 }) {
   return (
-    <main className="welcome-panel" aria-live="polite">
+    <section className="welcome-panel" aria-live="polite">
       <div className="welcome-mark" aria-hidden="true">
         A
       </div>
@@ -20,6 +20,6 @@ export function SessionSelectionFallback({
           Sessions
         </button>
       </div>
-    </main>
+    </section>
   );
 }

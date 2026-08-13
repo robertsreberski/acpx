@@ -371,6 +371,9 @@ button:disabled {
   justify-content: space-between;
   gap: 14px;
 }
+.workspace-title > div {
+  min-width: 0;
+}
 .workspace-title h1 {
   overflow: hidden;
   margin: 0;
@@ -709,7 +712,7 @@ button:disabled {
   background: #f3e2ca;
   font-size: 9px;
 }
-.interaction-card h3 {
+.interaction-card h2 {
   margin: 10px 0 4px;
   font-family: Georgia, serif;
   font-size: 17px;
@@ -1171,7 +1174,8 @@ fieldset.elicitation-field {
     font-size: 12px;
   }
   .workspace-title > div > span {
-    max-width: 165px;
+    width: 100%;
+    max-width: min(165px, 100%);
   }
   .session-status {
     max-width: 86px;

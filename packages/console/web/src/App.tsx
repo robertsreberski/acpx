@@ -19,7 +19,7 @@ function Welcome({
   readonly onAdopt: () => void;
 }) {
   return (
-    <main className="welcome-panel">
+    <section className="welcome-panel">
       <div className="welcome-mark">A</div>
       <h1>Your coding sessions, in one place</h1>
       <p>
@@ -34,7 +34,7 @@ function Welcome({
           Adopt session
         </button>
       </div>
-    </main>
+    </section>
   );
 }
 
@@ -65,7 +65,7 @@ export default function App() {
           onCreate={() => openDialog("create")}
           onAdopt={() => openDialog("adopt")}
         />
-        <section className={`session-workspace${session ? " has-session" : ""}`}>
+        <main className={`session-workspace${session ? " has-session" : ""}`}>
           <header className="workspace-header">
             <button
               type="button"
@@ -129,7 +129,7 @@ export default function App() {
           ) : (
             <Welcome onCreate={() => openDialog("create")} onAdopt={() => openDialog("adopt")} />
           )}
-        </section>
+        </main>
         <SessionFacts open={factsOpen} onClose={() => setFactsOpen(false)} />
       </div>
       <SessionDialog mode={dialog} onClose={() => setDialog(null)} />
