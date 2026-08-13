@@ -19,6 +19,14 @@ Repo: https://github.com/openclaw/acpx
   session transcripts, create/adopt flows, queued prompts, cancellation, and
   permission or elicitation answers.
 
+- Console/UI: build the workspace on the ACPX Console design system. The session
+  list groups by project rather than turn state and collapses finished work, a
+  blocking permission or elicitation request docks above the composer instead of
+  scrolling away with the transcript, earlier history pages in on scroll while
+  holding the reader's place, and the type scale, touch targets and palette come
+  from the design. Inter now ships with the console as a self-hosted variable
+  font, so the intended weights render under the console's own CSP.
+
 ### Breaking
 
 ### Fixes

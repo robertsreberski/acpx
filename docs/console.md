@@ -39,19 +39,30 @@ owners.
 
 ## The workspace
 
-The session rail groups conversations by the action they need:
+The session rail groups conversations by project, so a session does not change
+group when its turn ends. Each row carries the session mode, what the session
+needs from you, and the agent and model that are running it:
 
 - **Needs you** — a permission or elicitation is waiting for an answer.
-- **Working** — a turn is starting, running, queued, cancelling, or otherwise
-  active.
-- **Open** — the session is open but has no active turn.
-- **History** — closed sessions and completed conversations.
+- **Running** — a turn is starting, running, queued, or cancelling, with the
+  queue depth beside it.
+- Finished and idle sessions collapse behind a single **Show N done** row at
+  the end of the list, so the list holds live and waiting work only.
+
+The chip row above the list filters to one project. Sessions are searchable by
+name, agent, model, workspace, or branch.
 
 Selecting a session opens its assistant-style transcript. Normal assistant
 text remains visible, while settled reasoning, plans, tool calls, results, and
 operational events are complete but collapsed. Active work expands while it is
-streaming. Use **Load earlier** to page backward through long conversations;
-the browser does not need to load the whole history at once.
+streaming. Earlier history pages in as you scroll toward the top of the
+transcript, holding your place across the load; the browser does not need to
+load the whole history at once.
+
+A permission or elicitation request that is blocking the turn leaves the
+transcript and sits above the composer, because the turn cannot continue until
+it is answered. Any further waiting request stays answerable in the transcript,
+and answered requests remain there as history.
 
 New session events are durably sequenced. Sessions created before this event
 ledger existed import the history ACPX still retained on the first transcript
