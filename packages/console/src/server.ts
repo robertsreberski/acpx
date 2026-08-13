@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { open, realpath, stat, type FileHandle } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { extname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import {
   assertRetainedWorkspaceAllowed,
@@ -14,6 +14,7 @@ import {
 import type {
   AcpxConsoleSessionService,
   ConsoleBootstrap,
+  ConsoleHiddenWorkspace,
   ConsoleSession,
   ProviderSession,
   ServiceInvalidation,
@@ -387,10 +388,32 @@ async function canonicalAllowedWorkspace(
   }
 }
 
-async function allowedSessions(
+/**
+ * Why a session the operator owns is not being served.
+ *
+ * A deleted workspace and an unauthorized one fail the same admission check but
+ * are not the same problem: one can be granted, the other can only be closed.
+ * Collapsing them would put an Authorize button on a directory where authorizing
+ * is impossible.
+ */
+async function withheldWorkspace(
+  cwd: string | undefined,
+): Promise<{ path: string; reason: "unauthorized" | "missing" } | undefined> {
+  if (!cwd) {
+    // Nothing to name and nothing to grant.
+    return undefined;
+  }
+  try {
+    return { path: await canonicalDirectory(cwd), reason: "unauthorized" };
+  } catch {
+    return { path: resolve(cwd), reason: "missing" };
+  }
+}
+
+async function partitionSessions(
   service: AcpxConsoleSessionService,
   config: Pick<ResolvedConsoleConfig, "stateDir" | "workspaceRoots">,
-): Promise<ConsoleSession[]> {
+): Promise<{ sessions: ConsoleSession[]; hiddenWorkspaces: ConsoleHiddenWorkspace[] }> {
   const sessions = await service.listSessions();
   const decisions = await Promise.all(
     sessions.map(
@@ -398,7 +421,30 @@ async function allowedSessions(
         (await canonicalAllowedWorkspace(session.acpxRecordId, session.cwd, config)) !== undefined,
     ),
   );
-  return sessions.filter((_, index) => decisions[index]);
+
+  const withheld = new Map<string, ConsoleHiddenWorkspace>();
+  await Promise.all(
+    sessions.map(async (session, index) => {
+      if (decisions[index]) {
+        return;
+      }
+      const workspace = await withheldWorkspace(session.cwd);
+      if (!workspace) {
+        return;
+      }
+      const existing = withheld.get(workspace.path);
+      if (existing) {
+        existing.sessionCount += 1;
+        return;
+      }
+      withheld.set(workspace.path, { ...workspace, sessionCount: 1 });
+    }),
+  );
+
+  return {
+    sessions: sessions.filter((_, index) => decisions[index]),
+    hiddenWorkspaces: [...withheld.values()].toSorted((a, b) => a.path.localeCompare(b.path)),
+  };
 }
 
 async function requireAllowedSession(
@@ -467,15 +513,16 @@ async function handleApi(
       "Set-Cookie",
       `acpx_console_csrf=${encodeURIComponent(context.csrfToken)}; Path=/; HttpOnly; SameSite=Strict`,
     );
-    const [agents, sessions] = await Promise.all([
+    const [agents, partitioned] = await Promise.all([
       context.service.listAgents({ cwd: context.config.workspaceRoots[0] }),
-      allowedSessions(context.service, context.config),
+      partitionSessions(context.service, context.config),
     ]);
     const body: ConsoleBootstrap = {
       version: 1,
       csrfToken: context.csrfToken,
       agents,
-      sessions,
+      sessions: partitioned.sessions,
+      hiddenWorkspaces: partitioned.hiddenWorkspaces,
       workspaceRoots: context.config.workspaceRoots,
       server: {
         host: context.config.host,
@@ -492,9 +539,7 @@ async function handleApi(
     return true;
   }
   if (method === "GET" && path === "/api/v1/sessions") {
-    sendJson(response, 200, {
-      sessions: await allowedSessions(context.service, context.config),
-    });
+    sendJson(response, 200, await partitionSessions(context.service, context.config));
     return true;
   }
   if (method === "POST" && path === "/api/v1/agents/session-options") {

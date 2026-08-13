@@ -207,11 +207,29 @@ export interface ConsoleCloseSessionResult {
       };
 }
 
+/**
+ * A directory holding sessions the console declined to serve.
+ *
+ * Filtering is a security boundary and stays exactly as strict, but silently
+ * returning a short list reads as "this is all your work". Reporting the
+ * directory and the count — never the sessions themselves — lets the operator
+ * see that something was withheld and, when the directory still exists, grant it.
+ *
+ * `missing` is not authorizable: the workspace has been deleted, so no grant can
+ * ever resolve it and the records are only good for closing.
+ */
+export interface ConsoleHiddenWorkspace {
+  path: string;
+  sessionCount: number;
+  reason: "unauthorized" | "missing";
+}
+
 export interface ConsoleBootstrap {
   version: 1;
   csrfToken: string;
   agents: ConsoleAgent[];
   sessions: ConsoleSession[];
+  hiddenWorkspaces: ConsoleHiddenWorkspace[];
   workspaceRoots: string[];
   server: { host: string; port: number; networkTrusted: boolean };
 }

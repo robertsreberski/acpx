@@ -200,10 +200,23 @@ export interface ProviderSession {
   readonly acpxRecordId?: string;
 }
 
+/**
+ * A directory whose sessions the console withheld.
+ *
+ * `unauthorized` can be granted from the UI; `missing` means the workspace is
+ * gone, so there is nothing to grant and the records can only be closed.
+ */
+export interface HiddenWorkspace {
+  readonly path: string;
+  readonly sessionCount: number;
+  readonly reason: "unauthorized" | "missing";
+}
+
 export interface BootstrapSnapshot {
   readonly agents: readonly AgentSummary[];
   readonly workspaceRoots: readonly WorkspaceRoot[];
   readonly sessions: readonly SessionSummary[];
+  readonly hiddenWorkspaces: readonly HiddenWorkspace[];
   readonly csrfToken?: string;
   readonly trustNetwork?: boolean;
   readonly version?: string;
