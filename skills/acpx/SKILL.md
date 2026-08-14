@@ -467,8 +467,9 @@ stable acpx `--cwd` because acpx still scopes its own record by cwd even though
 mono-agent treats the ACP cwd as advisory. For mono-agent `AskUser`, start the
 queue owner with `--defer` so acpx advertises and can park form elicitation.
 
-See [`agents/MonoAgent.md`](../../agents/MonoAgent.md) for setup, lifecycle, and
-ownership details.
+See the repository
+[`agents/MonoAgent.md`](https://github.com/robertsreberski/acpx/blob/fork-main/agents/MonoAgent.md)
+for setup, lifecycle, and ownership details.
 
 ## Devin ACP compatibility
 
