@@ -29,6 +29,10 @@ Repo: https://github.com/openclaw/acpx
 
 - CLI/effort: add portable `--effort <level>` selection across one-shot, persistent, queued, compare, flow, and embedded runtime paths; apply model before effort, validate against model-specific ACP config options, and persist explicit effort choices.
 
+- Docs/agents: document mono-agent sources as ordinary structured-argv aliases,
+  including source identity, durable resume, agent-owned capability boundaries,
+  and deferred `AskUser` elicitation.
+
 ### Breaking
 
 - CLI/sessions: persistent prompts now require the exact saved provider session to resume or load; reconnect failures no longer silently replace a conversation with `session/new`. A freshly created, untouched record whose adapter advertises no reuse method may still initialize its first prompt. Use `sessions new` explicitly to start over after any prompt attempt.

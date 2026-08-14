@@ -436,6 +436,37 @@ For ACP `authenticate` handshakes, use either config `auth` entries or explicit
 Ambient provider env vars such as `OPENAI_API_KEY` are still passed through to
 child agents, but they do not trigger ACP auth-method selection on their own.
 
+### mono-agent sources
+
+A mono-agent source is agent identity, not an ACP model. Keep its model and
+effort in `mono-agent.config.json`, then select one exact running source through
+an ordinary structured-argv alias:
+
+```json
+{
+  "agents": {
+    "mono-personal": {
+      "argv": ["mono-agent", "bridge", "acp", "--source-id", "personal-agent"]
+    }
+  },
+  "mcpServers": []
+}
+```
+
+The full argv participates in acpx session identity, so changing the source id
+selects a different scope without custom routing code. mono-agent owns its
+workspace, filesystem and terminal execution, MCP servers, credentials, and
+conversation history. Its bridge accepts acpx's standard filesystem and
+terminal capability advertisement but does not call those client methods; it
+requires an empty client MCP list and no additional directories.
+
+Current mono-agent bridges advertise `session/resume`, allowing acpx to retain
+the exact provider session across bridge and source restarts. Resume fails
+closed for unknown, cross-source, corrupt, pre-registry, or reset ids. Use a
+stable acpx `--cwd` because acpx still scopes its own record by cwd even though
+mono-agent treats the ACP cwd as advisory. For mono-agent `AskUser`, start the
+queue owner with `--defer` so acpx advertises and can park form elicitation.
+
 ## Devin ACP compatibility
 
 Devin is not a built-in agent shortcut. Use the raw command escape hatch:
