@@ -45,3 +45,7 @@ Harness-specific docs in this directory:
 - [Qwen](Qwen.md): built-in `qwen -> qwen --acp`
 - [Trae](Trae.md): built-in `trae -> traecli acp serve`
 - [ZeroClaw](ZeroClaw.md): built-in `zeroclaw -> zeroclaw acp`
+
+Configured ACP harnesses:
+
+- [mono-agent](MonoAgent.md): configure an `agents.<name>.argv` alias for one exact `mono-agent bridge acp --source-id <id>` source; mono-agent is not a built-in keyword
