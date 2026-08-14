@@ -61,7 +61,7 @@ mono-agent, but changing acpx's `cwd` selects a different local record. Use a
 stable `--cwd` when an orchestrator must reconnect from another process:
 
 ```bash
-acpx --cwd /absolute/task/root mono-personal sessions new -s research
+acpx --cwd /absolute/task/root mono-personal sessions new --name research
 acpx --cwd /absolute/task/root mono-personal -s research "continue"
 ```
 
