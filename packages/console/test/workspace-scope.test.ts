@@ -396,3 +396,48 @@ test("agent and provider inventories require and retain one canonical workspace 
     await running.close();
   }
 });
+
+test("withheld sessions are reported by workspace, and only a real directory is offered for authorization", async () => {
+  const { running, service, outside, workspaceRoot } = await fixture();
+  try {
+    // A workspace that existed when the session ran and has since been deleted:
+    // no grant can ever resolve it, so it must not be offered as authorizable.
+    const deleted = join(workspaceRoot, "..", "deleted-worktree");
+    await mkdir(deleted, { recursive: true });
+    service.sessions.push({ ...baseSession, acpxRecordId: "deleted-record", cwd: deleted });
+    await rm(deleted, { recursive: true, force: true });
+
+    const response = await fetch(`${running.origin}/api/v1/sessions`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      sessions: Array<{ acpxRecordId: string }>;
+      hiddenWorkspaces: Array<{ path: string; sessionCount: number; reason: string }>;
+    };
+
+    // The admission rule is unchanged: only the in-root session is served.
+    assert.deepEqual(
+      body.sessions.map((entry) => entry.acpxRecordId),
+      [baseSession.acpxRecordId],
+    );
+
+    const canonicalOutside = await realpath(outside);
+    const unauthorized = body.hiddenWorkspaces.find((entry) => entry.path === canonicalOutside);
+    // Both the direct path and the symlink that escapes into it canonicalize to
+    // one directory, so the operator is asked to authorize it once, not twice.
+    assert.deepEqual(unauthorized, {
+      path: canonicalOutside,
+      sessionCount: 2,
+      reason: "unauthorized",
+    });
+
+    const missing = body.hiddenWorkspaces.find((entry) => entry.reason === "missing");
+    assert.equal(missing?.sessionCount, 1);
+    assert.match(missing?.path ?? "", /deleted-worktree$/);
+
+    // Nothing about the withheld sessions themselves crosses the boundary — only
+    // the directory the operator would act on.
+    assert.equal(JSON.stringify(body.hiddenWorkspaces).includes(baseSession.acpxRecordId), false);
+  } finally {
+    await running.close();
+  }
+});

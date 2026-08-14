@@ -615,6 +615,7 @@ function useAutoLoadEarlier(
     };
     const settle = (landed: boolean) => {
       loadingRef.current = false;
+      scroller.classList.remove("is-restoring-scroll");
       if (!cancelled()) {
         setLoading(false);
       }
@@ -638,6 +639,10 @@ function useAutoLoadEarlier(
     const renderedRows = () => scroller.querySelectorAll(".message-row").length;
 
     const holdAnchor = (distance: number, rowsBefore: number) => {
+      // The anchor is re-pinned by assignment every frame; with the viewport's
+      // default `scroll-behavior: smooth` each of those would animate, so the
+      // correction that exists to hide the prepend becomes the visible jolt.
+      scroller.classList.add("is-restoring-scroll");
       let frames = 0;
       let lastHeight = scroller.scrollHeight;
       let stableFrames = 0;
@@ -689,6 +694,9 @@ function useAutoLoadEarlier(
     observer.observe(sentinel);
     return () => {
       loadingRef.current = false;
+      // A teardown mid-restore never reaches settle, and leaving the class on
+      // would strip smooth scrolling from the viewport for the rest of its life.
+      scroller.classList.remove("is-restoring-scroll");
       observer.disconnect();
     };
   }, [sentinel, canLoadEarlier]);

@@ -13,8 +13,12 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="ACPX" />
-    <!-- Lets the transcript run under the status bar and notch once installed. -->
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- `default`, not `black-translucent`: translucent forces white status bar
+         glyphs, which vanish against the light theme's pale header. With
+         `default` iOS tints the bar from the theme-color pair above and picks a
+         legible foreground for each theme itself. The safe-area insets in the
+         stylesheet stay correct either way. -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <title>ACPX Console</title>
   </head>
   <body>

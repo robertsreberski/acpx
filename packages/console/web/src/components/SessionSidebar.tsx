@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../api";
 import { useDismissibleLayer } from "../dismissible-layer";
 import {
   displayRepo,
@@ -9,7 +10,7 @@ import {
 } from "../session-presentation";
 import { sessionGroup, useSessionStore } from "../session-store";
 import { absoluteSessionTime, compactSessionTime } from "../session-time";
-import type { SessionSummary } from "../types";
+import type { HiddenWorkspace, SessionSummary } from "../types";
 import { Icon } from "./Icon";
 
 /** Live and waiting work stays on screen; finished and idle sessions collapse. */
@@ -69,6 +70,85 @@ function SessionRow({
   );
 }
 
+/**
+ * Account for the sessions the console declined to serve.
+ *
+ * The admission rule does not change here — work outside a configured root
+ * still stays out until the operator grants it. What changes is that the
+ * omission is now visible: a short list with no explanation is indistinguishable
+ * from having no other work, and a session the operator cannot see is one they
+ * cannot recover.
+ *
+ * A deleted workspace gets no Authorize button, because no grant can resolve a
+ * directory that is gone; naming it is the whole remedy the console can offer.
+ */
+function HiddenWorkspaces({
+  workspaces,
+  onAuthorized,
+}: {
+  readonly workspaces: readonly HiddenWorkspace[];
+  readonly onAuthorized: () => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [authorizing, setAuthorizing] = useState<string | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  if (workspaces.length === 0) {
+    return null;
+  }
+  const total = workspaces.reduce((count, workspace) => count + workspace.sessionCount, 0);
+  const authorize = async (path: string): Promise<void> => {
+    setAuthorizing(path);
+    setFailure(null);
+    try {
+      await api.authorizeWorkspace(path);
+      await onAuthorized();
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAuthorizing(null);
+    }
+  };
+  return (
+    <section className="hidden-workspaces">
+      <button
+        type="button"
+        className="show-done"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {total} session{total === 1 ? "" : "s"} not shown
+        <Icon name="chevron" size={16} />
+      </button>
+      {expanded && (
+        <ul>
+          {workspaces.map((workspace) => (
+            <li key={workspace.path}>
+              <p className="hidden-workspace-path">{workspace.path}</p>
+              <p className="hidden-workspace-note">
+                {workspace.sessionCount} session{workspace.sessionCount === 1 ? "" : "s"} ·{" "}
+                {workspace.reason === "missing"
+                  ? "workspace no longer exists"
+                  : "outside the allowed workspaces"}
+              </p>
+              {workspace.reason === "unauthorized" && (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={authorizing !== null}
+                  onClick={() => void authorize(workspace.path)}
+                >
+                  {authorizing === workspace.path ? "Authorizing…" : "Authorize"}
+                </button>
+              )}
+            </li>
+          ))}
+          {failure && <li className="hidden-workspace-error">{failure}</li>}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export function SessionSidebar({
   open,
   onClose,
@@ -80,7 +160,7 @@ export function SessionSidebar({
   readonly onCreate: () => void;
   readonly onAdopt: () => void;
 }) {
-  const { bootstrap, connectionState, loading, selectedSessionId, selectSession } =
+  const { bootstrap, connectionState, loading, refresh, selectedSessionId, selectSession } =
     useSessionStore();
   const sidebarLayerRef = useRef<HTMLDivElement>(null);
   useDismissibleLayer(open, onClose, sidebarLayerRef);
@@ -261,6 +341,7 @@ export function SessionSidebar({
               {query ? `No sessions match “${query}”.` : "No sessions in this project."}
             </p>
           )}
+          <HiddenWorkspaces workspaces={bootstrap.hiddenWorkspaces} onAuthorized={refresh} />
         </nav>
         <div className="sidebar-actions">
           <button type="button" className="primary-button" onClick={onCreate}>

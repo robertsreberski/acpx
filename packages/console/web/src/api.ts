@@ -481,6 +481,9 @@ export class ConsoleApi {
         path,
       })),
       sessions: snapshot.sessions.map(sessionSummary),
+      // Optional on the wire so a console served by an older build reports no
+      // withheld directories rather than failing to boot.
+      hiddenWorkspaces: snapshot.hiddenWorkspaces ?? [],
       csrfToken: snapshot.csrfToken,
       trustNetwork: snapshot.server.networkTrusted,
       version: String(snapshot.version),
@@ -699,8 +702,15 @@ interface WireBootstrap {
     readonly supportsSessionList?: boolean;
   }[];
   readonly sessions: readonly WireSession[];
+  readonly hiddenWorkspaces?: readonly WireHiddenWorkspace[];
   readonly workspaceRoots: readonly string[];
   readonly server: { readonly networkTrusted: boolean };
+}
+
+interface WireHiddenWorkspace {
+  readonly path: string;
+  readonly sessionCount: number;
+  readonly reason: "unauthorized" | "missing";
 }
 
 interface WireSession {

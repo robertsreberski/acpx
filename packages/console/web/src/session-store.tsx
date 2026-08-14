@@ -45,7 +45,12 @@ import type {
   TimelinePage,
 } from "./types";
 
-const EMPTY_BOOTSTRAP: BootstrapSnapshot = { agents: [], workspaceRoots: [], sessions: [] };
+const EMPTY_BOOTSTRAP: BootstrapSnapshot = {
+  agents: [],
+  workspaceRoots: [],
+  sessions: [],
+  hiddenWorkspaces: [],
+};
 
 const selectedSessionFromLocation = (): string | null =>
   sessionIdFromPath(window.location.pathname);
