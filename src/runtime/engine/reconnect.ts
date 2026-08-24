@@ -149,6 +149,32 @@ function isFallbackSafeEmptySessionError(
   return isAcpQueryClosedBeforeResponseError(error) || acp?.code === -32603;
 }
 
+/**
+ * True when a rebind failure may be answered with a fresh provider session even
+ * though the caller asked for the same one.
+ *
+ * `sessions new` and `sessions ensure` mint the provider session inside a
+ * short-lived adapter process. Adapters in wide use do not persist a session
+ * that never took a turn, so the next call against that record — `set-mode`,
+ * `set`, or the very first prompt — resumes an id the adapter has already
+ * forgotten and is answered with resource-not-found or an internal error.
+ * Failing closed there guards a conversation that does not exist, and leaves
+ * the record permanently unusable: creating it again reproduces the same state.
+ *
+ * A record that has never carried an agent turn has nothing to lose, so it may
+ * be rebound. Once a turn is recorded the same-session rule holds, imported
+ * records keep their provider session or fail, and the hard-failure set
+ * (timeout, interrupt) is never answered by discarding a session that may still
+ * be alive.
+ */
+function canRebindUntouchedSession(error: unknown, record: SessionRecord): boolean {
+  return (
+    record.importedFrom === undefined &&
+    !sessionHasAgentMessages(record) &&
+    shouldFallbackToNewSession(error, record)
+  );
+}
+
 function requiresSameSession(resumePolicy: SessionResumePolicy | undefined): boolean {
   return resumePolicy === "same-session-only";
 }
@@ -956,7 +982,7 @@ async function recoverRuntimeSessionLoadFailure(
   error: unknown,
 ): Promise<RuntimeSessionLoadState> {
   const loadError = formatErrorMessage(error);
-  if (params.sameSessionOnly) {
+  if (params.sameSessionOnly && !canRebindUntouchedSession(error, params.record)) {
     const acp = extractAcpError(error);
     throw makeSessionResumeRequiredError({
       record: params.record,

@@ -5003,118 +5003,111 @@ test("integration: config agent command with flags is split correctly and stores
   });
 });
 
-test("integration: prompt preserves the exact session when loadSession fails on an empty session", async () => {
+/**
+ * Wait out the queue owner a prompt left behind.
+ *
+ * A warm owner still holds its adapter session, so the next prompt reuses it and
+ * never reaches the rebind path under test.
+ */
+async function retireQueueOwner(homeDir: string, recordId: string): Promise<void> {
+  const { lockPath } = queuePaths(homeDir, recordId);
+  let ownerPid: number | undefined;
+  try {
+    ownerPid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid?: number }).pid;
+  } catch {
+    // the lock is already gone
+  }
+  if (typeof ownerPid === "number") {
+    assert.equal(await waitForPidExit(ownerPid, 10_000), true, "queue owner did not exit");
+  }
+  await sleep(500);
+}
+
+function promptOutputPayloads(
+  stdout: string,
+): { result?: { stopReason?: string }; error?: unknown }[] {
+  return stdout
+    .trim()
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { result?: { stopReason?: string }; error?: unknown });
+}
+
+function promptEndedTurn(stdout: string): boolean {
+  return promptOutputPayloads(stdout).some((payload) => payload.result?.stopReason === "end_turn");
+}
+
+function promptReportedError(stdout: string): boolean {
+  return promptOutputPayloads(stdout).some((payload) => Object.hasOwn(payload, "error"));
+}
+
+test("integration: prompt rebinds an untouched session, then preserves it once it holds a turn", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const callLog = path.join(cwd, "agent-calls.ndjson");
     const flakyLoadAgentCommand =
       `${MOCK_AGENT_COMMAND} --load-session-fails-on-empty ` +
       `--call-log ${JSON.stringify(callLog)}`;
+    const agentArgs = ["--agent", flakyLoadAgentCommand, "--approve-all", "--cwd", cwd];
 
     try {
-      const created = await runCli(
-        [
-          "--agent",
-          flakyLoadAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "sessions",
-          "new",
-        ],
-        homeDir,
-      );
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
       assert.equal(created.code, 0, created.stderr);
-      const createdEvent = JSON.parse(created.stdout.trim()) as {
-        acpxRecordId?: string;
-      };
-      const originalSessionId = createdEvent.acpxRecordId;
-      assert.equal(typeof originalSessionId, "string");
-
-      const prompt = await runCli(
-        [
-          "--agent",
-          flakyLoadAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "prompt",
-          "echo recovered",
-        ],
-        homeDir,
-      );
-      assert.notEqual(prompt.code, 0, prompt.stderr);
-
-      const payloads = prompt.stdout
-        .trim()
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { jsonrpc?: string; result?: { stopReason?: string } });
-      assert.equal(
-        payloads.some((payload) => Object.hasOwn(payload, "error")),
-        true,
-        prompt.stdout,
-      );
-      assert.equal(
-        payloads.some((payload) => payload.result?.stopReason === "end_turn"),
-        false,
-        prompt.stdout,
-      );
+      const recordId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof recordId, "string");
 
       const storedRecordPath = path.join(
         homeDir,
         ".acpx",
         "sessions",
-        `${encodeURIComponent(originalSessionId as string)}.json`,
+        `${encodeURIComponent(recordId as string)}.json`,
       );
-      const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
-        acp_session_id?: string;
-        messages?: unknown[];
-      };
+      const readRecord = async (): Promise<{ acp_session_id?: string; messages?: unknown[] }> =>
+        JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
+          acp_session_id?: string;
+          messages?: unknown[];
+        };
+      const createdSessionId = (await readRecord()).acp_session_id;
 
-      assert.equal(storedRecord.acp_session_id, originalSessionId);
-      const messages = Array.isArray(storedRecord.messages) ? storedRecord.messages : [];
+      // The adapter forgot the session it just minted, and the record has no turn
+      // to lose, so the first prompt rebinds it instead of dying.
+      const first = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "0.0001", "prompt", "echo recovered"],
+        homeDir,
+      );
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(promptEndedTurn(first.stdout), true, first.stdout);
+      await retireQueueOwner(homeDir, recordId as string);
+
+      const afterFirst = await readRecord();
+      assert.notEqual(afterFirst.acp_session_id, createdSessionId);
       assert.equal(
-        messages.some(
+        (Array.isArray(afterFirst.messages) ? afterFirst.messages : []).some(
           (message) =>
             typeof message === "object" &&
             message !== null &&
             "Agent" in (message as Record<string, unknown>),
         ),
-        false,
+        true,
       );
 
-      const calls = await readMockAgentCalls(callLog);
-      assert.equal(calls.filter((call) => call.method === "session/new").length, 1);
-      assert.equal(calls.filter((call) => call.method === "session/prompt").length, 0);
+      const afterFirstCalls = await readMockAgentCalls(callLog);
+      assert.equal(afterFirstCalls.filter((call) => call.method === "session/new").length, 2);
+      assert.equal(afterFirstCalls.filter((call) => call.method === "session/prompt").length, 1);
 
-      const fresh = await runCli(
-        [
-          "--agent",
-          flakyLoadAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "sessions",
-          "new",
-        ],
+      // Now there is a conversation, so the same failure must fail closed.
+      const second = await runCli(
+        [...agentArgs, "--format", "json", "prompt", "echo again"],
         homeDir,
       );
-      assert.equal(fresh.code, 0, fresh.stderr);
-      const freshSessionId = (JSON.parse(fresh.stdout.trim()) as { acpxRecordId?: string })
-        .acpxRecordId;
-      assert.equal(typeof freshSessionId, "string");
-      assert.notEqual(freshSessionId, originalSessionId);
-      assert.equal(
-        (await readMockAgentCalls(callLog)).filter((call) => call.method === "session/new").length,
-        2,
-      );
+      assert.notEqual(second.code, 0, second.stderr);
+      assert.equal(promptReportedError(second.stdout), true, second.stdout);
+
+      assert.equal((await readRecord()).acp_session_id, afterFirst.acp_session_id);
+      const afterSecondCalls = await readMockAgentCalls(callLog);
+      assert.equal(afterSecondCalls.filter((call) => call.method === "session/new").length, 2);
+      assert.equal(afterSecondCalls.filter((call) => call.method === "session/prompt").length, 1);
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -5186,83 +5179,56 @@ test("integration: exec retries stop after partial prompt output", async () => {
   });
 });
 
-test("integration: prompt preserves the exact session when loadSession returns not found", async () => {
+test("integration: prompt rebinds an untouched session when loadSession returns not found", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const callLog = path.join(cwd, "agent-calls.ndjson");
     const notFoundLoadAgentCommand =
       `${MOCK_AGENT_COMMAND} --supports-load-session --load-session-not-found ` +
       `--call-log ${JSON.stringify(callLog)}`;
+    const agentArgs = ["--agent", notFoundLoadAgentCommand, "--approve-all", "--cwd", cwd];
 
     try {
-      const created = await runCli(
-        [
-          "--agent",
-          notFoundLoadAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "sessions",
-          "new",
-        ],
-        homeDir,
-      );
+      const created = await runCli([...agentArgs, "--format", "json", "sessions", "new"], homeDir);
       assert.equal(created.code, 0, created.stderr);
-      const createdEvent = JSON.parse(created.stdout.trim()) as {
-        acpxRecordId?: string;
-      };
-      const originalSessionId = createdEvent.acpxRecordId;
-      assert.equal(typeof originalSessionId, "string");
-
-      const prompt = await runCli(
-        [
-          "--agent",
-          notFoundLoadAgentCommand,
-          "--approve-all",
-          "--cwd",
-          cwd,
-          "--format",
-          "json",
-          "prompt",
-          "echo recovered",
-        ],
-        homeDir,
-      );
-      assert.notEqual(prompt.code, 0, prompt.stderr);
-
-      const payloads = prompt.stdout
-        .trim()
-        .split("\n")
-        .filter((line) => line.trim().length > 0)
-        .map((line) => JSON.parse(line) as { jsonrpc?: string; result?: { stopReason?: string } });
-
-      assert.equal(
-        payloads.some((payload) => Object.hasOwn(payload, "error")),
-        true,
-        prompt.stdout,
-      );
-      assert.equal(
-        payloads.some((payload) => payload.result?.stopReason === "end_turn"),
-        false,
-        prompt.stdout,
-      );
+      const recordId = (JSON.parse(created.stdout.trim()) as { acpxRecordId?: string })
+        .acpxRecordId;
+      assert.equal(typeof recordId, "string");
 
       const storedRecordPath = path.join(
         homeDir,
         ".acpx",
         "sessions",
-        `${encodeURIComponent(originalSessionId as string)}.json`,
+        `${encodeURIComponent(recordId as string)}.json`,
       );
-      const storedRecord = JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as {
-        acp_session_id?: string;
-      };
-      assert.equal(storedRecord.acp_session_id, originalSessionId);
+      const readRecord = async (): Promise<{ acp_session_id?: string }> =>
+        JSON.parse(await fs.readFile(storedRecordPath, "utf8")) as { acp_session_id?: string };
+      const createdSessionId = (await readRecord()).acp_session_id;
 
-      const calls = await readMockAgentCalls(callLog);
-      assert.equal(calls.filter((call) => call.method === "session/new").length, 1);
-      assert.equal(calls.filter((call) => call.method === "session/prompt").length, 0);
+      const first = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "0.0001", "prompt", "echo recovered"],
+        homeDir,
+      );
+      assert.equal(first.code, 0, first.stderr);
+      assert.equal(promptEndedTurn(first.stdout), true, first.stdout);
+      await retireQueueOwner(homeDir, recordId as string);
+
+      const afterFirst = await readRecord();
+      assert.notEqual(afterFirst.acp_session_id, createdSessionId);
+      const afterFirstCalls = await readMockAgentCalls(callLog);
+      assert.equal(afterFirstCalls.filter((call) => call.method === "session/new").length, 2);
+      assert.equal(afterFirstCalls.filter((call) => call.method === "session/prompt").length, 1);
+
+      const second = await runCli(
+        [...agentArgs, "--format", "json", "prompt", "echo again"],
+        homeDir,
+      );
+      assert.notEqual(second.code, 0, second.stderr);
+      assert.equal((await readRecord()).acp_session_id, afterFirst.acp_session_id);
+      assert.equal(
+        (await readMockAgentCalls(callLog)).filter((call) => call.method === "session/new").length,
+        2,
+      );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
