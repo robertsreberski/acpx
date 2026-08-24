@@ -597,7 +597,7 @@ For prompt commands:
 Use `sessions new [--name <name>]` when you explicitly want a fresh scoped session.
 Use `sessions ensure [--name <name>]` when you want idempotent "get-or-create" behavior.
 
-If a saved session PID is dead, `acpx` respawns the agent and tries `session/resume` when advertised or `session/load` otherwise. Persistent prompts fail closed when that exact provider session cannot be restored. The only no-history exception is the first prompt after `sessions new` when the recorded capabilities advertise neither reuse method: `acpx` may initialize that empty conversation with `session/new` while preserving its local record identity. Once a prompt has been attempted, `acpx` never replaces the provider session during a later prompt; use `sessions new` explicitly to start over.
+If a saved session PID is dead, `acpx` respawns the agent and tries `session/resume` when advertised or `session/load` otherwise. Persistent prompts and session controls fail closed when that exact provider session cannot be restored. The exception is a record that has never carried an agent turn: adapters commonly forget a session that was created and never prompted, so `acpx` rebinds that still-empty record to a fresh `session/new` while preserving its local record identity, its name, and its saved mode and model. Once the session holds a turn, `acpx` never replaces the provider session; use `sessions new` explicitly to start over. Imported records always require their own provider session.
 
 ### Prompt queueing
 

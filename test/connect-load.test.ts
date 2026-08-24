@@ -627,6 +627,14 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
       acpSessionId: "strict-resume-session",
       agentCommand: "agent",
       cwd,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "a turn that must not be discarded" }],
+            tool_results: {},
+          },
+        },
+      ],
     });
 
     const client: FakeClient = {
@@ -665,6 +673,158 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
     );
 
     assert.equal(record.acpSessionId, "strict-resume-session");
+  });
+});
+
+test("connectAndLoadSession rebinds an untouched record the adapter no longer knows", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "untouched-record",
+      acpSessionId: "forgotten-session",
+      agentCommand: "agent",
+      cwd,
+      acpx: { desired_mode_id: "plan" },
+    });
+
+    const modes: string[] = [];
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32002,
+            message: "Resource not found: forgotten-session",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSession should not be called");
+      },
+      createSession: async () => ({
+        sessionId: "rebound-session",
+        agentSessionId: "rebound-runtime",
+      }),
+      setSessionMode: async (_sessionId: string, modeId: string) => {
+        modes.push(modeId);
+      },
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      resumePolicy: "same-session-only",
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.resumed, false);
+    assert.equal(result.sessionId, "rebound-session");
+    assert.equal(record.acpSessionId, "rebound-session");
+    assert.match(result.loadError ?? "", /Resource not found/);
+    assert.deepEqual(modes, ["plan"]);
+  });
+});
+
+test("connectAndLoadSession rebinds an untouched record when the adapter answers an internal error", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "untouched-internal-record",
+      acpSessionId: "untouched-internal-session",
+      agentCommand: "agent",
+      cwd,
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async () => {
+        throw {
+          error: {
+            code: -32603,
+            message: "Internal error",
+          },
+        };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSession should not be called");
+      },
+      createSession: async () => ({
+        sessionId: "rebound-internal-session",
+        agentSessionId: "rebound-internal-runtime",
+      }),
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    const result = await connectAndLoadSession({
+      client: client as never,
+      record,
+      resumePolicy: "same-session-only",
+      timeoutMs: 1_000,
+      activeController: ACTIVE_CONTROLLER,
+    });
+
+    assert.equal(result.sessionId, "rebound-internal-session");
+    assert.equal(record.acpSessionId, "rebound-internal-session");
+  });
+});
+
+test("connectAndLoadSession keeps an untouched record when the rebind attempt times out", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "untouched-timeout-record",
+      acpSessionId: "untouched-timeout-session",
+      agentCommand: "agent",
+      cwd,
+    });
+
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async () => await new Promise(() => {}),
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSession should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async () => {},
+    };
+
+    await assert.rejects(
+      async () =>
+        await connectAndLoadSession({
+          client: client as never,
+          record,
+          resumePolicy: "same-session-only",
+          timeoutMs: 25,
+          activeController: ACTIVE_CONTROLLER,
+        }),
+      /Persistent ACP session untouched-timeout-session could not be resumed/i,
+    );
+
+    assert.equal(record.acpSessionId, "untouched-timeout-session");
   });
 });
 

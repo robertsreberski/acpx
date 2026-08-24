@@ -926,6 +926,58 @@ test("prompt reconciles agentSessionId from loadSession metadata", async () => {
   });
 });
 
+test("set-mode rebinds an untouched session and keeps the mode for its first prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
+    await fs.writeFile(
+      path.join(homeDir, ".acpx", "config.json"),
+      `${JSON.stringify(
+        {
+          agents: {
+            codex: {
+              command: MOCK_AGENT_WITH_LOAD_FALLBACK,
+            },
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const sessionId = "untouched-mode-session";
+    await writeSessionRecord(homeDir, {
+      acpxRecordId: sessionId,
+      acpSessionId: sessionId,
+      agentCommand: MOCK_AGENT_WITH_LOAD_FALLBACK,
+      cwd,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+      closed: false,
+    });
+
+    const result = await runCli(
+      ["--cwd", cwd, "--format", "json", "codex", "set-mode", "plan"],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    const storedRecord = JSON.parse(
+      await fs.readFile(
+        path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(sessionId)}.json`),
+        "utf8",
+      ),
+    ) as {
+      acp_session_id?: string;
+      acpx?: { desired_mode_id?: string };
+    };
+    assert.equal(storedRecord.acpx?.desired_mode_id, "plan");
+    assert.notEqual(storedRecord.acp_session_id, sessionId);
+  });
+});
+
 test("set-mode fails closed when loading the exact provider session fails", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
@@ -956,6 +1008,14 @@ test("set-mode fails closed when loading the exact provider session fails", asyn
       createdAt: "2026-01-01T00:00:00.000Z",
       lastUsedAt: "2026-01-01T00:00:00.000Z",
       closed: false,
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "a turn that must not be discarded" }],
+            tool_results: {},
+          },
+        },
+      ],
     });
 
     const result = await runCli(

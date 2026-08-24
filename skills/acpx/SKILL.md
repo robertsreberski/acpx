@@ -159,7 +159,8 @@ Behavior:
 - Uses a saved session for the session scope key
 - Auto-resumes prior session when one exists for that scope
 - If no session exists for the scope, exits with `NO_SESSION` and prompts for `sessions new`
-- Requires the exact saved provider session to resume or load. If it cannot, the prompt fails closed; run `sessions new` explicitly only when a fresh conversation is intended.
+- Requires the exact saved provider session to resume or load once the session holds a turn. If it cannot, the prompt fails closed; run `sessions new` explicitly only when a fresh conversation is intended.
+- A record that has never carried an agent turn is rebound to a fresh provider session instead, because adapters commonly forget a session that was created and never prompted. This is what lets `set-mode` land on a cold session before its first prompt.
 - Is queue-aware when another prompt is already running for the same session
 - On interrupt during an active turn, sends ACP `session/cancel` before force-kill fallback
 

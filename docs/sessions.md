@@ -190,7 +190,7 @@ Saved sessions may include a cached adapter PID from the last connected helper p
 
 1. `acpx` respawns the agent.
 2. Attempts ACP `session/resume` with the saved provider session id when the agent advertises it, otherwise ACP `session/load`.
-3. Fails closed if that exact provider session cannot be restored. The only no-history exception is the first prompt after `sessions new` when the recorded capabilities advertise neither reuse method; that prompt may initialize the still-empty conversation with `session/new` while preserving its local record identity. After any prompt attempt, the saved provider session is not replaced; use `sessions new` explicitly when discarding the conversation is intended.
+3. Fails closed if that exact provider session cannot be restored. The exception is a record that has never carried an agent turn: adapters commonly forget a session created by `sessions new` or `sessions ensure` and never prompted, so `acpx` rebinds that still-empty record to a fresh `session/new`, keeping its local record identity and its saved preferences. Once the session holds a turn the saved provider session is not replaced; use `sessions new` explicitly when discarding the conversation is intended. Imported records always require their own provider session.
 
 This makes long-running scripted sessions resilient when the adapter can restore
 the provider session without hiding continuity loss when it cannot. Prompt and

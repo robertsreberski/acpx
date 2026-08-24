@@ -35,7 +35,7 @@ Repo: https://github.com/openclaw/acpx
 
 ### Breaking
 
-- CLI/sessions: persistent prompts now require the exact saved provider session to resume or load; reconnect failures no longer silently replace a conversation with `session/new`. A freshly created, untouched record whose adapter advertises no reuse method may still initialize its first prompt. Use `sessions new` explicitly to start over after any prompt attempt.
+- CLI/sessions: persistent prompts now require the exact saved provider session to resume or load; reconnect failures no longer silently replace a conversation with `session/new`. A record that has never carried an agent turn may still be rebound to a fresh provider session. Use `sessions new` explicitly to start over once a session holds a turn.
 
 ### Fixes
 
@@ -56,6 +56,18 @@ Repo: https://github.com/openclaw/acpx
 
 - Effort/queue recovery: preserve live turn updates during active controls, close accepted tasks promptly when shutdown interrupts turn startup, and clean up inactive retirement-marker sockets.
 - CLI/interrupts and timeouts: latch process interrupts before asynchronous cancellation so `Ctrl+C` reliably exits `130` after flushing buffered output, and avoid extending one-shot timeouts when no durable reply can be salvaged.
+
+- CLI/sessions: rebind a session that has never carried an agent turn instead of
+  failing closed. `sessions new` and `sessions ensure` mint the provider session
+  inside a short-lived adapter process, and adapters in wide use do not persist a
+  session that was never prompted, so the next `set-mode`, `set`, or first prompt
+  resumed an id the adapter had already forgotten and was refused with
+  `SESSION_RESUME_REQUIRED`. Creating the session again reproduced the same
+  state, which left `claude` and `codex` sessions unusable from the moment they
+  were created and made "set the mode before the first prompt" impossible. An
+  untouched record has no conversation to protect, so it is now rebound; records
+  that hold a turn, imported records, and hard failures such as timeouts still
+  fail closed.
 
 ## 2026.7.27 (v0.13.0)
 

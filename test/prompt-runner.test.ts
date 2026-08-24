@@ -80,7 +80,14 @@ test("runSessionSetConfigOptionDirect fails closed instead of replacing the prov
       acpSessionId: "stale-session-id",
       agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --load-session-fails-on-empty`,
       cwd,
-      messages: [],
+      messages: [
+        {
+          Agent: {
+            content: [{ Text: "a turn that must not be discarded" }],
+            tool_results: {},
+          },
+        },
+      ],
     });
     await writeSessionRecord(homeDir, record);
 
@@ -107,6 +114,35 @@ test("runSessionSetConfigOptionDirect fails closed instead of replacing the prov
     const persisted = await resolveSessionRecord(record.acpxRecordId);
     assert.equal(persisted.acpSessionId, "stale-session-id");
     assert.equal(persisted.acpx?.desired_config_options, undefined);
+  });
+});
+
+test("runSessionSetConfigOptionDirect rebinds an untouched provider session", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const record = makeSessionRecord({
+      acpxRecordId: "prompt-runner-config-untouched",
+      acpSessionId: "forgotten-session-id",
+      agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session --load-session-fails-on-empty`,
+      cwd,
+      messages: [],
+    });
+    await writeSessionRecord(homeDir, record);
+
+    const result = await runSessionSetConfigOptionDirect({
+      sessionRecordId: record.acpxRecordId,
+      configId: "reasoning_effort",
+      value: "high",
+      timeoutMs: 5_000,
+    });
+
+    assert.notEqual(result.record.acpSessionId, "forgotten-session-id");
+
+    const persisted = await resolveSessionRecord(record.acpxRecordId);
+    assert.notEqual(persisted.acpSessionId, "forgotten-session-id");
+    assert.equal(persisted.acpx?.desired_config_options?.reasoning_effort, "high");
   });
 });
 
